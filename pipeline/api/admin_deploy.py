@@ -409,6 +409,8 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 PIPELINE_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP_SCRIPT_PATH = PIPELINE_ROOT / "scripts" / "bootstrap.sh"
 PIPELINE_SOURCE_DIRS = ["pipeline", "scripts"]   # tar.gz に含めるディレクトリ
+# pip install -e . で必要な root レベルファイル (= 新規 box で venv 自前作成時に必須)
+PIPELINE_SOURCE_FILES = ["pyproject.toml", "README.md", "LICENSE"]
 
 
 @router.get("/bootstrap/source.tar.gz")
@@ -420,17 +422,22 @@ def get_bootstrap_source() -> StreamingResponse:
     def _stream():
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            # __pycache__ / .pyc / .bak 除外
+            def _filter(ti: tarfile.TarInfo):
+                name = ti.name
+                if "/__pycache__" in name or name.endswith(".pyc") or name.endswith(".bak"):
+                    return None
+                return ti
             for d in PIPELINE_SOURCE_DIRS:
                 src = PIPELINE_ROOT / d
                 if not src.exists():
                     continue
-                # __pycache__ / .pyc / .bak 除外
-                def _filter(ti: tarfile.TarInfo):
-                    name = ti.name
-                    if "/__pycache__" in name or name.endswith(".pyc") or name.endswith(".bak"):
-                        return None
-                    return ti
                 tar.add(str(src), arcname=d, filter=_filter)
+            # pip install -e . に必要な root 直下ファイル (pyproject.toml / README.md / LICENSE)
+            for f in PIPELINE_SOURCE_FILES:
+                src = PIPELINE_ROOT / f
+                if src.exists():
+                    tar.add(str(src), arcname=f)
         buf.seek(0)
         yield buf.getvalue()
 
