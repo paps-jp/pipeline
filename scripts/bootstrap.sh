@@ -35,10 +35,12 @@ log "  install dir  : $INSTALL_DIR"
 log "  service user : $SERVICE_USER"
 
 # --- 1. apt 依存 ---
-log "Step 1: apt deps (rsync, python3-venv, curl)"
+# libmariadb-dev は plugin (hash_detect / embed) が使う mariadb-connector-python の
+# wheel build に必須 (= 無いと pip install mariadb がソースビルド失敗する)
+log "Step 1: apt deps (rsync, python3-venv, python3-dev, libmariadb-dev, curl)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq rsync python3-venv python3-pip curl >/dev/null
+apt-get install -y -qq rsync python3-venv python3-pip python3-dev libmariadb-dev gcc curl >/dev/null
 
 # --- 2. service user 作成 (なければ) ---
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
@@ -77,17 +79,26 @@ log "  extracted to $INSTALL_DIR"
 
 # --- 5. venv の判定 + 構築 ---
 if [ "$SKIP_VENV" = "1" ] && [ -x "/home/www/face_search/bin/pipeline" ]; then
+  # 既存 face_search venv を流用 (= 旧フリート互換)
   PYTHON_BIN="/home/www/face_search/bin/python3"
   PIPELINE_BIN="/home/www/face_search/bin/pipeline"
   log "Step 5: using existing venv /home/www/face_search (SKIP_VENV=1)"
 else
-  log "Step 5: create venv at $INSTALL_DIR/.venv"
+  # 新規 venv 構築 + pyproject.toml から editable install (= pipeline package 自身 + 全依存)
+  log "Step 5: create venv at $INSTALL_DIR/.venv + pip install -e .[mysql]"
   python3 -m venv "$INSTALL_DIR/.venv"
   "$INSTALL_DIR/.venv/bin/pip" install -q -U pip
-  "$INSTALL_DIR/.venv/bin/pip" install -q httpx mariadb numpy fastapi uvicorn pydantic
-  # entry point は pipeline.cli:main
+  # numpy は plugin (insightface 等) で使う、 pipeline pkg 自体の dep ではない
+  "$INSTALL_DIR/.venv/bin/pip" install -q -e "${INSTALL_DIR}[mysql]" numpy
+  # pip install -e は entry-points 経由で pipeline コマンドを venv/bin に置く
   PYTHON_BIN="$INSTALL_DIR/.venv/bin/python"
-  PIPELINE_BIN="$INSTALL_DIR/.venv/bin/python -m pipeline"
+  PIPELINE_BIN="$INSTALL_DIR/.venv/bin/pipeline"
+  if [ ! -x "$PIPELINE_BIN" ]; then
+    log "  ERROR: $PIPELINE_BIN が作られなかった (= pip install -e .[mysql] が失敗)"
+    "$INSTALL_DIR/.venv/bin/pip" install -e "${INSTALL_DIR}[mysql]"  # verbose 再実行で原因表示
+    exit 1
+  fi
+  log "  installed: $($PIPELINE_BIN --version 2>&1 | head -1)"
 fi
 
 # --- 6. systemd unit 配置 ---
