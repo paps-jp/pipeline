@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>セットアップ — Pipeline</title>
+<meta name="description" content="Pipeline のインストール、 起動、 最初の ワークロード追加までの手順。" />
+<link rel="stylesheet" href="assets/site.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="nav">
+    <a class="brand" href="./">Pipeline</a>
+    <div class="nav-links">
+      <a href="./">ホーム</a>
+      <a href="setup.html" class="active">セットアップ</a>
+      <a href="manual.html">マニュアル</a>
+    </div>
+    <a class="gh" href="https://github.com/paps-jp/pipeline" target="_blank" rel="noopener">GitHub →</a>
+  </nav>
+</header>
+
+<main>
+
+<h1>セットアップ</h1>
+<p>制御プレーン 1 ホスト + ワーカー 1 ホスト以上、 という構成を 想定。
+小規模では 同一ホストで 両方動かしても 構わない。</p>
+
+<div class="toc">
+  <h4>このページの内容</h4>
+  <ul>
+    <li><a href="#requirements">必要要件</a></li>
+    <li><a href="#install">インストール (制御プレーン)</a></li>
+    <li><a href="#first-run">初回起動</a></li>
+    <li><a href="#web-build">Web UI ビルド</a></li>
+    <li><a href="#first-workload">最初のワークロード</a></li>
+    <li><a href="#worker-deploy">ワーカーをホストに追加</a></li>
+    <li><a href="#systemd">systemd 常駐化</a></li>
+    <li><a href="#verify">動作確認</a></li>
+  </ul>
+</div>
+
+<section id="requirements">
+  <h2>必要要件</h2>
+  <table>
+    <tr><th>項目</th><th>バージョン</th><th>備考</th></tr>
+    <tr><td>Python</td><td>3.12 以上</td><td>制御プレーン / ワーカー 共通</td></tr>
+    <tr><td>Node.js</td><td>18 以上</td><td>Web UI ビルド時のみ (= 配布済 build を使うなら不要)</td></tr>
+    <tr><td>OS</td><td>Linux 推奨</td><td>制御プレーン。 Mac / WSL でも 開発可。</td></tr>
+    <tr><td>SQLite</td><td>3.35 以上</td><td>ALTER TABLE DROP COLUMN を使うため</td></tr>
+    <tr><td>GPU ホスト</td><td>任意</td><td>NVIDIA GPU + ドライバ + nvidia-smi (= GPU メトリクスを取る場合)</td></tr>
+  </table>
+</section>
+
+<section id="install">
+  <h2>インストール (制御プレーン)</h2>
+  <pre><code>git clone https://github.com/paps-jp/pipeline
+cd pipeline
+
+# venv 作成
+python3.12 -m venv .venv
+source .venv/bin/activate     # Windows: .venv\Scripts\activate
+
+# パッケージインストール (editable)
+pip install -e .</code></pre>
+
+  <p>これで <code>pipeline</code> コマンドが venv の中に入る。</p>
+</section>
+
+<section id="first-run">
+  <h2>初回起動</h2>
+  <p>SQLite DB は 初回起動時に 自動作成される。</p>
+  <pre><code>pipeline run \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --db-url sqlite:///./pipeline.db \
+  --log-level info</code></pre>
+
+  <p>ブラウザで <code>http://localhost:8001</code> を開く。 ダッシュボードが 表示されれば OK。</p>
+
+  <div class="callout">
+    <strong>初回は ワークロード ゼロ。</strong> 「実行中」 「最近の失敗」 「キュー深さ」 の 3 つの
+    パネルは 全て 空状態で表示される。 これは 正常。
+  </div>
+</section>
+
+<section id="web-build">
+  <h2>Web UI ビルド</h2>
+  <p>repo にビルド済バンドルは 含まれないため、 初回は ビルドが必要。</p>
+
+  <pre><code>cd web
+npm install
+npm run build
+# → ../pipeline/web/static/ に index.html + assets/ が出力される</code></pre>
+
+  <p>その後 <code>pipeline run …</code> を 再起動すると FastAPI が 新 UI を 配信する。</p>
+
+  <p>開発時 (= ホットリロード) は <code>npm run dev</code>。 <code>localhost:5173</code> が 立ち上がり <code>/api</code> は <code>localhost:8001</code> へ proxy される。</p>
+</section>
+
+<section id="first-workload">
+  <h2>最初のワークロード</h2>
+  <p>repo に <code>plugins/echo_sample/</code> が同梱されている。 これを 使って 動作確認できる。</p>
+
+  <ol>
+    <li>Web UI → <strong>ワークロード</strong> タブ → <strong>新規作成</strong></li>
+    <li>基本情報:
+      <ul>
+        <li><strong>slug</strong>: <code>echo-test</code> (= URL に使われる識別子)</li>
+        <li><strong>表示名</strong>: <code>Echo テスト</code></li>
+      </ul>
+    </li>
+    <li>実行モード: <strong>python_module</strong> を選択</li>
+    <li>プラグイン: <code>echo-sample</code> を選択</li>
+    <li>モジュール: <code>main</code> を選択</li>
+    <li>設定:
+      <ul>
+        <li>prefix: <code>[echo]</code> (デフォルト)</li>
+        <li>sleep_secs: <code>0</code></li>
+        <li>fail_pk_substr: 空文字</li>
+      </ul>
+    </li>
+    <li><strong>作成</strong> ボタン → ワークロード 一覧に <code>echo-test</code> が追加される</li>
+    <li>その行の <strong>📨 投入</strong> アイコン → pk に <code>hello</code> と入れて <strong>投入</strong></li>
+    <li>同じ行の <strong>履歴</strong> アイコン → runs drawer で 結果が緑色 (= success) で 表示される</li>
+  </ol>
+
+  <p>1 件 実行できれば 制御プレーンは 正常。 次は ワーカーを 別ホストに 追加する。</p>
+</section>
+
+<section id="worker-deploy">
+  <h2>ワーカーをホストに追加</h2>
+
+  <h3>方法 1: 手動</h3>
+  <p>ワーカーをデプロイしたい ホストに SSH ログインして、 同じ手順で venv + pip install を 行う。 その後:</p>
+
+  <pre><code>pipeline worker \
+  --control-url http://&lt;control-host&gt;:8001 \
+  --worker-id worker-host-a \
+  --tags gpu \
+  --log-level info</code></pre>
+
+  <p>制御プレーンの Web UI → <strong>ワーカー</strong> タブで このホストが <code>active</code> と表示される。</p>
+
+  <h3>方法 2: Deploy タブから配信</h3>
+  <p>運用フェーズに 入ったら 制御プレーンから コードを 配信できる。</p>
+
+  <ol>
+    <li>Web UI → <strong>Deploy</strong> タブ</li>
+    <li>「配信先ホスト」 で SSH 接続先 (= IP / port / user) を 登録</li>
+    <li>「配信パス」 で 何を どこへ コピーするか + 配信後 実行コマンド + service コマンドを 登録</li>
+    <li><strong>Deploy now</strong> ボタン → 一括で rsync + systemctl restart</li>
+  </ol>
+
+  <p>詳細は <a href="manual.html#deploy">マニュアルの Deploy セクション</a>。</p>
+</section>
+
+<section id="systemd">
+  <h2>systemd 常駐化</h2>
+
+  <h3>制御プレーン</h3>
+  <pre><code># /etc/systemd/system/pipeline-control.service
+[Unit]
+Description=Pipeline control plane
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/opt/pipeline
+ExecStart=/opt/pipeline/.venv/bin/pipeline run \
+    --host 0.0.0.0 --port 8001 \
+    --db-url sqlite:////opt/pipeline/data/pipeline.db \
+    --log-level info
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+  <h3>ワーカー</h3>
+  <pre><code># /etc/systemd/system/pipeline-worker.service
+[Unit]
+Description=Pipeline worker
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/opt/pipeline
+ExecStart=/opt/pipeline/.venv/bin/pipeline worker \
+    --control-url http://&lt;control-host&gt;:8001 \
+    --worker-id %H \
+    --tags gpu \
+    --log-level info
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+  <pre><code>sudo systemctl daemon-reload
+sudo systemctl enable --now pipeline-control     # 制御プレーン側
+sudo systemctl enable --now pipeline-worker      # 各ワーカー側</code></pre>
+</section>
+
+<section id="verify">
+  <h2>動作確認</h2>
+
+  <p>curl で API を叩いて 状態を 確認:</p>
+  <pre><code>curl http://localhost:8001/api/v1/status
+# → {"version":"0.1.0","mode":"prod","db_url":"sqlite:///./pipeline.db","now":"..."}
+
+curl http://localhost:8001/api/v1/workers
+# → {"workers":[{"id":"worker-host-a","host":"...","state":"active",...}],"total":1}
+
+curl http://localhost:8001/api/v1/dashboard/overview
+# → {"running":[...],"recent_failures":[...],"queue_depths":[...]}</code></pre>
+
+  <p>続いて 詳細な 使い方は <a href="manual.html">マニュアル</a> へ。</p>
+</section>
+
+</main>
+
+<footer>
+  <div>Pipeline — GUI-first batch fleet</div>
+  <div>
+    <a href="https://github.com/paps-jp/pipeline">GitHub</a> ·
+    <a href="./">ホーム</a> ·
+    <a href="manual.html">マニュアル</a>
+  </div>
+</footer>
+
+</body>
+</html>

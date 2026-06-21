@@ -1,0 +1,2 @@
+# echo_sample は標準ライブラリのみで動作するため pip install は不要。
+# ここに依存を書くと worker が venv に自動 install する。
