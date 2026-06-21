@@ -5,13 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Pipeline — GUI-first batch fleet</title>
 <meta name="description" content="Pipeline — GUI から登録したワークロードをワーカープールで並列実行する、シンプルなバッチフリート制御プレーン。" />
+<link rel="icon" type="image/x-icon" href="assets/favicon.ico" />
+<link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="assets/icon-192.png" />
+<link rel="apple-touch-icon" sizes="256x256" href="assets/icon-256.png" />
+<meta property="og:image" content="assets/icon-256.png" />
 <link rel="stylesheet" href="assets/site.css" />
 </head>
 <body>
 
 <header class="site-header">
   <nav class="nav">
-    <a class="brand" href="./">Pipeline</a>
+    <a class="brand" href="./">
+      <img class="brand-icon" src="assets/icon-64.png" alt="" />
+      <span class="brand-text">Pipeline</span>
+    </a>
     <div class="nav-links">
       <a href="./" class="active">ホーム</a>
       <a href="setup.html">セットアップ</a>
@@ -22,6 +30,7 @@
 </header>
 
 <section class="hero">
+  <img class="hero-icon" src="assets/icon-256.png" alt="Pipeline" />
   <h1>GUI から登録した バッチを<br/>フリート全体で並列実行</h1>
   <p class="tagline">
     Pipeline は ワークロードを Web UI から登録し、 複数ホストの ワーカープールで
