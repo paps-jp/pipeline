@@ -1,0 +1,58 @@
+/* グローバル微調整 — Mantine の上に薄く積む */
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-feature-settings: "cv11", "ss01", "ss03", "tnum";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* 数字を等幅に (= numeric tabular で UI が安定) */
+.mantine-Table-table,
+.mantine-Badge-label,
+.mantine-Code-root {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Card hover: 上に 1px 浮く + accent border */
+.mantine-Card-root[data-with-border]:hover {
+  border-color: var(--mantine-color-indigo-5);
+  box-shadow: 0 6px 18px rgba(78, 93, 255, 0.08);
+}
+
+/* Active NavLink: 左 accent bar */
+.mantine-NavLink-root[data-active] {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--mantine-color-indigo-6) 12%, transparent),
+    transparent 70%
+  );
+  box-shadow: inset 3px 0 0 var(--mantine-color-indigo-6);
+}
+
+/* scrollbar: minimal */
+* {
+  scrollbar-width: thin;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(120, 130, 180, 0.35);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 130, 180, 0.6);
+}
+
+/* Header: sticky 感の補強 (= AppShell.Header 用の追加 polish) */
+[data-pipeline-header] {
+  backdrop-filter: saturate(140%) blur(8px);
+  -webkit-backdrop-filter: saturate(140%) blur(8px);
+}

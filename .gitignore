@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Local dev artifacts
+pipeline.db
+pipeline.db-shm
+pipeline.db-wal
+pipeline.db-journal
+*.sqlite
+*.sqlite*-journal
+.env
+.env.local
+local/
+
+# scratch/ = operator の一時スクリプト (機密 password を含むため絶対に commit しない)
+scratch/
+
+# plugins/ = face_search 固有の本番プラグイン (= operator 判断で OSS リポジトリには載せない)
+plugins/
+
+# docs/ = ワークロード内部設計 (= operator 判断で OSS リポジトリには載せない、 ローカルにだけ残す)
+docs/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+pipeline/web/static/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Docs build
+docs/_build/
+site/
