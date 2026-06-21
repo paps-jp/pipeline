@@ -167,7 +167,7 @@ export default function App() {
           to="/logs"
         />
         <NavLink
-          label="Deploy"
+          label={t("nav.deploy")}
           leftSection={<IconRocket size={18} />}
           component={RouterNavLink}
           to="/deploy"
