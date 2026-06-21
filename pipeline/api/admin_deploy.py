@@ -404,9 +404,11 @@ import tarfile
 
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
-BOOTSTRAP_SCRIPT_PATH = Path("/opt/pipeline/scripts/bootstrap.sh")
+# project root は admin_deploy.py の位置 (= <root>/pipeline/api/admin_deploy.py) から導出
+# こうしておけば install パスが /opt/pipeline でも /home/paps-ai/ai/pipeline でも動く
+PIPELINE_ROOT = Path(__file__).resolve().parents[2]
+BOOTSTRAP_SCRIPT_PATH = PIPELINE_ROOT / "scripts" / "bootstrap.sh"
 PIPELINE_SOURCE_DIRS = ["pipeline", "scripts"]   # tar.gz に含めるディレクトリ
-PIPELINE_ROOT = Path("/opt/pipeline")
 
 
 @router.get("/bootstrap/source.tar.gz")
