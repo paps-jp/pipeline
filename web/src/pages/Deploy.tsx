@@ -8,16 +8,13 @@ import {
   Group,
   Loader,
   Modal,
-  NumberInput,
   ScrollArea,
   Stack,
   Switch,
   Table,
-  Tabs,
   Text,
   TextInput,
   Textarea,
-  Tooltip,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { modals } from "@mantine/modals";
@@ -26,10 +23,12 @@ import type { TFunction } from "i18next";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { DeployPath, DeployPathCreate, DeployRun, DeployTarget, DeployTargetCreate, deployApi } from "@/api/client";
+import { DeployPath, DeployPathCreate, DeployRun, deployApi } from "@/api/client";
 import { PageHeader } from "@/components/PageHeader";
 
-function confirmDelete(label: string, onConfirm: () => void, t: TFunction) {
+const REFRESH_MS = 2000;
+
+function confirmDeletePath(label: string, onConfirm: () => void, t: TFunction) {
   modals.openConfirmModal({
     title: t("deploy.confirm_delete_title"),
     children: <Text size="sm">{t("deploy.confirm_delete_message", { label })}</Text>,
@@ -42,7 +41,12 @@ function confirmDelete(label: string, onConfirm: () => void, t: TFunction) {
   });
 }
 
-const REFRESH_MS = 2000;
+function ctrlBaseUrl(): string {
+  if (typeof window !== "undefined") {
+    return `${window.location.protocol}//${window.location.host}`;
+  }
+  return "";
+}
 
 function fmtTime(iso: string | null): string {
   if (!iso) return "          ";
@@ -65,289 +69,9 @@ function statusBadge(r: DeployRun) {
   return <Badge color="gray">{String(r.success)}</Badge>;
 }
 
-function TargetEditor({
-  initial,
-  onSave,
-  onCancel,
-  saving,
-}: {
-  initial?: DeployTarget;
-  onSave: (body: DeployTargetCreate) => void;
-  onCancel: () => void;
-  saving: boolean;
-}) {
-  const [label, setLabel] = useState(initial?.label ?? "");
-  const [host, setHost] = useState(initial?.host ?? "");
-  const [sshUser, setSshUser] = useState(initial?.ssh_user ?? "root");
-  const [sshPort, setSshPort] = useState<number | string>(initial?.ssh_port ?? 22);
-  const [enabled, setEnabled] = useState(initial?.enabled ?? true);
-  const [notes, setNotes] = useState(initial?.notes ?? "");
-  const { t } = useTranslation();
-
-  return (
-    <Stack gap="xs">
-      <TextInput label={t("deploy.targets.label")} required value={label} onChange={(e) => setLabel(e.currentTarget.value)} placeholder="ai-gpu1" />
-      <TextInput label="host (IP / DNS)" required value={host} onChange={(e) => setHost(e.currentTarget.value)} placeholder="10.10.50.23" />
-      <Group grow>
-        <TextInput label="SSH user" value={sshUser} onChange={(e) => setSshUser(e.currentTarget.value)} />
-        <NumberInput label="SSH port" value={sshPort} onChange={setSshPort} min={1} max={65535} />
-      </Group>
-      <Textarea label={t("deploy.targets.notes")} value={notes ?? ""} onChange={(e) => setNotes(e.currentTarget.value)} autosize minRows={2} maxRows={4} />
-      <Switch label={t("deploy.targets.enabled")} checked={enabled} onChange={(e) => setEnabled(e.currentTarget.checked)} />
-      <Group justify="flex-end">
-        <Button variant="default" onClick={onCancel}>{t("deploy.targets.cancel")}</Button>
-        <Button
-          loading={saving}
-          disabled={!label || !host}
-          onClick={() =>
-            onSave({
-              label, host,
-              ssh_user: sshUser, ssh_port: Number(sshPort),
-              enabled, notes: notes || null,
-            })
-          }
-        >
-          {t("deploy.targets.save")}
-        </Button>
-      </Group>
-    </Stack>
-  );
-}
-
-function ctrlBaseUrl(): string {
-  if (typeof window !== "undefined") {
-    return `${window.location.protocol}//${window.location.host}`;
-  }
-  return "";
-}
-
-function TargetsSection() {
-  const { t } = useTranslation();
-  const qc = useQueryClient();
-  const list = useQuery({
-    queryKey: ["deploy-targets"],
-    queryFn: () => deployApi.listTargets(),
-    refetchInterval: 10_000,
-  });
-  const pubkey = useQuery({
-    queryKey: ["deploy-pubkey"],
-    queryFn: () => deployApi.getPubkey(),
-  });
-  const [editorOpened, editorCtl] = useDisclosure(false);
-  const [addModalOpened, addModalCtl] = useDisclosure(false);
-  const [editing, setEditing] = useState<DeployTarget | undefined>(undefined);
-  const [pubkeyOpened, pubkeyCtl] = useDisclosure(false);
-  const [bootstrapCopied, setBootstrapCopied] = useState(false);
-
-  const create = useMutation({
-    mutationFn: (body: DeployTargetCreate) => deployApi.createTarget(body),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["deploy-targets"] });
-      editorCtl.close();
-    },
-  });
-  const update = useMutation({
-    mutationFn: ({ id, body }: { id: number; body: Partial<DeployTargetCreate> }) =>
-      deployApi.updateTarget(id, body),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["deploy-targets"] });
-      editorCtl.close();
-    },
-  });
-  const del = useMutation({
-    mutationFn: (id: number) => deployApi.deleteTarget(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["deploy-targets"] }),
-  });
-  const toggleEnabled = useMutation({
-    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
-      deployApi.updateTarget(id, { enabled }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["deploy-targets"] }),
-  });
-
-  const targets = list.data ?? [];
-
-  return (
-    <Box>
-      <Group justify="space-between" mb="xs">
-        <Text fw={500}>{t("deploy.targets.section")} ({targets.length})</Text>
-        <Group gap="xs">
-          <Button size="xs" variant="default" onClick={pubkeyCtl.open}>
-            {t("deploy.targets.pubkey")}
-          </Button>
-          <Button size="xs" onClick={addModalCtl.open}>
-            {t("deploy.targets.add")}
-          </Button>
-        </Group>
-      </Group>
-
-      <Table withTableBorder withColumnBorders striped highlightOnHover>
-        <Table.Thead>
-          <Table.Tr>
-            <Table.Th style={{ width: 70 }}>{t("workloads.enabled")}</Table.Th>
-            <Table.Th>{t("deploy.targets.col_label")}</Table.Th>
-            <Table.Th>{t("deploy.targets.col_host_port")}</Table.Th>
-            <Table.Th>{t("deploy.targets.col_user")}</Table.Th>
-            <Table.Th>{t("deploy.targets.col_last")}</Table.Th>
-            <Table.Th>{t("deploy.targets.col_notes")}</Table.Th>
-            <Table.Th style={{ width: 110 }}>{t("deploy.targets.col_action")}</Table.Th>
-          </Table.Tr>
-        </Table.Thead>
-        <Table.Tbody>
-          {targets.length === 0 && (
-            <Table.Tr>
-              <Table.Td colSpan={7}>
-                <Text c="dimmed" ta="center">{t("deploy.targets.empty")}</Text>
-              </Table.Td>
-            </Table.Tr>
-          )}
-          {targets.map((row) => (
-            <Table.Tr key={row.id}>
-              <Table.Td>
-                <Switch
-                  checked={row.enabled}
-                  onChange={(e) => toggleEnabled.mutate({ id: row.id, enabled: e.currentTarget.checked })}
-                  size="xs"
-                />
-              </Table.Td>
-              <Table.Td>{row.label}</Table.Td>
-              <Table.Td><Code>{row.host}:{row.ssh_port}</Code></Table.Td>
-              <Table.Td>{row.ssh_user}</Table.Td>
-              <Table.Td>
-                {row.last_deploy_at ? (
-                  <Group gap={4}>
-                    <Text size="xs">{fmtTime(row.last_deploy_at)}</Text>
-                    {row.last_deploy_ok === true && <Badge size="xs" color="teal">{t("deploy.targets.last_ok")}</Badge>}
-                    {row.last_deploy_ok === false && <Badge size="xs" color="red">{t("deploy.targets.last_ng")}</Badge>}
-                  </Group>
-                ) : (
-                  <Text size="xs" c="dimmed">{t("deploy.targets.last_not_run")}</Text>
-                )}
-              </Table.Td>
-              <Table.Td>
-                <Text size="xs" c="dimmed">{row.notes ?? ""}</Text>
-              </Table.Td>
-              <Table.Td>
-                <Group gap={4}>
-                  <Button
-                    size="xs"
-                    variant="light"
-                    onClick={() => {
-                      setEditing(row);
-                      editorCtl.open();
-                    }}
-                  >
-                    {t("deploy.targets.edit")}
-                  </Button>
-                  <Tooltip label={t("deploy.targets.delete")}>
-                    <ActionIcon
-                      size="sm"
-                      color="red"
-                      variant="subtle"
-                      onClick={() => confirmDelete(row.label, () => del.mutate(row.id), t)}
-                    >
-                      ×
-                    </ActionIcon>
-                  </Tooltip>
-                </Group>
-              </Table.Td>
-            </Table.Tr>
-          ))}
-        </Table.Tbody>
-      </Table>
-
-      <Modal
-        opened={editorOpened}
-        onClose={editorCtl.close}
-        title={t("deploy.targets.edit_title", { label: editing?.label ?? "" })}
-        size="md"
-      >
-        <TargetEditor
-          initial={editing}
-          saving={update.isPending}
-          onCancel={editorCtl.close}
-          onSave={(body) => {
-            if (editing) update.mutate({ id: editing.id, body });
-          }}
-        />
-      </Modal>
-
-      <Modal
-        opened={addModalOpened}
-        onClose={addModalCtl.close}
-        title={t("deploy.targets.add_title")}
-        size="lg"
-      >
-        <Tabs defaultValue="bootstrap">
-          <Tabs.List>
-            <Tabs.Tab value="bootstrap">{t("deploy.targets.tab_bootstrap")}</Tabs.Tab>
-            <Tabs.Tab value="manual">{t("deploy.targets.tab_manual")}</Tabs.Tab>
-          </Tabs.List>
-          <Tabs.Panel value="bootstrap" pt="md">
-            <Stack gap="xs">
-              <Text size="sm">{t("deploy.targets.bootstrap_help")}</Text>
-              <Group gap="xs" align="flex-start">
-                <Code style={{ flex: 1, padding: 10, fontSize: 12, wordBreak: "break-all" }}>
-                  {`curl -sSL ${ctrlBaseUrl()}/bootstrap.sh | sudo bash`}
-                </Code>
-                <Button
-                  size="xs"
-                  variant={bootstrapCopied ? "filled" : "light"}
-                  color={bootstrapCopied ? "teal" : undefined}
-                  onClick={() => {
-                    navigator.clipboard.writeText(`curl -sSL ${ctrlBaseUrl()}/bootstrap.sh | sudo bash`);
-                    setBootstrapCopied(true);
-                    setTimeout(() => setBootstrapCopied(false), 1500);
-                  }}
-                >
-                  {bootstrapCopied ? t("deploy.targets.bootstrap_copied") : t("deploy.targets.bootstrap_copy")}
-                </Button>
-              </Group>
-              <Text size="xs" c="dimmed">{t("deploy.targets.bootstrap_what")}</Text>
-              <Text size="xs" c="dimmed">{t("deploy.targets.bootstrap_prereq", { url: ctrlBaseUrl() })}</Text>
-            </Stack>
-          </Tabs.Panel>
-          <Tabs.Panel value="manual" pt="md">
-            <Text size="sm" c="dimmed" mb="xs">{t("deploy.targets.manual_help")}</Text>
-            <TargetEditor
-              saving={create.isPending}
-              onCancel={addModalCtl.close}
-              onSave={(body) => {
-                create.mutate(body, {
-                  onSuccess: () => addModalCtl.close(),
-                });
-              }}
-            />
-          </Tabs.Panel>
-        </Tabs>
-      </Modal>
-
-      <Modal
-        opened={pubkeyOpened}
-        onClose={pubkeyCtl.close}
-        title={t("deploy.targets.pubkey_title")}
-        size="lg"
-      >
-        <Stack gap="xs">
-          <Text size="sm">{t("deploy.targets.pubkey_help", { path: "/root/.ssh/authorized_keys" })}</Text>
-          {pubkey.data?.pubkey ? (
-            <>
-              <Code block style={{ wordBreak: "break-all", whiteSpace: "pre-wrap" }}>
-                {pubkey.data.pubkey}
-              </Code>
-              <Text size="xs" c="dimmed">source: {pubkey.data.source}</Text>
-              <Box mt="md">
-                <Text size="xs" fw={500} mb={4}>{t("deploy.targets.pubkey_how_label")}</Text>
-                <Code block>{`echo '${pubkey.data.pubkey}' | ssh root@<host> 'mkdir -p /root/.ssh && cat >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys'`}</Code>
-              </Box>
-            </>
-          ) : (
-            <Text c="red">{pubkey.data?.hint ?? t("deploy.targets.pubkey_error")}</Text>
-          )}
-        </Stack>
-      </Modal>
-    </Box>
-  );
-}
+// ============================================================
+// 配信パス: 編集フォーム
+// ============================================================
 
 function PathEditor({
   initial,
@@ -378,7 +102,7 @@ function PathEditor({
         required
         value={src}
         onChange={(e) => setSrc(e.currentTarget.value)}
-        placeholder="/opt/pipeline/plugins/embed_writer"
+        placeholder="/home/paps-ai/ai/pipeline/plugins/embed_writer"
       />
       <TextInput
         label={t("deploy.paths.dst")}
@@ -433,6 +157,10 @@ function PathEditor({
     </Stack>
   );
 }
+
+// ============================================================
+// 配信パス: 一覧 + 追加/編集/削除
+// ============================================================
 
 function PathsSection() {
   const { t } = useTranslation();
@@ -533,8 +261,8 @@ function PathsSection() {
                 {p.last_synced_at ? (
                   <Group gap={4}>
                     <Text size="xs">{p.last_synced_at.slice(11, 19)}</Text>
-                    {p.last_synced_ok === true && <Badge size="xs" color="teal">{t("deploy.targets.last_ok")}</Badge>}
-                    {p.last_synced_ok === false && <Badge size="xs" color="red">{t("deploy.targets.last_ng")}</Badge>}
+                    {p.last_synced_ok === true && <Badge size="xs" color="teal">{t("workers.registry.last_ok")}</Badge>}
+                    {p.last_synced_ok === false && <Badge size="xs" color="red">{t("workers.registry.last_ng")}</Badge>}
                   </Group>
                 ) : <Text size="xs" c="dimmed">{t("deploy.paths.last_not_deployed")}</Text>}
               </Table.Td>
@@ -545,7 +273,7 @@ function PathsSection() {
                   </Button>
                   <ActionIcon
                     size="sm" color="red" variant="subtle"
-                    onClick={() => confirmDelete(p.label, () => del.mutate(p.id), t)}
+                    onClick={() => confirmDeletePath(p.label, () => del.mutate(p.id), t)}
                   >×</ActionIcon>
                 </Group>
               </Table.Td>
@@ -574,6 +302,10 @@ function PathsSection() {
   );
 }
 
+// ============================================================
+// page entry
+// ============================================================
+
 export default function Deploy() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -592,12 +324,9 @@ export default function Deploy() {
     queryKey: ["deploy-detail", openedRun?.id],
     queryFn: () => deployApi.get(openedRun!.id),
     enabled: openedRun !== null && logModalOpened,
-    // running 中は 500ms 間隔で polling (= リアルタイム性 up)、 完了後は止まる
     refetchInterval: (q) => (q.state.data?.finished_at ? false : 500),
   });
   const logViewportRef = useRef<HTMLDivElement | null>(null);
-  // log が更新されたら末尾までスクロール (= リアルタイムフィード追従)
-  // 2 段 RAF で layout 計算 → paint 後にスクロール (= 1 段だと <pre> render 前で scrollHeight が古い)
   useEffect(() => {
     const v = logViewportRef.current;
     if (!v) return;
@@ -613,7 +342,6 @@ export default function Deploy() {
   const trigger = useMutation({
     mutationFn: () =>
       deployApi.trigger({
-        // hosts 省略 → DB の enabled=1 を使う
         skip_restart: skipRestart,
         dry_run: dryRun,
       }),
@@ -645,13 +373,11 @@ export default function Deploy() {
         border: "1px solid color-mix(in srgb, var(--mantine-color-indigo-6) 18%, transparent)",
       }}>
         <Text size="sm" c="dimmed" component="div">
-          <strong>① {t("deploy.intro_hosts")}</strong> — {t("deploy.intro_hosts_desc")} <br/>
+          <strong>① {t("deploy.intro_workers")}</strong> — {t("deploy.intro_workers_desc")} <br/>
           <strong>② {t("deploy.intro_paths")}</strong> — {t("deploy.intro_paths_desc")} <br/>
           <strong>③ {t("deploy.intro_button")}</strong> — {t("deploy.intro_button_desc")}
         </Text>
       </Box>
-
-      <TargetsSection />
 
       <PathsSection />
 

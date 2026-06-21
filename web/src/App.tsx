@@ -18,6 +18,7 @@ import {
   IconRocket,
   IconScript,
   IconSun,
+  IconUsersGroup,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
@@ -159,6 +160,12 @@ export default function App() {
           leftSection={<IconList size={18} />}
           component={RouterNavLink}
           to="/workloads"
+        />
+        <NavLink
+          label={t("nav.workers", "ワーカー")}
+          leftSection={<IconUsersGroup size={18} />}
+          component={RouterNavLink}
+          to="/workers"
         />
         <NavLink
           label={t("nav.logs")}
