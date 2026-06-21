@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>マニュアル — Pipeline</title>
+<meta name="description" content="Pipeline の概念、 Web UI、 プラグイン SDK、 REST API、 設定リファレンス。" />
+<link rel="stylesheet" href="assets/site.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="nav">
+    <a class="brand" href="./">Pipeline</a>
+    <div class="nav-links">
+      <a href="./">ホーム</a>
+      <a href="setup.html">セットアップ</a>
+      <a href="manual.html" class="active">マニュアル</a>
+    </div>
+    <a class="gh" href="https://github.com/paps-jp/pipeline" target="_blank" rel="noopener">GitHub →</a>
+  </nav>
+</header>
+
+<main>
+
+<h1>マニュアル</h1>
+<p>制御プレーン / ワーカー / プラグイン SDK / Web UI / REST API の リファレンス。</p>
+
+<div class="toc">
+  <h4>目次</h4>
+  <ul>
+    <li><a href="#concepts">1. 用語と概念</a></li>
+    <li><a href="#dashboard">2. Dashboard</a></li>
+    <li><a href="#workloads">3. Workloads</a></li>
+    <li><a href="#workers">4. Workers</a></li>
+    <li><a href="#service-log">5. ServiceLog</a></li>
+    <li><a href="#deploy">6. Deploy</a></li>
+    <li><a href="#plugin-sdk">7. プラグイン SDK</a></li>
+    <li><a href="#executors">8. Executor 種別</a></li>
+    <li><a href="#rest-api">9. REST API</a></li>
+    <li><a href="#config">10. 設定リファレンス</a></li>
+    <li><a href="#operations">11. 運用 Tips</a></li>
+  </ul>
+</div>
+
+<!-- 1. Concepts -->
+<section id="concepts">
+  <h2>1. 用語と概念</h2>
+
+  <table>
+    <tr><th>用語</th><th>説明</th></tr>
+    <tr><td><strong>制御プレーン (Control plane)</strong></td>
+        <td>FastAPI + SQLite で動く 単一プロセス。 Web UI 配信 + REST API + ワーカー heartbeat 受付。</td></tr>
+    <tr><td><strong>ワーカー (Worker)</strong></td>
+        <td>各ホストで動く デーモン。 制御プレーンに heartbeat を 10 秒ごとに送り、 キューから タスクを 1 つずつ 取り出して処理。</td></tr>
+    <tr><td><strong>ワークロード (Workload)</strong></td>
+        <td>「何を どう実行するか」 の 定義。 slug で 一意。 Web UI から登録する 1 つの単位。</td></tr>
+    <tr><td><strong>キュー (Queue)</strong></td>
+        <td>ワークロード毎に 1 つ作られる、 タスクの待ち行列。 SQLite 内の <code>&lt;slug&gt;_queue</code> テーブル。</td></tr>
+    <tr><td><strong>タスク (Task)</strong></td>
+        <td>キューに 1 行入る 処理単位。 <code>pk</code> (主キー) + <code>extra</code> (任意の JSON) を持つ。</td></tr>
+    <tr><td><strong>Run</strong></td>
+        <td>タスクの実行履歴 1 件。 成功 / 失敗 / 経過時間 / stdout / stderr / output_json が保存される。</td></tr>
+    <tr><td><strong>Executor</strong></td>
+        <td>タスクを 実際に処理する方式。 <code>shell</code> (= 任意コマンド) と <code>python_module</code> (= プラグイン呼出) の 2 種類。</td></tr>
+    <tr><td><strong>プラグイン</strong></td>
+        <td>Python モジュール 1 つを <code>plugins/&lt;name&gt;/</code> に配置。 <code>plugin.yaml</code> + <code>setup()</code>/<code>process()</code>/<code>cleanup()</code> を export する。</td></tr>
+  </table>
+
+  <h3>1.1 タスクのライフサイクル</h3>
+  <ol>
+    <li><strong>enqueue</strong> — Web UI または POST API で キューに pk を 1 件追加 (= state <code>pending</code>)</li>
+    <li><strong>claim</strong> — 空きの ワーカーが claim_batch で 1 件取得 (= state <code>claimed</code>、 リース付き)</li>
+    <li><strong>process</strong> — ワーカーが プラグインの <code>process(task)</code> を呼ぶ</li>
+    <li><strong>complete / fail</strong> — 戻り値が dict なら成功 (= キュー行を削除 + runs に記録)、 例外なら失敗 (= attempt 増加 + state <code>failed</code>)</li>
+    <li><strong>retry</strong> — failed タスクは max_attempts 未満なら 再度 pending に戻る。 上限に達すると dead-letter として 残る。</li>
+  </ol>
+</section>
+
+<!-- 2. Dashboard -->
+<section id="dashboard">
+  <h2>2. Dashboard</h2>
+
+  <p>制御プレーンの 全体状態を 一画面で 把握するためのページ。 3 秒ごとに更新。</p>
+
+  <table>
+    <tr><th>パネル</th><th>内容</th></tr>
+    <tr><td>実行中</td><td>finished_at が null の run 一覧 (workload / pk / worker / 経過秒)</td></tr>
+    <tr><td>最近の失敗</td><td>直近 300 件から success=false を 抽出 (最大 10 件)、 Python traceback の最終行を 表示</td></tr>
+    <tr><td>キュー深さ</td><td>enabled 各 workload の pending / claimed / failed をバーで可視化</td></tr>
+    <tr><td>システム情報</td><td>version / mode (= dev/prod) / DB URL / 現在時刻</td></tr>
+    <tr><td>GPU 温度</td><td>ワーカーが nvidia-smi メトリクスを heartbeat に乗せた場合、 過去 30 分の温度を スパークラインで 表示 (70℃ で 黄、 80℃ で 赤)</td></tr>
+  </table>
+</section>
+
+<!-- 3. Workloads -->
+<section id="workloads">
+  <h2>3. Workloads</h2>
+
+  <p>ワークロードの 一覧 + 作成 + 編集。 各行に 「直近 20 件の 成否」 がスパークラインで 表示される (緑 = 成功 / 赤 = 失敗)。</p>
+
+  <h3>3.1 ワークロード作成</h3>
+  <p>「新規作成」 ボタンで Drawer が 右から開く。 入力項目:</p>
+
+  <table>
+    <tr><th>項目</th><th>説明</th></tr>
+    <tr><td><strong>slug</strong></td><td>URL/識別子。 小文字英数 + ハイフン / アンダースコア。 一度作ったら 変更不可。</td></tr>
+    <tr><td><strong>表示名</strong></td><td>UI 上での 人間可読名。</td></tr>
+    <tr><td><strong>説明</strong></td><td>(任意) 何をする workload か メモ。</td></tr>
+    <tr><td><strong>実行モード</strong></td><td><code>shell</code> または <code>python_module</code> を選択。</td></tr>
+    <tr><td><strong>実行設定</strong></td><td>shell ならコマンド配列、 python_module ならプラグイン + モジュール + 設定。</td></tr>
+    <tr><td><strong>優先度</strong></td><td>0–100。 ワーカーが 複数 workload に対応する場合 高優先を 先に処理。</td></tr>
+    <tr><td><strong>重み</strong></td><td>同優先度内での 配分比率 (= weighted fair queue)。</td></tr>
+    <tr><td><strong>バッチサイズ</strong></td><td>ワーカーが 1 回の claim_batch で 取る件数。 大きいほど スループット 上昇、 小さいほど 公平性 / 失敗 局所化。</td></tr>
+    <tr><td><strong>lease 秒数</strong></td><td>claim 後 この秒数 worker から complete/fail が来なければ 他 worker が 再 claim 可能。</td></tr>
+    <tr><td><strong>max_attempts</strong></td><td>fail → retry の上限回数。 超えると dead-letter として残る。</td></tr>
+  </table>
+
+  <h3>3.2 タスク投入</h3>
+  <p>各行の 📨 アイコンで モーダルを開き、 pk と任意の extra (JSON) を入力して投入。 同じ pk は 重複扱いされ INSERT IGNORE される。</p>
+
+  <h3>3.3 実行履歴</h3>
+  <p>各行の 履歴アイコンで RunsDrawer が 右から開く。</p>
+  <ul>
+    <li>キュー状態 (pending / claimed / failed) の バッジ表示</li>
+    <li>直近 50 件の run を 表形式で 表示</li>
+    <li>各行クリックで stdout / stderr / error / output_json を 展開 (= 失敗原因が一目で分かる)</li>
+    <li>各行の 🔄 アイコンで <strong>同じ pk を 再投入</strong></li>
+  </ul>
+
+  <h3>3.4 URL deep link</h3>
+  <p>各 workload に 直接 URL でアクセス可能:</p>
+  <ul>
+    <li><code>/workloads/&lt;slug&gt;</code> — その workload の 編集 Drawer が開く</li>
+    <li><code>/workloads/&lt;slug&gt;/runs</code> — RunsDrawer が 開く</li>
+  </ul>
+  <p>Slack や Issue に URL を貼る運用に 便利。</p>
+</section>
+
+<!-- 4. Workers -->
+<section id="workers">
+  <h2>4. Workers</h2>
+
+  <p>接続中ワーカー の一覧。 表示項目:</p>
+
+  <table>
+    <tr><th>列</th><th>意味</th></tr>
+    <tr><td>id</td><td>ワーカー識別子 (= 起動時に <code>--worker-id</code> で指定、 デフォルトは hostname)</td></tr>
+    <tr><td>host</td><td>ワーカーの ホスト名</td></tr>
+    <tr><td>state</td><td><code>active</code> / <code>draining</code> / <code>lost</code> / <code>connecting</code></td></tr>
+    <tr><td>current_workload</td><td>現在処理中の workload (claim 中なら表示)</td></tr>
+    <tr><td>processed</td><td>累計 処理タスク数</td></tr>
+    <tr><td>errors</td><td>累計 エラー数</td></tr>
+    <tr><td>last_seen</td><td>最後の heartbeat 経過時間</td></tr>
+    <tr><td>started_at</td><td>起動時刻</td></tr>
+  </table>
+
+  <div class="callout">
+    <strong>state の遷移:</strong> heartbeat が 60 秒来ないと <code>lost</code> に。 さらに 600 秒来ないと
+    DB から 削除される (= worker_metrics の 該当行も リーパーで 削除)。
+  </div>
+</section>
+
+<!-- 5. ServiceLog -->
+<section id="service-log">
+  <h2>5. ServiceLog</h2>
+
+  <p>制御プレーン + 各ワーカーホスト の stdout/stderr を タブで切り替えて 表示。 動作中は teal の パルスバッジが 点滅、 一時停止中は灰色。</p>
+
+  <ul>
+    <li><strong>Pipeline タブ</strong> — 制御プレーン (= pipeline-oss-control.service) の ログ</li>
+    <li><strong>各 ホストタブ</strong> — Deploy で 登録した 各 配信先ホスト の ログ (= 配信時に該当ホストの service stdout/stderr が 制御プレーンに集約)</li>
+  </ul>
+
+  <p>タブ切替時に 自動で 最下行 (= 最新) にスクロール。 「一時停止」 で 自動更新を 停止できる。</p>
+</section>
+
+<!-- 6. Deploy -->
+<section id="deploy">
+  <h2>6. Deploy</h2>
+
+  <p>制御プレーンから 各ホストへ ファイルやコードを 一括配信する 仕組み。 SSH を裏で使う が、 オペレータは Web UI だけで完結。</p>
+
+  <h3>6.1 配信先ホスト</h3>
+  <p>SSH 接続先の 一覧:</p>
+  <ul>
+    <li><strong>label</strong>: 表示名</li>
+    <li><strong>host</strong>: IP または FQDN</li>
+    <li><strong>ssh_user</strong> / <strong>ssh_port</strong>: 通常 <code>root</code> / <code>22</code></li>
+    <li><strong>enabled</strong>: チェックを外すと この配信から 除外される</li>
+  </ul>
+
+  <p>「公開鍵を表示」 で 制御プレーンが使う SSH 公開鍵を 表示。 これを 配信先ホストの <code>~/.ssh/authorized_keys</code> に 入れることで パスワード無しの 配信が可能になる。</p>
+
+  <h3>6.2 配信パス</h3>
+  <p>「何を どこへ」 の 設定:</p>
+  <ul>
+    <li><strong>src_path</strong>: 制御プレーン上の パス (= 配信元)</li>
+    <li><strong>dst_path</strong>: 配信先ホストでの パス (= 配信先)</li>
+    <li><strong>setup_command</strong>: 配信直後に 1 回 実行するコマンド (任意)</li>
+    <li><strong>service_command</strong>: service として常駐させる場合 のコマンド (任意)</li>
+    <li><strong>delete_mode</strong>: rsync --delete を 付ける (= 余分なファイルを 配信先で 削除)</li>
+  </ul>
+
+  <h3>6.3 配信実行</h3>
+  <p>「Deploy now」 ボタン → 有効化された 全配信先 × 全配信パスを 一括実行。</p>
+  <ul>
+    <li><strong>skip restart</strong>: rsync のみで service restart は 行わない</li>
+    <li><strong>dry run</strong>: rsync --dry-run で 何が配信されるか だけを 表示</li>
+  </ul>
+
+  <p>結果は 履歴に 残り、 各 run の ログを 展開して 確認できる。</p>
+</section>
+
+<!-- 7. Plugin SDK -->
+<section id="plugin-sdk">
+  <h2>7. プラグイン SDK</h2>
+
+  <h3>7.1 ディレクトリ構成</h3>
+  <pre><code>plugins/
+  my_plugin/
+    plugin.yaml         # マニフェスト
+    main.py             # setup / process / cleanup を export
+    requirements.txt    # (任意) pip 依存。 ワーカーが venv に自動 install</code></pre>
+
+  <h3>7.2 plugin.yaml</h3>
+  <pre><code>name: my-plugin
+description: |
+  ここにプラグインの 説明を書く。 Web UI に 表示される。
+
+init_kwargs:
+  - key: api_url
+    type: str
+    default: https://api.example.com
+    label: API endpoint
+    help: タスクが叩く API の URL
+
+  - key: timeout_secs
+    type: float
+    default: 10
+    label: HTTP timeout
+    min: 1
+    max: 300
+
+  - key: dry_run
+    type: bool
+    default: false
+    label: 書き込みをスキップ
+
+  - key: api_key
+    type: secret
+    label: API key
+    help: 環境変数 でも 設定可
+
+hidden_kwargs:
+  - workload_slug    # 制御プレーンが 自動で入れる
+</code></pre>
+
+  <h4>init_kwargs の type</h4>
+  <table>
+    <tr><th>type</th><th>Web UI で表示される input</th></tr>
+    <tr><td><code>str</code></td><td>TextInput</td></tr>
+    <tr><td><code>path</code></td><td>TextInput (path 用 placeholder)</td></tr>
+    <tr><td><code>int</code></td><td>NumberInput (整数)</td></tr>
+    <tr><td><code>float</code></td><td>NumberInput (小数)</td></tr>
+    <tr><td><code>bool</code></td><td>Checkbox</td></tr>
+    <tr><td><code>enum</code></td><td>Select (= <code>options</code> 必須)</td></tr>
+    <tr><td><code>secret</code></td><td>PasswordInput</td></tr>
+  </table>
+
+  <h3>7.3 main.py</h3>
+  <pre><code>from typing import Any
+
+def setup(**kwargs: Any) -> dict[str, Any]:
+    """プロセス起動時に 1 回 呼ばれる。 重い初期化 (モデルロード / DB 接続)
+    はここで。 戻り dict が process() に ctx として 渡される。"""
+    return {
+        "api_url": kwargs["api_url"],
+        "timeout": kwargs.get("timeout_secs", 10),
+        "client": _make_http_client(),
+    }
+
+def process(task: Any, **ctx: Any) -> dict[str, Any]:
+    """1 タスク毎に呼ばれる。 task.pk + task.extra を 元に処理。
+    戻り dict は runs.output_json に保存される。 例外を上げると 失敗扱い。"""
+    response = ctx["client"].get(f"{ctx['api_url']}/{task.pk}", timeout=ctx["timeout"])
+    return {"status_code": response.status_code, "size": len(response.content)}
+
+def cleanup(**ctx: Any) -> None:
+    """プロセス停止時に呼ばれる (任意)。 接続のクローズなど。"""
+    ctx["client"].close()</code></pre>
+
+  <h3>7.4 task オブジェクト</h3>
+  <table>
+    <tr><th>属性</th><th>型</th><th>意味</th></tr>
+    <tr><td><code>pk</code></td><td>str</td><td>タスクの 主キー</td></tr>
+    <tr><td><code>extra</code></td><td>dict</td><td>enqueue 時に 添えた JSON</td></tr>
+    <tr><td><code>attempt</code></td><td>int</td><td>何回目の試行か (0 始まり)</td></tr>
+    <tr><td><code>enqueued_at</code></td><td>str (ISO)</td><td>キューに入った 時刻</td></tr>
+  </table>
+
+  <h3>7.5 サンプル</h3>
+  <p>repo に <a href="https://github.com/paps-jp/pipeline/tree/main/plugins/echo_sample"><code>plugins/echo_sample/</code></a> が同梱。 新規 plugin を作るときは これをコピーするのが 早い。</p>
+</section>
+
+<!-- 8. Executors -->
+<section id="executors">
+  <h2>8. Executor 種別</h2>
+
+  <h3>8.1 shell</h3>
+  <p>任意の シェルコマンドを 1 タスク = 1 プロセスとして 実行する。</p>
+  <pre><code>{
+  "command": ["bash", "-c", "echo task={task.pk}"],
+  "cwd": null,
+  "env": {"MY_VAR": "value"},
+  "timeout_secs": 60
+}</code></pre>
+  <p>テンプレート変数 <code>{task.pk}</code> <code>{task.extra.KEY}</code> が 展開される。</p>
+
+  <h3>8.2 python_module</h3>
+  <p>プラグインを 呼ぶ。 instance は worker プロセスで キャッシュされる ため、 重い setup() は 1 回だけ実行。</p>
+  <pre><code>{
+  "source_path": "plugins/my_plugin",
+  "module": "main",
+  "init_kwargs": {
+    "api_url": "https://api.example.com",
+    "timeout_secs": 10
+  }
+}</code></pre>
+</section>
+
+<!-- 9. REST API -->
+<section id="rest-api">
+  <h2>9. REST API</h2>
+
+  <p>FastAPI が <code>/docs</code> で OpenAPI Swagger UI を 自動配信する (= <code>http://localhost:8001/docs</code>)。 以下は 主要なエンドポイント。</p>
+
+  <h3>9.1 システム</h3>
+  <table>
+    <tr><th>method</th><th>path</th><th>説明</th></tr>
+    <tr><td>GET</td><td><code>/api/v1/health</code></td><td>軽量 ヘルスチェック (LB 用)</td></tr>
+    <tr><td>GET</td><td><code>/api/v1/status</code></td><td>version / mode / db_url / now</td></tr>
+    <tr><td>GET</td><td><code>/api/v1/runs?limit=N</code></td><td>全 workload 横断の 直近 N 件 run</td></tr>
+  </table>
+
+  <h3>9.2 ワークロード</h3>
+  <table>
+    <tr><th>method</th><th>path</th><th>説明</th></tr>
+    <tr><td>GET</td><td><code>/api/v1/workloads</code></td><td>一覧</td></tr>
+    <tr><td>POST</td><td><code>/api/v1/workloads</code></td><td>作成</td></tr>
+    <tr><td>GET</td><td><code>/api/v1/workloads/{slug}</code></td><td>1 件取得</td></tr>
+    <tr><td>PUT</td><td><code>/api/v1/workloads/{slug}</code></td><td>更新</td></tr>
+    <tr><td>PATCH</td><td><code>/api/v1/workloads/{slug}/enabled</code></td><td>enabled トグル</td></tr>
+    <tr><td>DELETE</td><td><code>/api/v1/workloads/{slug}</code></td><td>削除</td></tr>
+    <tr><td>POST</td><td><code>/api/v1/workloads/{slug}/tasks</code></td><td>タスク投入</td></tr>
+    <tr><td>POST</td><td><code>/api/v1/workloads/{slug}/tasks/batch</code></td><td>バルク投入</td></tr>
+    <tr><td>GET</td><td><code>/api/v1/workloads/{slug}/queue</code></td><td>キュー状態</td></tr>
+    <tr><td>GET</td><td><code>/api/v1/workloads/{slug}/runs?limit=N</code></td><td>run 履歴</td></tr>
+  </table>
+
+  <h3>9.3 ワーカー</h3>
+  <table>
+    <tr><th>method</th><th>path</th><th>説明</th></tr>
+    <tr><td>GET</td><td><code>/api/v1/workers</code></td><td>一覧</td></tr>
+    <tr><td>GET</td><td><code>/api/v1/workers/metrics?minutes=N</code></td><td>GPU メトリクス (温度 / 使用率)</td></tr>
+  </table>
+
+  <h3>9.4 Dashboard 集約</h3>
+  <table>
+    <tr><th>method</th><th>path</th><th>説明</th></tr>
+    <tr><td>GET</td><td><code>/api/v1/dashboard/overview</code></td><td>running / recent_failures / queue_depths の 集約</td></tr>
+    <tr><td>GET</td><td><code>/api/v1/dashboard/workloads-runs-summary</code></td><td>各 workload の 直近 20 件成否 (sparkline 用)</td></tr>
+  </table>
+
+  <h3>9.5 プラグイン</h3>
+  <table>
+    <tr><th>method</th><th>path</th><th>説明</th></tr>
+    <tr><td>GET</td><td><code>/api/v1/plugins/available</code></td><td>plugins/ ディレクトリの 一覧 + manifest</td></tr>
+  </table>
+
+  <h3>9.6 タスク投入例</h3>
+  <pre><code>curl -X POST http://localhost:8001/api/v1/workloads/echo-test/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"pk": "task-001", "extra": {"foo": "bar"}}'</code></pre>
+
+  <h3>9.7 バルク投入例</h3>
+  <pre><code>curl -X POST http://localhost:8001/api/v1/workloads/echo-test/tasks/batch \
+  -H "Content-Type: application/json" \
+  -d '{"items": [{"pk": "t1"}, {"pk": "t2"}, {"pk": "t3"}]}'</code></pre>
+</section>
+
+<!-- 10. Config -->
+<section id="config">
+  <h2>10. 設定リファレンス</h2>
+
+  <h3>10.1 制御プレーン CLI</h3>
+  <pre><code>pipeline run [OPTIONS]
+
+  --host TEXT        listen するホスト名/IP (デフォルト 0.0.0.0)
+  --port INTEGER     listen ポート (デフォルト 8001)
+  --db-url TEXT      SQLAlchemy URL (例: sqlite:///./pipeline.db)
+  --log-level TEXT   debug / info / warning / error
+  --mode TEXT        dev / prod (= CORS 設定が変わる)</code></pre>
+
+  <h3>10.2 ワーカー CLI</h3>
+  <pre><code>pipeline worker [OPTIONS]
+
+  --control-url TEXT  制御プレーンの URL (例: http://10.0.0.1:8001) [必須]
+  --worker-id TEXT    ワーカー識別子 (デフォルト hostname)
+  --tags TEXT         カンマ区切り (例: gpu,cuda12)
+  --token TEXT        制御プレーン認証トークン (任意)
+  --log-level TEXT    ログレベル</code></pre>
+
+  <h3>10.3 環境変数</h3>
+  <table>
+    <tr><th>変数</th><th>意味</th></tr>
+    <tr><td><code>PIPELINE_DB_URL</code></td><td><code>--db-url</code> と同等</td></tr>
+    <tr><td><code>ADMIN_PASSWORD</code></td><td>初回起動時に 管理者パスワードを 設定 (= 認証を有効化する場合)</td></tr>
+  </table>
+</section>
+
+<!-- 11. Operations -->
+<section id="operations">
+  <h2>11. 運用 Tips</h2>
+
+  <h3>11.1 バックアップ</h3>
+  <p>SQLite ファイル (<code>pipeline.db</code>) を そのままコピーすれば フル バックアップ。 制御プレーンが動作中でも WAL モードなので 読み出し ロックは 発生しにくい。 確実を期すなら <code>VACUUM INTO</code>:</p>
+  <pre><code>sqlite3 pipeline.db "VACUUM INTO 'pipeline-backup-$(date +%Y%m%d).db'"</code></pre>
+
+  <h3>11.2 ワーカー追加 / 削除</h3>
+  <p>ワーカーは pull 型なので、 追加は デーモン起動だけで OK (= 制御プレーン側の 設定変更 不要)。 削除は デーモン停止だけ、 60 秒後に <code>lost</code>、 600 秒後に DB から消える。</p>
+
+  <h3>11.3 ワーカーの アフィニティ</h3>
+  <p>workload の <code>host_affinity</code> を 設定する と、 タグが一致する ワーカーだけが claim できる。 例: <code>["gpu"]</code> を指定すると tags=<code>gpu</code> 持ちのみ。</p>
+
+  <h3>11.4 失敗の リトライ</h3>
+  <p>例外で 失敗した タスクは <code>max_attempts</code> 回まで 自動 retry。 上限超過後は キューに残るが claim されなくなる (= dead-letter)。 これらは Dashboard の キュー深さで <code>failed</code> として見える。 手動で 再投入するか、 失敗原因を 修正して enable 切替で 再開。</p>
+
+  <h3>11.5 監視</h3>
+  <p>Prometheus 形式の メトリクス endpoint は 未実装 (= 必要に応じて 追加可能)。 当面は:</p>
+  <ul>
+    <li>Dashboard の キュー深さで 滞留を 監視</li>
+    <li><code>/api/v1/dashboard/overview</code> の <code>recent_failures</code> を 定期 ping</li>
+    <li>nvidia-smi メトリクスは ワーカーから 自動収集</li>
+  </ul>
+
+  <h3>11.6 アップデート</h3>
+  <pre><code>cd /opt/pipeline
+git pull
+pip install -e .
+sudo systemctl restart pipeline-control
+# 各 worker:
+sudo systemctl restart pipeline-worker</code></pre>
+
+  <p>Web UI を 更新した場合は <code>cd web && npm install && npm run build</code> も 実行。</p>
+</section>
+
+</main>
+
+<footer>
+  <div>Pipeline — GUI-first batch fleet</div>
+  <div>
+    <a href="https://github.com/paps-jp/pipeline">GitHub</a> ·
+    <a href="./">ホーム</a> ·
+    <a href="setup.html">セットアップ</a>
+  </div>
+</footer>
+
+</body>
+</html>

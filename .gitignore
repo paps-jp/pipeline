@@ -29,8 +29,15 @@ local/
 # scratch/ = operator の一時スクリプト (機密 password を含むため絶対に commit しない)
 scratch/
 
-# plugins/ = face_search 固有の本番プラグイン (= operator 判断で OSS リポジトリには載せない)
-plugins/
+# plugins/ — face_search 固有の本番プラグインは個別に除外、 sample/ などのサンプルは公開
+plugins/crawl_image_dispatcher/
+plugins/embed_production/
+plugins/embed_writer/
+plugins/hash_detect_cpuread/
+plugins/hash_detect_dryrun/
+plugins/hash_detect_drywrite/
+plugins/hash_detect_gpuread/
+plugins/hash_detect_production/
 
 # docs/ = ワークロード内部設計 (= operator 判断で OSS リポジトリには載せない、 ローカルにだけ残す)
 docs/
