@@ -139,6 +139,52 @@
 </section>
 
 <section>
+  <h2>画面ツアー</h2>
+  <p>主要 4 画面の スクリーンショット。 click で 原寸表示。</p>
+  <div class="tour-grid">
+    <figure class="tour-figure">
+      <a href="assets/screenshots/dashboard.png" target="_blank" rel="noopener">
+        <img src="assets/screenshots/dashboard.png" alt="Dashboard — 実行中 / 最近の失敗 / キュー深さ + バージョン情報 + GPU 温度スパークライン" loading="lazy" />
+      </a>
+      <figcaption>
+        <div class="label">ダッシュボード <span class="badge">Dashboard</span></div>
+        <div class="desc">「いま何が動いているか」 3 panel + バージョン情報 + GPU 温度のライブスパークライン (3 秒更新)</div>
+      </figcaption>
+    </figure>
+
+    <figure class="tour-figure">
+      <a href="assets/screenshots/workloads.png" target="_blank" rel="noopener">
+        <img src="assets/screenshots/workloads.png" alt="Workloads — slug / executor / sparkline / enabled toggle / 優先度 / バッチ" loading="lazy" />
+      </a>
+      <figcaption>
+        <div class="label">ワークロード <span class="badge">Workloads</span></div>
+        <div class="desc">登録ワークロード一覧。 直近 20 件の成否を行内スパークライン + 成功率で表示。 各行から 投入 / 履歴 / 編集 / 削除。</div>
+      </figcaption>
+    </figure>
+
+    <figure class="tour-figure">
+      <a href="assets/screenshots/service-log.png" target="_blank" rel="noopener">
+        <img src="assets/screenshots/service-log.png" alt="ServiceLog — Pipeline制御 + 各ホストのタブ + 動作中 pulse バッジ + 一時停止" loading="lazy" />
+      </a>
+      <figcaption>
+        <div class="label">サービスログ <span class="badge">ServiceLog</span></div>
+        <div class="desc">制御プレーン + 各ホストの stdout を タブで切替。 動作中は teal の pulse バッジで稼働を 視認。</div>
+      </figcaption>
+    </figure>
+
+    <figure class="tour-figure">
+      <a href="assets/screenshots/deploy.png" target="_blank" rel="noopener">
+        <img src="assets/screenshots/deploy.png" alt="Deploy — 配信先ホスト + 配信パス + 配信実行 + 履歴" loading="lazy" />
+      </a>
+      <figcaption>
+        <div class="label">コード配信 <span class="badge">Code deploy</span></div>
+        <div class="desc">配信先ホスト × 配信パスを Web UI で登録し、 1 ボタンで rsync + service restart を一括実行。</div>
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
   <h2>これでできること</h2>
   <table>
     <tr><th>シナリオ</th><th>仕組み</th></tr>
