@@ -182,20 +182,37 @@ done
 if [ "$SKIP_RESTART" = "1" ] || [ "$DRY_RUN" = "1" ]; then
   log "Step 2: SKIP_RESTART=$SKIP_RESTART, DRY_RUN=$DRY_RUN → skip pipeline-worker-gpu restart"
 else
-  log "Step 2: restart pipeline-worker-gpu.service on all hosts"
+  log "Step 2: restart pipeline-worker-gpu instances (= template + 単発の両方対応)"
   for host in $GPU_HOSTS; do
     out="$TMPDIR/restart-$host.log"
     (
-      ssh -o ConnectTimeout=5 root@$host \
-        "systemctl restart pipeline-worker-gpu.service && sleep 2 && systemctl is-active pipeline-worker-gpu.service" \
-        > "$out" 2>&1
+      ssh -o ConnectTimeout=5 root@$host bash <<'EOSSH' > "$out" 2>&1
+# template instance (= pipeline-worker-gpu@N.service) を列挙、 無ければ単発 .service へ fallback
+units=$(systemctl list-units --type=service --all --no-legend 'pipeline-worker-gpu@*' 2>/dev/null \
+        | awk '{print $1}' | grep -v '^$' | sort -u)
+if [ -z "$units" ]; then
+  units="pipeline-worker-gpu.service"
+fi
+ok=0; total=0
+for u in $units; do
+  total=$((total+1))
+  if systemctl restart "$u" 2>&1; then
+    ok=$((ok+1))
+  fi
+done
+sleep 2
+for u in $units; do
+  echo "  $u: $(systemctl is-active "$u" 2>&1)"
+done
+echo "restarted: $ok/$total"
+EOSSH
     ) &
   done
   wait
   for host in $GPU_HOSTS; do
     out="$TMPDIR/restart-$host.log"
-    state=$(tail -1 "$out" 2>/dev/null || echo "?")
-    log "  $host: $state"
+    summary=$(grep '^restarted:' "$out" 2>/dev/null || echo "?")
+    log "  $host: $summary"
   done
 fi
 

@@ -22,7 +22,7 @@ router = APIRouter(prefix="/api/v1/admin", tags=["admin-deploy"])
 bootstrap_router = APIRouter(tags=["bootstrap"])  # root-level (= /bootstrap.sh)
 log = logging.getLogger("pipeline.api.admin_deploy")
 
-DEPLOY_SCRIPT = "/opt/pipeline/scripts/deploy-to-gpu.sh"
+DEPLOY_SCRIPT = str(Path(__file__).resolve().parents[2] / "scripts" / "deploy-to-gpu.sh")
 LOG_HISTORY_MAX = 20  # 直近 20 回ぶん保持
 
 # プロセス内のシンプルな履歴 (= 永続化はしない、 restart で消える)
