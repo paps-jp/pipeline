@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Pipeline — GPU の 空き容量を バッチで 埋め尽くす</title>
-<meta name="description" content="Pipeline — 推論 / 学習の あいまに 残る GPU の 空き時間を、 複数バッチ ワークロードで 埋める 制御プレーン。 self-loop で キューを 絶やさず、 アイドル GPU を 残さない。" />
+<title>Pipeline — GPUの空き容量をバッチで埋め尽くす</title>
+<meta name="description" content="Pipeline — 推論 / 学習のあいまに残るGPUの空き時間を、複数バッチワークロードで埋める制御プレーン。self-loopでキューを絶やさず、アイドルGPUを残さない。" />
 <link rel="icon" type="image/x-icon" href="assets/favicon.ico" />
 <link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png" />
 <link rel="icon" type="image/png" sizes="192x192" href="assets/icon-192.png" />
@@ -32,11 +32,11 @@
 
 <section class="hero">
   <img class="hero-icon" src="assets/icon-256.png" alt="Pipeline" />
-  <h1>アイドル GPU を、<br/>バッチで 埋め尽くす</h1>
+  <h1>アイドルGPUを、<br/>バッチで埋め尽くす</h1>
   <p class="tagline">
-    推論 / 学習 / 解析 — 複数の バッチ ワークロードを 同じ GPU フリートに 同居させ、
-    self-loop で キューを 絶やさず、 残った 空き時間を 別 workload で 埋める。
-    GPU を 「ジョブ単独で 半分しか 使えない」 から 「常時 ほぼフル稼働」 へ。
+    推論 / 学習 / 解析 — 複数のバッチワークロードを同じGPUフリートに同居させ、
+    self-loopでキューを絶やさず、残った空き時間を別workloadで埋める。
+    GPUを「ジョブ単独で半分しか使えない」から「常時ほぼフル稼働」へ。
   </p>
   <div class="cta-row">
     <a class="btn btn-primary" href="setup.html">セットアップを見る</a>
@@ -47,32 +47,32 @@
 <main>
 
 <section>
-  <h2>なぜ GPU の 空きを 埋め切れるのか</h2>
+  <h2>なぜGPUの空きを埋め切れるのか</h2>
   <p>
-    単一ジョブ で 動かす GPU は、 入力待ち / モデルロード / preprocess / 後処理 で
-    案外 半分くらい アイドル している。 Pipeline は 4 つの 構造で その 隙間を 別 workload に
-    流し込んで、 アイドル時間を 残さない。
+    単一ジョブで動かすGPUは、入力待ち / モデルロード / preprocess / 後処理で
+    案外半分くらいアイドルしている。Pipelineは4つの構造でその隙間を別workloadに
+    流し込んで、アイドル時間を残さない。
   </p>
   <div class="feature-grid">
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:infinity"></iconify-icon></div>
-      <h3>self-loop で キューを 絶やさない</h3>
-      <p>ワークロード 自身が 「次の tick」 を 自分で キューに 入れ続ける 設計。 外部の dispatcher / cron が 不要、 キューが 空になる 瞬間が 無いので、 ワーカーは 常に 次の 仕事を 受け取れる。</p>
+      <h3>self-loopでキューを絶やさない</h3>
+      <p>ワークロード自身が「次のtick」を自分でキューに入れ続ける設計。外部のdispatcher / cronが不要、キューが空になる瞬間が無いので、ワーカーは常に次の仕事を受け取れる。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:list-checks"></iconify-icon></div>
-      <h3>1 タスク = 1 claim、 順序 自由</h3>
-      <p>ワーカーは キューから 1 件 取って 処理 → 完了 → 次の 1 件、 を 繰り返す だけ。 バッチ barrier (= N 件 揃ってから 次へ) が 無いので、 速い task と 遅い task が 同居しても 速い方が 先に 流れて GPU を 空かせない。</p>
+      <h3>1タスク = 1 claim、順序自由</h3>
+      <p>ワーカーはキューから1件取って処理 → 完了 → 次の1件、を繰り返すだけ。バッチbarrier (= N件揃ってから次へ) が無いので、速いtaskと遅いtaskが同居しても速い方が先に流れてGPUを空かせない。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:sliders-horizontal"></iconify-icon></div>
-      <h3>複数 workload の 同居 + 重み配分</h3>
-      <p>同じ ワーカー fleet に N 個 workload を 登録できる。 優先度 + 重みを Optimizer が 自動調整、 「メインの 推論 70%、 隙間の 解析 30%」 のような 同居構成を 1 fleet で 実現する。 重い 学習が 来たら 軽い 推論を 一時 退避、 終わり次第 復帰。</p>
+      <h3>複数workloadの同居 + 重み配分</h3>
+      <p>同じワーカーfleetにN個workloadを登録できる。優先度 + 重みをOptimizerが自動調整、「メインの推論70%、隙間の解析30%」のような同居構成を1 fleetで実現する。重い学習が来たら軽い推論を一時退避、終わり次第復帰。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:tag"></iconify-icon></div>
-      <h3>GPU タグで 必要な ワーカーへ</h3>
-      <p>ワーカーごとに <code>gpu</code> / <code>cpu</code> / 任意 タグを 付与。 GPU 必須の task は GPU ワーカーへ、 CPU で OK な task は CPU ワーカーへ アフィニティ 振り分け。 GPU は 「GPU が 本当に 要る タスク」 だけで 埋まる。</p>
+      <h3>GPUタグで必要なワーカーへ</h3>
+      <p>ワーカーごとに <code>gpu</code> / <code>cpu</code> / 任意タグを付与。GPU必須のtaskはGPUワーカーへ、CPUでOKなtaskはCPUワーカーへアフィニティ振り分け。GPUは「GPUが本当に要るタスク」だけで埋まる。</p>
     </div>
   </div>
 </section>
@@ -82,33 +82,33 @@
   <div class="feature-grid">
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:clipboard-list"></iconify-icon></div>
-      <h3>GUI でワークロード登録</h3>
-      <p>シェルコマンドや Python モジュールを Web UI のフォームから登録。 開発者以外の運用担当でも追加・編集できる。</p>
+      <h3>GUIでワークロード登録</h3>
+      <p>シェルコマンドやPythonモジュールをWeb UIのフォームから登録。開発者以外の運用担当でも追加・編集できる。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:puzzle"></iconify-icon></div>
       <h3>プラグイン方式</h3>
-      <p>ローカル <code>plugins/</code> ディレクトリに <code>plugin.yaml</code> + <code>main.py</code> を置けば 即フォーム化。 サンプル付属。</p>
+      <p>ローカル <code>plugins/</code> ディレクトリに <code>plugin.yaml</code> + <code>main.py</code> を置けば即フォーム化。サンプル付属。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:zap"></iconify-icon></div>
-      <h3>シンプルな ワーカー</h3>
-      <p>各ホストに 1 つのデーモンが HTTP heartbeat で参加。 クラスタマネージャ不要、 SSH 不要 (= 配信は HTTP 経由)。</p>
+      <h3>シンプルなワーカー</h3>
+      <p>各ホストに1つのデーモンがHTTP heartbeatで参加。クラスタマネージャ不要、SSH不要 (= 配信はHTTP経由)。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:activity"></iconify-icon></div>
       <h3>ライブ可視化</h3>
-      <p>ダッシュボードで 実行中タスク / 最近の失敗 / キュー深さ / GPU 温度を 3 秒更新で表示。</p>
+      <p>ダッシュボードで実行中タスク / 最近の失敗 / キュー深さ / GPU温度を3秒更新で表示。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:refresh-cw"></iconify-icon></div>
       <h3>失敗詳細 + 再実行</h3>
-      <p>各 run の stderr / Python traceback を ワンクリックで展開。 失敗した task は 同じ pk で 即 再投入できる。 1 件 詰まって 全体停止、 という Airflow 系の 落とし穴を 構造的に 回避。</p>
+      <p>各runのstderr / Python tracebackをワンクリックで展開。失敗したtaskは同じpkで即再投入できる。1件詰まって全体停止、というAirflow系の落とし穴を構造的に回避。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:database"></iconify-icon></div>
-      <h3>SQLite シングルファイル</h3>
-      <p>制御プレーンの全状態が 1 つの SQLite ファイルに収まる。 バックアップ・差分・grep が容易。</p>
+      <h3>SQLiteシングルファイル</h3>
+      <p>制御プレーンの全状態が1つのSQLiteファイルに収まる。バックアップ・差分・grepが容易。</p>
     </div>
   </div>
 </section>
@@ -116,9 +116,9 @@
 <section>
   <h2>アーキテクチャ</h2>
   <p>
-    制御プレーン (= FastAPI + SQLite + React 配信) と ワーカー (= ジョブ実行プロセス) は
-    明確に分離されている。 ワーカーは HTTP heartbeat で制御プレーンに参加し、 キューから
-    タスクを claim → process → complete する。
+    制御プレーン (= FastAPI + SQLite + React配信) とワーカー (= ジョブ実行プロセス) は
+    明確に分離されている。ワーカーはHTTP heartbeatで制御プレーンに参加し、キューから
+    タスクをclaim → process → completeする。
   </p>
 
   <div class="diagram">
@@ -173,18 +173,18 @@
 
 <section>
   <h2>画面ツアー</h2>
-  <p>主要 4 画面の スクリーンショット。 click で 原寸表示。</p>
+  <p>主要4画面のスクリーンショット。clickで原寸表示。</p>
   <div class="tour-grid">
     <figure class="tour-figure">
       <a href="assets/screenshots/dashboard.png" target="_blank" rel="noopener">
         <picture>
           <source srcset="assets/screenshots/dashboard.webp" type="image/webp" />
-          <img src="assets/screenshots/dashboard.png" width="1103" height="776" alt="Dashboard — 実行中 / 最近の失敗 / キュー深さ + バージョン情報 + GPU 温度スパークライン" loading="lazy" decoding="async" />
+          <img src="assets/screenshots/dashboard.png" width="1103" height="776" alt="Dashboard — 実行中 / 最近の失敗 / キュー深さ + バージョン情報 + GPU温度スパークライン" loading="lazy" decoding="async" />
         </picture>
       </a>
       <figcaption>
         <div class="label">ダッシュボード <span class="badge">Dashboard</span></div>
-        <div class="desc">「いま何が動いているか」 3 panel + バージョン情報 + GPU 温度のライブスパークライン (3 秒更新)</div>
+        <div class="desc">「いま何が動いているか」3 panel + バージョン情報 + GPU温度のライブスパークライン (3秒更新)</div>
       </figcaption>
     </figure>
 
@@ -197,7 +197,7 @@
       </a>
       <figcaption>
         <div class="label">ワークロード <span class="badge">Workloads</span></div>
-        <div class="desc">登録ワークロード一覧。 直近 20 件の成否を行内スパークライン + 成功率で表示。 各行から 投入 / 履歴 / 編集 / 削除。</div>
+        <div class="desc">登録ワークロード一覧。直近20件の成否を行内スパークライン + 成功率で表示。各行から投入 / 履歴 / 編集 / 削除。</div>
       </figcaption>
     </figure>
 
@@ -205,12 +205,12 @@
       <a href="assets/screenshots/service-log.png" target="_blank" rel="noopener">
         <picture>
           <source srcset="assets/screenshots/service-log.webp" type="image/webp" />
-          <img src="assets/screenshots/service-log.png" width="1078" height="630" alt="ServiceLog — Pipeline制御 + 各ホストのタブ + 動作中 pulse バッジ + 一時停止" loading="lazy" decoding="async" />
+          <img src="assets/screenshots/service-log.png" width="1078" height="630" alt="ServiceLog — Pipeline制御 + 各ホストのタブ + 動作中pulseバッジ + 一時停止" loading="lazy" decoding="async" />
         </picture>
       </a>
       <figcaption>
         <div class="label">サービスログ <span class="badge">ServiceLog</span></div>
-        <div class="desc">制御プレーン + 各ホストの stdout を タブで切替。 動作中は teal の pulse バッジで稼働を 視認。</div>
+        <div class="desc">制御プレーン + 各ホストのstdoutをタブで切替。動作中はtealのpulseバッジで稼働を視認。</div>
       </figcaption>
     </figure>
 
@@ -223,7 +223,7 @@
       </a>
       <figcaption>
         <div class="label">コード配信 <span class="badge">Code deploy</span></div>
-        <div class="desc">配信先ホスト × 配信パスを Web UI で登録し、 1 ボタンで rsync + service restart を一括実行。</div>
+        <div class="desc">配信先ホスト × 配信パスをWeb UIで登録し、1ボタンでrsync + service restartを一括実行。</div>
       </figcaption>
     </figure>
   </div>
@@ -234,24 +234,24 @@
   <table>
     <tr><th>シナリオ</th><th>仕組み</th></tr>
     <tr>
-      <td>定期的に 1 行 = 1 タスクの SQL クエリを 並列実行したい</td>
-      <td>ワークロード 1 つ + ワーカー N 台 → 自動分散</td>
+      <td>定期的に1行 = 1タスクのSQLクエリを並列実行したい</td>
+      <td>ワークロード1つ + ワーカーN台 → 自動分散</td>
     </tr>
     <tr>
-      <td>GPU を使う モデル推論を 複数ホストで 回したい</td>
-      <td>Python プラグイン + ワーカー tags=gpu でアフィニティ</td>
+      <td>GPUを使うモデル推論を複数ホストで回したい</td>
+      <td>Pythonプラグイン + ワーカーtags=gpuでアフィニティ</td>
     </tr>
     <tr>
-      <td>失敗した タスクだけを 後で再実行したい</td>
-      <td>RunsDrawer の各行に 「再投入」 ボタン</td>
+      <td>失敗したタスクだけを後で再実行したい</td>
+      <td>RunsDrawerの各行に「再投入」ボタン</td>
     </tr>
     <tr>
-      <td>運用担当 (= 非エンジニア) が ジョブ設定を 変更したい</td>
-      <td><code>plugin.yaml</code> の <code>init_kwargs</code> から フォームを自動生成</td>
+      <td>運用担当 (= 非エンジニア) がジョブ設定を変更したい</td>
+      <td><code>plugin.yaml</code> の <code>init_kwargs</code> からフォームを自動生成</td>
     </tr>
     <tr>
-      <td>新しい GPU 箱を 5 分で 追加したい</td>
-      <td>bootstrap スクリプト 1 行 + Deploy タブで配信先登録</td>
+      <td>新しいGPU箱を5分で追加したい</td>
+      <td>bootstrapスクリプト1行 + Deployタブで配信先登録</td>
     </tr>
   </table>
 </section>
@@ -259,10 +259,10 @@
 <section>
   <h2>これは向いていない</h2>
   <ul>
-    <li><strong>10,000 ノード以上の分散学習</strong> — 専用フレームワーク (Ray など) の方が適切</li>
-    <li><strong>ノード間で 大 tensor を zero-copy で渡す ワークロード</strong> — object store が無いため</li>
-    <li><strong>複雑な DAG / Workflow オーケストレーション</strong> — 直列 chain + self-loop の シンプル設計</li>
-    <li><strong>マルチテナント (複数チーム共有)</strong> — 単一 operator を想定</li>
+    <li><strong>10,000ノード以上の分散学習</strong> — 専用フレームワーク (Rayなど) の方が適切</li>
+    <li><strong>ノード間で大tensorをzero-copyで渡すワークロード</strong> — object storeが無いため</li>
+    <li><strong>複雑なDAG / Workflowオーケストレーション</strong> — 直列chain + self-loopのシンプル設計</li>
+    <li><strong>マルチテナント (複数チーム共有)</strong> — 単一operatorを想定</li>
   </ul>
 </section>
 
