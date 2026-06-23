@@ -1,0 +1,68 @@
+name: rss-news-summarize
+description: |
+  RSS / Atom の 1 エントリ = 1 タスクで本文を取得し、 Claude haiku で 数行に 要約する。
+  結果は plugin 内の SQLite (`store_db_path`) に永続化し、 同時に runs.output_json
+  にも 入る (Web UI の「履歴 / Runs Drawer」 で 直接 読める)。
+
+  ペアの dispatcher が `rss-news-dispatcher`。 task.pk = エントリ URL、
+  task.extra = {feed_name, feed_url, title, summary_html, published}。
+
+  本文 fetch は graceful fallback:
+    trafilatura (best) → BeautifulSoup (good) → 正規表現 strip (raw) → RSS summary_html (last resort)
+  どれも未インストール / fetch 失敗時は RSS の summary を そのまま 要約材料にする。
+
+init_kwargs:
+  - key: anthropic_api_key_env
+    type: str
+    default: ANTHROPIC_API_KEY
+    label: Anthropic API key を 読む 環境変数名
+    help: そのまま os.environ から 読む。 `.env` ファイル運用なら 別途 systemd unit で 注入
+
+  - key: model
+    type: str
+    default: claude-haiku-4-5-20251001
+    label: モデル ID
+    help: haiku-4.5 を 推奨 (安い + 速い + 要約品質 十分)。 重要度高なら sonnet-4.6 / opus-4.8
+
+  - key: summary_sentences
+    type: int
+    default: 3
+    label: 要約行数
+    help: 1 行目 = 見出し、 2-N 行目 = ポイント
+    min: 1
+    max: 10
+
+  - key: summary_language
+    type: str
+    default: auto
+    label: 要約の言語 (auto / ja / en)
+    help: auto = 原文に合わせる
+
+  - key: fetch_full_article
+    type: bool
+    default: true
+    label: 本文も fetch してから 要約する
+    help: false にすると RSS summary_html のみで 要約 (= 速いが 浅い)
+
+  - key: fetch_timeout_s
+    type: int
+    default: 12
+    label: 本文 fetch タイムアウト (秒)
+    min: 3
+    max: 60
+
+  - key: max_input_chars
+    type: int
+    default: 8000
+    label: モデルに 渡す 本文の 最大文字数
+    help: 越えた分は 末尾を 切り詰める。 トークン爆発 抑制
+    min: 500
+    max: 60000
+
+  - key: store_db_path
+    type: path
+    default: /opt/pipeline/plugins/rss_news_summarize/summaries.sqlite
+    label: 要約結果の SQLite パス
+
+hidden_kwargs:
+  - workload_slug

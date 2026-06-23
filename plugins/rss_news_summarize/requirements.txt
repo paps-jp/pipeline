@@ -1,0 +1,4 @@
+anthropic>=0.34
+# 本文抽出は graceful fallback なので 以下は どちらも optional (= 動くと きれいに 出る):
+trafilatura>=1.12
+beautifulsoup4>=4.12

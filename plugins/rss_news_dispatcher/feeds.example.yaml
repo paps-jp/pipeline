@@ -1,0 +1,19 @@
+# RSS / Atom フィード一覧 — 1 行 1 URL でも OK (TXT として 読まれる)。
+# 同じ記事が 複数フィードに 出てきても URL ベースで dedup されるので 重複登録に強い。
+#
+# JP テック / IT 系の 代表的な 入口:
+feeds:
+  - name: Publickey
+    url: https://www.publickey1.jp/atom.xml
+  - name: Gigazine
+    url: https://gigazine.net/news/rss_2.0/
+  - name: ITmedia NEWS
+    url: https://rss.itmedia.co.jp/rss/2.0/news_bursts.xml
+  - name: ZDNET Japan
+    url: https://japan.zdnet.com/rss/index.rdf
+
+  # EN テック系:
+  - name: Hacker News
+    url: https://hnrss.org/frontpage
+  - name: Lobsters
+    url: https://lobste.rs/rss
