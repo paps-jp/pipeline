@@ -34,9 +34,9 @@
   <img class="hero-icon" src="assets/icon-256.png" alt="Pipeline" />
   <h1>空きGPUを、<br/>バッチで埋め尽くす</h1>
   <p class="tagline">
-    MIGが使えないGPU (RTX 4090 / A6000 / L4 等) でも、1枚に複数workloadを同居させ、
-    単一ジョブでは40-60%アイドルになるGPUを取り戻す。
-    1-10 GPUのAIチーム向け、 軽量batch fleet。
+    MIGが使えないGPU (RTX 4090 / A6000 / L4 等) でも、1枚に複数workloadを同居させて、
+    単一ジョブでは40-60%アイドルになるGPUを取り戻します。
+    1-10 GPUのAIチーム向けの、軽量batch fleetです。
   </p>
   <div class="cta-row">
     <a class="btn btn-primary" href="setup.html">セットアップを見る</a>
@@ -50,34 +50,34 @@
   <h2>なぜGPUの空きを埋め切れるのか</h2>
   <p>
     単一ジョブで動かすGPUは、入力待ち / モデルロード / preprocess / 後処理で
-    案外40-60%アイドルしている。Pipelineは「同居させる土台」+「賢く配分する構造」の
-    2 段で、 その隙間を別workloadに流し込む。
+    案外40-60%アイドルしています。Pipelineは「同居させる土台」+「賢く配分する構造」の
+    2 段で、その隙間を別workloadに流し込みます。
   </p>
   <div class="feature-grid">
     <div class="feature-card" style="border-color: color-mix(in srgb, var(--accent) 35%, var(--border));">
       <div class="icon"><iconify-icon icon="lucide:layers"></iconify-icon></div>
       <h3>MIG非対応GPUでも1枚に同居できる</h3>
-      <p>サーバーGPU (A100 / H100) ならMIGで1枚を最大7枚に切り分けられるが、 RTX 4090 / 5090 / A6000 / 3090 / L4 は全てMIG非対応。 そこをMPS (NVIDIA Multi-Process Service) で物理共存させ、1 GPU上で複数CUDAプロセスを並行実行する。 <code>nvidia-cuda-mps-control -d</code> 1行で動く。 PipelineはMPSの上のオーケストレータ層 (= どのworkloadをどれだけ流すか) を担う。</p>
+      <p>サーバーGPU (A100 / H100) ならMIGで1枚を最大7枚に切り分けられますが、 RTX 4090 / 5090 / A6000 / 3090 / L4 はすべてMIG非対応です。 そこをMPS (NVIDIA Multi-Process Service) で物理共存させ、1 GPU上で複数CUDAプロセスを並行実行します。 <code>nvidia-cuda-mps-control -d</code> 1行で動きます。 PipelineはMPSの上のオーケストレータ層 (= どのworkloadをどれだけ流すか) を担います。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:infinity"></iconify-icon></div>
       <h3>self-loopでキューを絶やさない</h3>
-      <p>ワークロード自身が「次のtick」を自分でキューに入れ続ける設計。外部のdispatcher / cronが不要、キューが空になる瞬間が無いので、ワーカーは常に次の仕事を受け取れる。</p>
+      <p>ワークロード自身が「次のtick」を自分でキューに入れ続ける設計です。外部のdispatcher / cronは不要で、キューが空になる瞬間が無いので、ワーカーは常に次の仕事を受け取れます。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:list-checks"></iconify-icon></div>
       <h3>1タスク = 1 claim、順序自由</h3>
-      <p>ワーカーはキューから1件取って処理 → 完了 → 次の1件、を繰り返すだけ。バッチbarrier (= N件揃ってから次へ) が無いので、速いtaskと遅いtaskが同居しても速い方が先に流れてGPUを空かせない。</p>
+      <p>ワーカーはキューから1件取って処理 → 完了 → 次の1件、を繰り返すだけです。バッチbarrier (= N件揃ってから次へ) が無いので、速いtaskと遅いtaskが同居しても速い方が先に流れて、GPUを空かせません。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:sliders-horizontal"></iconify-icon></div>
       <h3>複数workloadの同居 + 重み配分</h3>
-      <p>同じワーカーfleetにN個workloadを登録できる。優先度 + 重みをOptimizerが自動調整、「メインの推論70%、隙間の解析30%」のような同居構成を1 fleetで実現する。重い学習が来たら軽い推論を一時退避、終わり次第復帰。</p>
+      <p>同じワーカーfleetにN個workloadを登録できます。優先度 + 重みをOptimizerが自動調整し、「メインの推論70%、隙間の解析30%」のような同居構成を1 fleetで実現します。重い学習が来たら軽い推論を一時退避させ、終わり次第復帰します。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:tag"></iconify-icon></div>
       <h3>GPUタグで必要なワーカーへ</h3>
-      <p>ワーカーごとに <code>gpu</code> / <code>cpu</code> / 任意タグを付与。GPU必須のtaskはGPUワーカーへ、CPUでOKなtaskはCPUワーカーへアフィニティ振り分け。GPUは「GPUが本当に要るタスク」だけで埋まる。</p>
+      <p>ワーカーごとに <code>gpu</code> / <code>cpu</code> / 任意タグを付けられます。GPU必須のtaskはGPUワーカーへ、CPUでOKなtaskはCPUワーカーへとアフィニティで振り分けられるので、GPUは「GPUが本当に要るタスク」だけで埋まります。</p>
     </div>
   </div>
 </section>
@@ -88,32 +88,32 @@
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:clipboard-list"></iconify-icon></div>
       <h3>GUIでワークロード登録</h3>
-      <p>シェルコマンドやPythonモジュールをWeb UIのフォームから登録。開発者以外の運用担当でも追加・編集できる。</p>
+      <p>シェルコマンドやPythonモジュールをWeb UIのフォームから登録できます。開発者以外の運用担当の方でも追加・編集していただけます。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:puzzle"></iconify-icon></div>
       <h3>プラグイン方式</h3>
-      <p>ローカル <code>plugins/</code> ディレクトリに <code>plugin.yaml</code> + <code>main.py</code> を置けば即フォーム化。サンプル付属。</p>
+      <p>ローカル <code>plugins/</code> ディレクトリに <code>plugin.yaml</code> + <code>main.py</code> を置けば即フォーム化されます。サンプルも同梱しています。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:zap"></iconify-icon></div>
       <h3>シンプルなワーカー</h3>
-      <p>各ホストに1つのデーモンがHTTP heartbeatで参加。クラスタマネージャ不要、SSH不要 (= 配信はHTTP経由)。</p>
+      <p>各ホストに1つのデーモンがHTTP heartbeatで参加します。クラスタマネージャ不要、SSH不要です (= 配信はHTTP経由)。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:activity"></iconify-icon></div>
       <h3>ライブ可視化</h3>
-      <p>ダッシュボードで実行中タスク / 最近の失敗 / キュー深さ / GPU温度を3秒更新で表示。</p>
+      <p>ダッシュボードで実行中タスク / 最近の失敗 / キュー深さ / GPU温度を3秒更新で表示します。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:refresh-cw"></iconify-icon></div>
       <h3>失敗詳細 + 再実行</h3>
-      <p>各runのstderr / Python tracebackをワンクリックで展開。失敗したtaskは同じpkで即再投入できる。1件詰まって全体停止、というAirflow系の落とし穴を構造的に回避。</p>
+      <p>各runのstderr / Python tracebackをワンクリックで展開できます。失敗したtaskは同じpkで即再投入が可能です。1件詰まって全体停止、というAirflow系の落とし穴を構造的に回避しています。</p>
     </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:database"></iconify-icon></div>
       <h3>SQLiteシングルファイル</h3>
-      <p>制御プレーンの全状態が1つのSQLiteファイルに収まる。バックアップ・差分・grepが容易。</p>
+      <p>制御プレーンの全状態が1つのSQLiteファイルに収まります。バックアップ・差分・grepが容易です。</p>
     </div>
   </div>
 </section>
@@ -122,8 +122,8 @@
   <h2>アーキテクチャ</h2>
   <p>
     制御プレーン (= FastAPI + SQLite + React配信) とワーカー (= ジョブ実行プロセス) は
-    明確に分離されている。ワーカーはHTTP heartbeatで制御プレーンに参加し、キューから
-    タスクをclaim → process → completeする。
+    明確に分離されています。ワーカーはHTTP heartbeatで制御プレーンに参加し、キューから
+    タスクをclaim → process → completeします。
   </p>
 
   <div class="diagram">
@@ -178,7 +178,7 @@
 
 <section>
   <h2>画面ツアー</h2>
-  <p>主要4画面のスクリーンショット。clickで原寸表示。</p>
+  <p>主要4画面のスクリーンショットです。クリックで原寸表示できます。</p>
   <div class="tour-grid">
     <figure class="tour-figure">
       <a href="assets/screenshots/dashboard.png" target="_blank" rel="noopener">
@@ -189,7 +189,7 @@
       </a>
       <figcaption>
         <div class="label">ダッシュボード <span class="badge">Dashboard</span></div>
-        <div class="desc">「いま何が動いているか」3 panel + バージョン情報 + GPU温度のライブスパークライン (3秒更新)</div>
+        <div class="desc">「いま何が動いているか」 3 panel + バージョン情報 + GPU温度のライブスパークラインを 3 秒更新で表示します。</div>
       </figcaption>
     </figure>
 
@@ -202,7 +202,7 @@
       </a>
       <figcaption>
         <div class="label">ワークロード <span class="badge">Workloads</span></div>
-        <div class="desc">登録ワークロード一覧。直近20件の成否を行内スパークライン + 成功率で表示。各行から投入 / 履歴 / 編集 / 削除。</div>
+        <div class="desc">登録ワークロードの一覧画面です。直近20件の成否を行内スパークライン + 成功率で表示します。各行から投入 / 履歴 / 編集 / 削除が行えます。</div>
       </figcaption>
     </figure>
 
@@ -215,7 +215,7 @@
       </a>
       <figcaption>
         <div class="label">サービスログ <span class="badge">ServiceLog</span></div>
-        <div class="desc">制御プレーン + 各ホストのstdoutをタブで切替。動作中はtealのpulseバッジで稼働を視認。</div>
+        <div class="desc">制御プレーン + 各ホストのstdoutをタブで切り替えられます。動作中はtealのpulseバッジで稼働状況を視認できます。</div>
       </figcaption>
     </figure>
 
@@ -228,7 +228,7 @@
       </a>
       <figcaption>
         <div class="label">コード配信 <span class="badge">Code deploy</span></div>
-        <div class="desc">配信先ホスト × 配信パスをWeb UIで登録し、1ボタンでrsync + service restartを一括実行。</div>
+        <div class="desc">配信先ホスト × 配信パスをWeb UIで登録し、1ボタンでrsync + service restartを一括実行できます。</div>
       </figcaption>
     </figure>
   </div>
@@ -264,16 +264,16 @@
 <section>
   <h2>これは向いていない</h2>
   <ul>
-    <li><strong>10,000ノード以上の分散学習</strong> — 専用フレームワーク (Rayなど) の方が適切</li>
-    <li><strong>ノード間で大tensorをzero-copyで渡すワークロード</strong> — object storeが無いため</li>
-    <li><strong>複雑なDAG / Workflowオーケストレーション</strong> — 直列chain + self-loopのシンプル設計</li>
-    <li><strong>マルチテナント (複数チーム共有)</strong> — 単一operatorを想定</li>
+    <li><strong>10,000ノード以上の分散学習</strong> — 専用フレームワーク (Rayなど) の方が適切です。</li>
+    <li><strong>ノード間で大tensorをzero-copyで渡すワークロード</strong> — object storeを持たないためです。</li>
+    <li><strong>複雑なDAG / Workflowオーケストレーション</strong> — 直列chain + self-loopのシンプル設計に振り切っています。</li>
+    <li><strong>マルチテナント (複数チーム共有)</strong> — 単一operatorの運用を想定しています。</li>
   </ul>
 </section>
 
 <section>
   <h2>ライセンス</h2>
-  <p>MIT License. 詳細は <a href="https://github.com/paps-jp/pipeline/blob/main/LICENSE">LICENSE</a> を参照。</p>
+  <p>MIT License です。詳細は <a href="https://github.com/paps-jp/pipeline/blob/main/LICENSE">LICENSE</a> をご参照ください。</p>
 </section>
 
 </main>

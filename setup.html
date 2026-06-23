@@ -31,8 +31,8 @@
 <main>
 
 <h1>セットアップ</h1>
-<p>制御プレーン1ホスト + ワーカー1ホスト以上、という構成を想定。
-小規模では同一ホストで両方動かしても構わない。</p>
+<p>制御プレーン1ホスト + ワーカー1ホスト以上、という構成を想定しています。
+小規模であれば同一ホストで両方動かしても構いません。</p>
 
 <div class="toc">
   <h4>このページの内容</h4>
@@ -54,7 +54,7 @@
     <tr><th>項目</th><th>バージョン</th><th>備考</th></tr>
     <tr><td>Python</td><td>3.12以上</td><td>制御プレーン / ワーカー共通</td></tr>
     <tr><td>Node.js</td><td>18以上</td><td>Web UIビルド時のみ (= 配布済buildを使うなら不要)</td></tr>
-    <tr><td>OS</td><td>Linux推奨</td><td>制御プレーン。Mac / WSLでも開発可。</td></tr>
+    <tr><td>OS</td><td>Linux推奨</td><td>制御プレーン用です。Mac / WSLでも開発できます。</td></tr>
     <tr><td>SQLite</td><td>3.35以上</td><td>ALTER TABLE DROP COLUMNを使うため</td></tr>
     <tr><td>GPUホスト</td><td>任意</td><td>NVIDIA GPU + ドライバ + nvidia-smi (= GPUメトリクスを取る場合)</td></tr>
   </table>
@@ -72,43 +72,43 @@ source .venv/bin/activate     # Windows: .venv\Scripts\activate
 # パッケージインストール (editable)
 pip install -e .</code></pre>
 
-  <p>これで <code>pipeline</code> コマンドがvenvの中に入る。</p>
+  <p>これで <code>pipeline</code> コマンドがvenvの中に入ります。</p>
 </section>
 
 <section id="first-run">
   <h2>初回起動</h2>
-  <p>SQLite DBは初回起動時に自動作成される。</p>
+  <p>SQLite DBは初回起動時に自動作成されます。</p>
   <pre><code>pipeline run \
   --host 0.0.0.0 \
   --port 8001 \
   --db-url sqlite:///./pipeline.db \
   --log-level info</code></pre>
 
-  <p>ブラウザで <code>http://localhost:8001</code> を開く。ダッシュボードが表示されればOK。</p>
+  <p>ブラウザで <code>http://localhost:8001</code> を開いてください。ダッシュボードが表示されればOKです。</p>
 
   <div class="callout">
-    <strong>初回はワークロードゼロ。</strong> 「実行中」「最近の失敗」「キュー深さ」の3つの
-    パネルは全て空状態で表示される。これは正常。
+    <strong>初回はワークロードゼロです。</strong> 「実行中」「最近の失敗」「キュー深さ」の3つの
+    パネルは全て空状態で表示されます。これは正常です。
   </div>
 </section>
 
 <section id="web-build">
   <h2>Web UIビルド</h2>
-  <p>repoにビルド済バンドルは含まれないため、初回はビルドが必要。</p>
+  <p>repoにビルド済バンドルは含まれないため、初回はビルドが必要です。</p>
 
   <pre><code>cd web
 npm install
 npm run build
 # → ../pipeline/web/static/ にindex.html + assets/ が出力される</code></pre>
 
-  <p>その後 <code>pipeline run …</code> を再起動するとFastAPIが新UIを配信する。</p>
+  <p>その後 <code>pipeline run …</code> を再起動するとFastAPIが新UIを配信します。</p>
 
-  <p>開発時 (= ホットリロード) は <code>npm run dev</code>。 <code>localhost:5173</code> が立ち上がり <code>/api</code> は <code>localhost:8001</code> へproxyされる。</p>
+  <p>開発時 (= ホットリロード) は <code>npm run dev</code> を使います。 <code>localhost:5173</code> が立ち上がり、 <code>/api</code> は <code>localhost:8001</code> へproxyされます。</p>
 </section>
 
 <section id="first-workload">
   <h2>最初のワークロード</h2>
-  <p>repoに <code>plugins/echo_sample/</code> が同梱されている。これを使って動作確認できる。</p>
+  <p>repoに <code>plugins/echo_sample/</code> が同梱されています。これを使って動作確認できます。</p>
 
   <ol>
     <li>Web UI → <strong>ワークロード</strong> タブ → <strong>新規作成</strong></li>
@@ -128,19 +128,19 @@ npm run build
         <li>fail_pk_substr: 空文字</li>
       </ul>
     </li>
-    <li><strong>作成</strong> ボタン → ワークロード一覧に <code>echo-test</code> が追加される</li>
-    <li>その行の <strong>📨 投入</strong> アイコン → pkに <code>hello</code> と入れて <strong>投入</strong></li>
-    <li>同じ行の <strong>履歴</strong> アイコン → runs drawerで結果が緑色 (= success) で表示される</li>
+    <li><strong>作成</strong> ボタンを押すと、ワークロード一覧に <code>echo-test</code> が追加されます。</li>
+    <li>その行の <strong>📨 投入</strong> アイコンを押し、pkに <code>hello</code> と入れて <strong>投入</strong> します。</li>
+    <li>同じ行の <strong>履歴</strong> アイコンを押すと、runs drawerで結果が緑色 (= success) で表示されます。</li>
   </ol>
 
-  <p>1件実行できれば制御プレーンは正常。次はワーカーを別ホストに追加する。</p>
+  <p>1件実行できれば制御プレーンは正常です。次はワーカーを別ホストに追加します。</p>
 </section>
 
 <section id="worker-deploy">
   <h2>ワーカーをホストに追加</h2>
 
   <h3>方法1: 手動</h3>
-  <p>ワーカーをデプロイしたいホストにSSHログインして、同じ手順でvenv + pip installを行う。その後:</p>
+  <p>ワーカーをデプロイしたいホストにSSHログインして、同じ手順でvenv + pip installを行います。その後:</p>
 
   <pre><code>pipeline worker \
   --control-url http://&lt;control-host&gt;:8001 \
@@ -148,19 +148,19 @@ npm run build
   --tags gpu \
   --log-level info</code></pre>
 
-  <p>制御プレーンのWeb UI → <strong>ワーカー</strong> タブでこのホストが <code>active</code> と表示される。</p>
+  <p>制御プレーンのWeb UI → <strong>ワーカー</strong> タブでこのホストが <code>active</code> と表示されます。</p>
 
   <h3>方法2: Deployタブから配信</h3>
-  <p>運用フェーズに入ったら制御プレーンからコードを配信できる。</p>
+  <p>運用フェーズに入ったら制御プレーンからコードを配信できます。</p>
 
   <ol>
-    <li>Web UI → <strong>Deploy</strong> タブ</li>
-    <li>「配信先ホスト」でSSH接続先 (= IP / port / user) を登録</li>
-    <li>「配信パス」で何をどこへコピーするか + 配信後実行コマンド + serviceコマンドを登録</li>
-    <li><strong>Deploy now</strong> ボタン → 一括でrsync + systemctl restart</li>
+    <li>Web UI → <strong>Deploy</strong> タブを開きます。</li>
+    <li>「配信先ホスト」でSSH接続先 (= IP / port / user) を登録します。</li>
+    <li>「配信パス」で何をどこへコピーするか + 配信後実行コマンド + serviceコマンドを登録します。</li>
+    <li><strong>Deploy now</strong> ボタンを押すと、一括でrsync + systemctl restartが行われます。</li>
   </ol>
 
-  <p>詳細は <a href="manual.html#deploy">マニュアルのDeployセクション</a>。</p>
+  <p>詳細は <a href="manual.html#deploy">マニュアルのDeployセクション</a> をご参照ください。</p>
 </section>
 
 <section id="systemd">
@@ -215,7 +215,7 @@ sudo systemctl enable --now pipeline-worker      # 各ワーカー側</code></pr
 <section id="verify">
   <h2>動作確認</h2>
 
-  <p>curlでAPIを叩いて状態を確認:</p>
+  <p>curlでAPIを叩いて状態を確認できます。</p>
   <pre><code>curl http://localhost:8001/api/v1/status
 # → {"version":"0.1.0","mode":"prod","db_url":"sqlite:///./pipeline.db","now":"..."}
 
@@ -225,7 +225,7 @@ curl http://localhost:8001/api/v1/workers
 curl http://localhost:8001/api/v1/dashboard/overview
 # → {"running":[...],"recent_failures":[...],"queue_depths":[...]}</code></pre>
 
-  <p>続いて詳細な使い方は <a href="manual.html">マニュアル</a> へ。</p>
+  <p>続いて詳細な使い方は <a href="manual.html">マニュアル</a> をご覧ください。</p>
 </section>
 
 </main>
