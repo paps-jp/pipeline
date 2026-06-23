@@ -5,6 +5,7 @@ import {
   Button,
   Code,
   Group,
+  Indicator,
   Loader,
   Modal,
   NumberInput,
@@ -362,6 +363,18 @@ function StateBadge({ state }: { state: string }) {
     state === "draining" ? "yellow" :
     state === "lost" ? "red" :
     state === "connecting" ? "blue" : "gray";
+  // active は脈打つ green dot (= ダッシュボード「実行中」と同じ Indicator processing) + ラベル。
+  // 他状態は静的な色付き Badge。
+  if (state === "active") {
+    return (
+      <Group gap={8} wrap="nowrap" align="center">
+        <Indicator processing size={10} color="green" offset={0} position="middle-center">
+          <span style={{ display: "inline-block", width: 1, height: 12 }} />
+        </Indicator>
+        <Text size="xs" fw={600} c="green.7" style={{ letterSpacing: 0.3 }}>active</Text>
+      </Group>
+    );
+  }
   return <Badge color={color} variant="light">{state}</Badge>;
 }
 
@@ -372,20 +385,42 @@ function RuntimeSection() {
     queryFn: () => api.listWorkers(),
     refetchInterval: 3_000,
   });
-  const workers: WorkerInfo[] = q.data?.workers ?? [];
+  // workload slug → friendly name のマップ (= dashboard と同じ趣旨)
+  const workloadsQ = useQuery({
+    queryKey: ["workloads-name-map"],
+    queryFn: () => api.listWorkloads(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+  const workloadNameMap = new Map(
+    (workloadsQ.data?.workloads ?? []).map((w) => [w.slug, w.name]),
+  );
+  const rawWorkers: WorkerInfo[] = q.data?.workers ?? [];
+  // 並び替え: active を先、 lost は末尾。 ヘッダ件数は「現在生きてる」 数を出す
+  const activeCount = rawWorkers.filter((w) => w.state === "active").length;
+  const lostCount = rawWorkers.filter((w) => w.state === "lost").length;
+  const stateOrder: Record<string, number> = {
+    active: 0, connecting: 1, draining: 2, lost: 3,
+  };
+  const workers = [...rawWorkers].sort((a, b) => {
+    const da = stateOrder[a.state] ?? 9;
+    const db_ = stateOrder[b.state] ?? 9;
+    if (da !== db_) return da - db_;
+    return (b.last_seen_at ?? "").localeCompare(a.last_seen_at ?? "");
+  });
 
   return (
     <Box>
       <Group justify="space-between" mb="xs">
         <Title order={4}>
-          {t("workers.section_runtime")} ({workers.length})
+          {t("workers.section_runtime")} ({activeCount})
         </Title>
         <Group gap="xs">
           {q.isLoading && <Loader size="xs" />}
-          <Badge color="green" variant="light">
-            active: {workers.filter((w) => w.state === "active").length}
-          </Badge>
-          <Badge color="gray" variant="light">total: {workers.length}</Badge>
+          <Badge color="green" variant="light">active: {activeCount}</Badge>
+          {lostCount > 0 && (
+            <Badge color="gray" variant="light">lost: {lostCount}</Badge>
+          )}
         </Group>
       </Group>
 
@@ -417,13 +452,17 @@ function RuntimeSection() {
           </Table.Thead>
           <Table.Tbody>
             {workers.map((w) => (
-              <Table.Tr key={w.id}>
+              <Table.Tr key={w.id} style={w.state === "lost" ? { opacity: 0.5 } : undefined}>
                 <Table.Td><Code>{w.id}</Code></Table.Td>
                 <Table.Td>{w.host}</Table.Td>
                 <Table.Td><StateBadge state={w.state} /></Table.Td>
                 <Table.Td>
                   {w.current_workload ? (
-                    <Code>{w.current_workload}</Code>
+                    <Tooltip label={w.current_workload}>
+                      <Badge color="indigo" variant="light" size="sm">
+                        {workloadNameMap.get(w.current_workload) ?? w.current_workload}
+                      </Badge>
+                    </Tooltip>
                   ) : (
                     <Text size="sm" c="dimmed">—</Text>
                   )}

@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from pipeline import __version__
-from pipeline.api import admin_cmds, admin_deploy, dashboard, plugins_local, service_logs, system, workers, workloads
+from pipeline.api import admin_cmds, admin_deploy, dashboard, plugin_runtime, plugins_local, service_logs, system, workers, workloads
 from pipeline.config import Settings
 from pipeline.db import get_db
 from pipeline.worker.drain import Worker
@@ -103,7 +103,9 @@ def create_app(settings: Settings) -> FastAPI:
             repo = WorkerRepository(db)
             while not _reaper_stop.is_set():
                 try:
-                    r = repo.prune_stale(lost_after_s=60, delete_after_s=600)
+                    # lost 化は 60s 後、 完全 DELETE は 180s 後 (= 旧 600s だと再起動後の
+                    # 旧 worker が 10 分残り Workers 画面のヘッダ件数が膨らむ問題への対処)
+                    r = repo.prune_stale(lost_after_s=60, delete_after_s=180)
                     if r["marked_lost"] or r["deleted"]:
                         log.info("workers reaper: lost=%d deleted=%d", r["marked_lost"], r["deleted"])
                 except Exception:
@@ -114,6 +116,11 @@ def create_app(settings: Settings) -> FastAPI:
                     pass
         reaper_task = _asyncio.create_task(_reaper_loop())
 
+        # self_loop workload watchdog: idle dispatcher 自動 bootstrap
+        from pipeline.control.self_loop_watchdog import SelfLoopWatchdog
+        selfloop_watchdog = SelfLoopWatchdog(db)
+        selfloop_watchdog.start()
+
         try:
             yield
         finally:
@@ -121,6 +128,10 @@ def create_app(settings: Settings) -> FastAPI:
             _reaper_stop.set()
             try:
                 await _asyncio.wait_for(reaper_task, timeout=3)
+            except Exception:
+                pass
+            try:
+                await selfloop_watchdog.stop()
             except Exception:
                 pass
             if worker is not None:
@@ -155,6 +166,10 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(admin_cmds.router)
     app.include_router(admin_cmds.admin_router)
     app.include_router(dashboard.router)
+    app.include_router(plugin_runtime.router)
+    # MinIO プロキシ (= プラグイン UI が顔サムネ等を <img> で見るため)
+    from pipeline.api import minio_proxy as _mp
+    app.include_router(_mp.router)
 
     # 静的アセット (React build が存在する時のみマウント)
     if _WEB_STATIC_DIR.exists() and any(_WEB_STATIC_DIR.iterdir()):

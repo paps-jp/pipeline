@@ -23,6 +23,83 @@ class RunsRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
 
+    def start(
+        self,
+        *,
+        workload_slug: str,
+        pk: str,
+        worker_id: str,
+        attempt: int,
+        started_at: str,
+    ) -> str:
+        """処理開始時に finished_at=NULL で INSERT。run id を返す。"""
+        run_id = _new_run_id()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO runs (
+                    id, workload_slug, pk, worker_id, attempt,
+                    started_at, finished_at,
+                    success, exit_code, duration_ms,
+                    stdout, stderr, output_json, error
+                ) VALUES (
+                    :id, :ws, :pk, :wid, :att,
+                    :s_at, NULL,
+                    NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL
+                )
+                """,
+                {
+                    "id": run_id,
+                    "ws": workload_slug,
+                    "pk": str(pk),
+                    "wid": worker_id,
+                    "att": int(attempt),
+                    "s_at": started_at,
+                },
+            )
+        return run_id
+
+    def finish(
+        self,
+        run_id: str,
+        *,
+        success: bool,
+        exit_code: int | None,
+        duration_ms: int,
+        stdout: str | None,
+        stderr: str | None,
+        output_json: dict[str, Any] | None,
+        error: str | None,
+    ) -> None:
+        """処理完了時に結果を UPDATE。"""
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET finished_at  = :f_at,
+                    success      = :ok,
+                    exit_code    = :ec,
+                    duration_ms  = :dur,
+                    stdout       = :so,
+                    stderr       = :se,
+                    output_json  = :oj,
+                    error        = :er
+                WHERE id = :id
+                """,
+                {
+                    "id": run_id,
+                    "f_at": _utcnow_iso(),
+                    "ok": 1 if success else 0,
+                    "ec": exit_code,
+                    "dur": int(duration_ms),
+                    "so": stdout,
+                    "se": stderr,
+                    "oj": json.dumps(output_json) if output_json else None,
+                    "er": error,
+                },
+            )
+
     def record(
         self,
         *,
@@ -39,40 +116,24 @@ class RunsRepository:
         output_json: dict[str, Any] | None,
         error: str | None,
     ) -> str:
-        """1 件 INSERT し、生成した run id を返す。"""
-        run_id = _new_run_id()
-        with self.db.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO runs (
-                    id, workload_slug, pk, worker_id, attempt,
-                    started_at, finished_at,
-                    success, exit_code, duration_ms,
-                    stdout, stderr, output_json, error
-                ) VALUES (
-                    :id, :ws, :pk, :wid, :att,
-                    :s_at, :f_at,
-                    :ok, :ec, :dur,
-                    :so, :se, :oj, :er
-                )
-                """,
-                {
-                    "id": run_id,
-                    "ws": workload_slug,
-                    "pk": str(pk),
-                    "wid": worker_id,
-                    "att": int(attempt),
-                    "s_at": started_at,
-                    "f_at": _utcnow_iso(),
-                    "ok": 1 if success else 0,
-                    "ec": exit_code,
-                    "dur": int(duration_ms),
-                    "so": stdout,
-                    "se": stderr,
-                    "oj": json.dumps(output_json) if output_json else None,
-                    "er": error,
-                },
-            )
+        """後方互換: 1 回で INSERT+完了 (executor build 失敗等の即 fail 用)。"""
+        run_id = self.start(
+            workload_slug=workload_slug,
+            pk=pk,
+            worker_id=worker_id,
+            attempt=attempt,
+            started_at=started_at,
+        )
+        self.finish(
+            run_id,
+            success=success,
+            exit_code=exit_code,
+            duration_ms=duration_ms,
+            stdout=stdout,
+            stderr=stderr,
+            output_json=output_json,
+            error=error,
+        )
         return run_id
 
     def list_for_workload(self, slug: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -100,6 +161,26 @@ class RunsRepository:
                        started_at, finished_at, success, exit_code, duration_ms,
                        stdout, stderr, output_json, error
                 FROM runs
+                ORDER BY started_at DESC, id DESC
+                LIMIT :lim
+                """,
+                {"lim": int(limit)},
+            )
+            rows = cur.fetchall()
+        return [self._row(r) for r in rows]
+
+    def list_recent_failures(self, limit: int = 10) -> list[dict[str, Any]]:
+        # list_recent(limit=300) で fold すると、 高スループット workload で recent window が
+        # 数分しか無く成功で埋まり failure が見えなくなる (=ダッシュボード "失敗はありません"
+        # が常時 false 表示)。 success=0 を直接 ORDER BY で取得する。
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, workload_slug, pk, worker_id, attempt,
+                       started_at, finished_at, success, exit_code, duration_ms,
+                       stdout, stderr, output_json, error
+                FROM runs
+                WHERE success = 0
                 ORDER BY started_at DESC, id DESC
                 LIMIT :lim
                 """,

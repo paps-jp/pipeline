@@ -15,6 +15,7 @@ import {
   IconLanguage,
   IconList,
   IconMoon,
+  IconPuzzle,
   IconRocket,
   IconScript,
   IconSun,
@@ -28,6 +29,7 @@ import { api } from "@/api/client";
 import { PageTransition } from "@/components/PageTransition";
 import Dashboard from "./pages/Dashboard";
 import Deploy from "./pages/Deploy";
+import PluginPanel from "./pages/PluginPanel";
 import ServiceLog from "./pages/ServiceLog";
 import Workers from "./pages/Workers";
 import Workloads from "./pages/Workloads";
@@ -72,6 +74,25 @@ export default function App() {
   const [opened, { toggle }] = useDisclosure();
   const { t, i18n } = useTranslation();
   const { colorScheme, toggleColorScheme } = useMantineColorScheme();
+
+  const pluginsQ = useQuery({
+    queryKey: ["available-plugins-sidebar"],
+    queryFn: () => api.listAvailablePlugins(),
+    refetchInterval: 60_000,
+  });
+  // workload の name を引きたい (= plugin.yaml の name は slug 同形のため見栄えが悪い)。
+  // plugin slug は underscore、 workload slug は dash なので _ → - で対応付けする。
+  const workloadsQ = useQuery({
+    queryKey: ["workloads-for-sidebar"],
+    queryFn: () => api.listWorkloads(),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+  const workloadNameMap = new Map(
+    (workloadsQ.data?.workloads ?? []).map((w) => [w.slug, w.name])
+  );
+  const uiPlugins =
+    pluginsQ.data?.plugins?.filter((p) => p.has_ui_panel) ?? [];
 
   const toggleLang = () => {
     void i18n.changeLanguage(i18n.language.startsWith("ja") ? "en" : "ja");
@@ -179,6 +200,26 @@ export default function App() {
           component={RouterNavLink}
           to="/deploy"
         />
+        {uiPlugins.length > 0 && (
+          <Text size="xs" c="dimmed" px="sm" mt="md" mb={4}>
+            {t("nav.plugins", "プラグイン")}
+          </Text>
+        )}
+        {uiPlugins.map((p) => {
+          const workloadSlug = p.slug.replace(/_/g, "-");
+          const label =
+            workloadNameMap.get(workloadSlug) ?? p.manifest?.name ?? p.slug;
+          return (
+          <NavLink
+            key={p.slug}
+            label={label}
+            title={p.slug}
+            leftSection={<IconPuzzle size={18} />}
+            component={RouterNavLink}
+            to={`/plugins/${p.slug}`}
+          />
+          );
+        })}
       </AppShell.Navbar>
 
       <AppShell.Main>
@@ -191,6 +232,7 @@ export default function App() {
             <Route path="/workers" element={<Workers />} />
             <Route path="/logs" element={<ServiceLog />} />
             <Route path="/deploy" element={<Deploy />} />
+            <Route path="/plugins/:slug" element={<PluginPanel />} />
           </Route>
         </Routes>
       </AppShell.Main>
