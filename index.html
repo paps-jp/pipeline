@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Pipeline — GPUの空き容量をバッチで埋め尽くす</title>
-<meta name="description" content="Pipeline — 推論 / 学習のあいまに残るGPUの空き時間を、複数バッチワークロードで埋める制御プレーン。self-loopでキューを絶やさず、アイドルGPUを残さない。" />
+<title>Pipeline — 空きGPUをバッチで埋め尽くす軽量フリート</title>
+<meta name="description" content="Pipeline — MIG非対応GPU (RTX 4090 / A6000 / L4 等) でも、1枚に複数workloadを同居させて、単一ジョブでは40-60%アイドルになるGPUを取り戻す。1-10 GPUのAIチーム向け、軽量batch fleet。" />
 <link rel="icon" type="image/x-icon" href="assets/favicon.ico" />
 <link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png" />
 <link rel="icon" type="image/png" sizes="192x192" href="assets/icon-192.png" />
@@ -32,11 +32,11 @@
 
 <section class="hero">
   <img class="hero-icon" src="assets/icon-256.png" alt="Pipeline" />
-  <h1>アイドルGPUを、<br/>バッチで埋め尽くす</h1>
+  <h1>空きGPUを、<br/>バッチで埋め尽くす</h1>
   <p class="tagline">
-    推論 / 学習 / 解析 — 複数のバッチワークロードを同じGPUフリートに同居させ、
-    self-loopでキューを絶やさず、残った空き時間を別workloadで埋める。
-    GPUを「ジョブ単独で半分しか使えない」から「常時ほぼフル稼働」へ。
+    MIGが使えないGPU (RTX 4090 / A6000 / L4 等) でも、1枚に複数workloadを同居させ、
+    単一ジョブでは40-60%アイドルになるGPUを取り戻す。
+    1-10 GPUのAIチーム向け、 軽量batch fleet。
   </p>
   <div class="cta-row">
     <a class="btn btn-primary" href="setup.html">セットアップを見る</a>
@@ -50,10 +50,15 @@
   <h2>なぜGPUの空きを埋め切れるのか</h2>
   <p>
     単一ジョブで動かすGPUは、入力待ち / モデルロード / preprocess / 後処理で
-    案外半分くらいアイドルしている。Pipelineは4つの構造でその隙間を別workloadに
-    流し込んで、アイドル時間を残さない。
+    案外40-60%アイドルしている。Pipelineは「同居させる土台」+「賢く配分する構造」の
+    2 段で、 その隙間を別workloadに流し込む。
   </p>
   <div class="feature-grid">
+    <div class="feature-card" style="border-color: color-mix(in srgb, var(--accent) 35%, var(--border));">
+      <div class="icon"><iconify-icon icon="lucide:layers"></iconify-icon></div>
+      <h3>MIG非対応GPUでも1枚に同居できる</h3>
+      <p>サーバーGPU (A100 / H100) ならMIGで1枚を最大7枚に切り分けられるが、 RTX 4090 / 5090 / A6000 / 3090 / L4 は全てMIG非対応。 そこをMPS (NVIDIA Multi-Process Service) で物理共存させ、1 GPU上で複数CUDAプロセスを並行実行する。 <code>nvidia-cuda-mps-control -d</code> 1行で動く。 PipelineはMPSの上のオーケストレータ層 (= どのworkloadをどれだけ流すか) を担う。</p>
+    </div>
     <div class="feature-card">
       <div class="icon"><iconify-icon icon="lucide:infinity"></iconify-icon></div>
       <h3>self-loopでキューを絶やさない</h3>
