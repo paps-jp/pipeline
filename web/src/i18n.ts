@@ -27,7 +27,7 @@ const resources = {
         title: "ワーカー",
         subtitle: "登録ホスト = ワーカー。 ホスト追加・公開鍵・稼働状態を 1 画面で管理",
         section_registry: "登録",
-        section_runtime: "稼働状態",
+        section_runtime: "状態",
         empty: "現在 register 中のワーカーがありません。",
         id: "Worker ID",
         host: "ホスト",

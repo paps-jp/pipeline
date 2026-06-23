@@ -81,7 +81,8 @@ def overview(request: Request) -> OverviewResponse:
     workloads_repo = WorkloadRepository(db)
     queue_repo = QueueRepository(db)
 
-    # 1. 直近 200 件から running / 失敗 を抽出
+    # 1. running は recent から、 failures は別 query (= 高スループット workload で
+    #    recent window が成功 run で埋まり failure が見えなくなるのを防ぐ)
     recent = runs_repo.list_recent(limit=300)
 
     running = [
@@ -97,21 +98,17 @@ def overview(request: Request) -> OverviewResponse:
         if r.get("finished_at") is None
     ]
 
-    failures = []
-    for r in recent:
-        if r.get("success") is False:
-            failures.append(
-                RecentFailure(
-                    id=r["id"],
-                    workload_slug=r["workload_slug"],
-                    pk=r["pk"],
-                    worker_id=r["worker_id"] or "",
-                    started_at=r["started_at"],
-                    reason=_short_reason(r.get("error"), r.get("stderr")),
-                )
-            )
-            if len(failures) >= 10:
-                break
+    failures = [
+        RecentFailure(
+            id=r["id"],
+            workload_slug=r["workload_slug"],
+            pk=r["pk"],
+            worker_id=r["worker_id"] or "",
+            started_at=r["started_at"],
+            reason=_short_reason(r.get("error"), r.get("stderr")),
+        )
+        for r in runs_repo.list_recent_failures(limit=10)
+    ]
 
     # 2. 各 workload の queue depth (enabled 限定)
     depths: list[QueueDepth] = []

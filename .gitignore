@@ -72,3 +72,5 @@ htmlcov/
 # Docs build
 docs/_build/
 site/
+plugins/crawl_video_dispatcher/
+plugins/video_face_extract/

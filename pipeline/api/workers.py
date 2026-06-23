@@ -17,6 +17,8 @@ HTTP で叩いて control plane と通信する:
 
 from __future__ import annotations
 
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -29,6 +31,46 @@ from pipeline.repositories.workers import WorkerNotFound, WorkerRepository
 from pipeline.repositories.workloads import WorkloadNotFound, WorkloadRepository
 
 router = APIRouter(prefix="/api/v1/workers", tags=["workers"])
+
+
+# ---------------- fair-share helpers (= KAI 風 weight ベース) -------------
+# 直近 N 秒の処理数を workload 別に集計、 10s キャッシュ。 高頻度な workloads
+# endpoint 呼び出しに対して runs テーブルを毎回叩かないため。
+
+_FAIR_CACHE: dict[str, Any] = {"ts": 0.0, "counts": {}}
+_FAIR_TTL_S = 10.0
+_FAIR_WINDOW_S = 300  # 直近 5 分
+
+
+def _recent_run_counts(db) -> dict[str, int]:
+    now = time.monotonic()
+    if now - _FAIR_CACHE["ts"] < _FAIR_TTL_S:
+        return _FAIR_CACHE["counts"]
+    since = (datetime.now(timezone.utc) - timedelta(seconds=_FAIR_WINDOW_S)).isoformat()
+    counts: dict[str, int] = {}
+    try:
+        with db.transaction() as conn:
+            cur = conn.execute(
+                "SELECT workload_slug, COUNT(*) AS n FROM runs "
+                "WHERE started_at > :s GROUP BY workload_slug",
+                {"s": since},
+            )
+            counts = {r["workload_slug"]: int(r["n"]) for r in cur.fetchall()}
+    except Exception:
+        pass  # fair-share は best-effort、 失敗時は全 0 (= 既存 slug 順)
+    _FAIR_CACHE.update({"ts": now, "counts": counts})
+    return counts
+
+
+def _fair_share_key(w: Any, recent_counts: dict[str, int]) -> float:
+    """大きいほど優先 (= 高 weight + 直近処理少ない = under-served)。
+    weight=1, recent=0  → 1.0
+    weight=3, recent=50 → 0.0588
+    weight=1, recent=100→ 0.0099
+    """
+    weight = max(float(w.weight or 1.0), 0.01)
+    actual = recent_counts.get(w.slug, 0)
+    return weight / (actual + 1)
 
 
 # ---------------- request / response models ----------------
@@ -67,6 +109,11 @@ class GpuMetric(BaseModel):
     temp_c: float | None = None
     util_pct: float | None = None
     mem_used_mb: int | None = None
+    mem_util_pct: float | None = None
+    mem_total_mb: int | None = None
+    power_w: float | None = None
+    sm_clock_mhz: int | None = None
+    mem_clock_mhz: int | None = None
 
 
 class HeartbeatRequest(BaseModel):
@@ -113,6 +160,23 @@ class RunRecordRequest(BaseModel):
     success: bool
     exit_code: int | None = None
     duration_ms: int
+    stdout: str | None = None
+    stderr: str | None = None
+    output_json: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class RunStartRequest(BaseModel):
+    workload_slug: str
+    pk: str
+    attempt: int
+    started_at: str
+
+
+class RunFinishRequest(BaseModel):
+    success: bool
+    exit_code: int | None = None
+    duration_ms: int = 0
     stdout: str | None = None
     stderr: str | None = None
     output_json: dict[str, Any] | None = None
@@ -190,33 +254,51 @@ def heartbeat(worker_id: str, body: HeartbeatRequest, request: Request) -> Worke
             for g in body.gpu_metrics:
                 conn.execute(
                     "INSERT OR REPLACE INTO worker_metrics "
-                    "(worker_id, gpu_idx, ts, temp_c, util_pct, mem_used_mb) "
-                    "VALUES (:wid, :gi, :ts, :tc, :up, :mu)",
+                    "(worker_id, gpu_idx, ts, temp_c, util_pct, mem_used_mb, "
+                    " mem_util_pct, mem_total_mb, power_w, sm_clock_mhz, mem_clock_mhz) "
+                    "VALUES (:wid, :gi, :ts, :tc, :up, :mu, :mup, :mt, :pw, :sc, :mc)",
                     {"wid": worker_id, "gi": g.gpu_idx, "ts": ts,
-                     "tc": g.temp_c, "up": g.util_pct, "mu": g.mem_used_mb},
+                     "tc": g.temp_c, "up": g.util_pct, "mu": g.mem_used_mb,
+                     "mup": g.mem_util_pct, "mt": g.mem_total_mb,
+                     "pw": g.power_w, "sc": g.sm_clock_mhz, "mc": g.mem_clock_mhz},
                 )
     return WorkerInfo(**rec)
 
 
 @router.get("/metrics", response_model=dict[str, Any])
 def list_workers_metrics(request: Request, minutes: int = 30) -> dict[str, Any]:
-    """過去 N 分の全 worker の GPU metrics を返す。 UI Dashboard graph 用."""
+    """過去 N 分の全 worker の GPU metrics を返す。 UI Dashboard graph 用.
+    アクティブ worker (workers テーブルに存在) のみ返す。"""
     from datetime import datetime, timedelta, timezone
     since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
     db = request.app.state.db
     with db.transaction() as conn:
+        active_ids = {
+            r["id"] for r in conn.execute(
+                "SELECT id FROM workers WHERE state = 'active'"
+            ).fetchall()
+        }
         cur = conn.execute(
-            "SELECT worker_id, gpu_idx, ts, temp_c, util_pct, mem_used_mb "
+            "SELECT worker_id, gpu_idx, ts, temp_c, util_pct, mem_used_mb, "
+            "       mem_util_pct, mem_total_mb, power_w, sm_clock_mhz, mem_clock_mhz "
             "FROM worker_metrics WHERE ts >= :since ORDER BY worker_id, gpu_idx, ts",
             {"since": since},
         )
         rows = [dict(r) for r in cur.fetchall()]
-    # worker_id ごとに集約
     by_worker: dict[str, dict[int, list[dict[str, Any]]]] = {}
     for r in rows:
+        if r["worker_id"] not in active_ids:
+            continue
         by_worker.setdefault(r["worker_id"], {}).setdefault(r["gpu_idx"], []).append({
-            "ts": r["ts"], "temp_c": r["temp_c"],
-            "util_pct": r["util_pct"], "mem_used_mb": r["mem_used_mb"],
+            "ts": r["ts"],
+            "temp_c": r["temp_c"],
+            "util_pct": r["util_pct"],
+            "mem_used_mb": r["mem_used_mb"],
+            "mem_util_pct": r["mem_util_pct"],
+            "mem_total_mb": r["mem_total_mb"],
+            "power_w": r["power_w"],
+            "sm_clock_mhz": r["sm_clock_mhz"],
+            "mem_clock_mhz": r["mem_clock_mhz"],
         })
     return {"workers": by_worker, "since_minutes": minutes}
 
@@ -243,6 +325,13 @@ def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorker
 
     `host_affinity` が空: 全 host が候補。
     `host_affinity` が指定: worker.host がリストに含まれる場合のみ。
+
+    返却順は **priority 降順 → fair-share key 降順 → slug**:
+    - 1st: priority 高 → 低 (= strict 優先度: 100 が先、 50 が後)
+    - 2nd: 同 priority 内では fair-share key (= weight / (直近 5min 処理数 + 1)) 降順
+      → 高 weight + under-served が先 (= KAI Scheduler 流の weighted fair-share)
+      → starvation 防止 + operator が weight で配分比を制御可能
+    - 3rd: tie breaker = slug alphabetical
     """
     worker = _get_worker_or_404(request, worker_id)
     worker_host = worker.get("host") if isinstance(worker, dict) else getattr(worker, "host", None)
@@ -255,7 +344,44 @@ def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorker
         if affinity and worker_host not in affinity:
             continue
         out.append(w)
+    recent_counts = _recent_run_counts(request.app.state.db)
+    out.sort(key=lambda w: (
+        -int(w.priority or 0),
+        -_fair_share_key(w, recent_counts),
+        w.slug,
+    ))
     return WorkloadsForWorkerResponse(workloads=out)
+
+
+@router.get("/{worker_id}/higher-pending", response_model=dict[str, Any])
+def higher_pending(worker_id: str, than: int, request: Request) -> dict[str, Any]:
+    """この worker の host_affinity を踏まえ、 priority > `than` の enabled workload
+    のうち pending タスクがあるものを返す (Lv2 preemption 用)。
+    worker は batch 完了後にこれを叩き、 True なら現 workload を抜け次 _drain_once で
+    最高 priority から再開する。
+    """
+    worker = _get_worker_or_404(request, worker_id)
+    worker_host = worker.get("host") if isinstance(worker, dict) else getattr(worker, "host", None)
+    qrepo = _qrepo(request)
+    higher_slugs: list[str] = []
+    for w in _wlrepo(request).list_all():
+        if not w.enabled:
+            continue
+        if int(w.priority or 0) <= than:
+            continue
+        affinity = list(w.host_affinity or [])
+        if affinity and worker_host not in affinity:
+            continue
+        # 安全な queue_table のみ count、 失敗時 (= 表未作成等) は skip
+        try:
+            counts = qrepo.count_by_state(w.queue_table)
+        except Exception:
+            continue
+        if int(counts.get("pending", 0)) > 0:
+            higher_slugs.append(w.slug)
+            if len(higher_slugs) >= 5:  # = 早期 break、 高 priority N 件あれば十分
+                break
+    return {"has_pending": bool(higher_slugs), "slugs": higher_slugs, "than": than}
 
 
 @router.post("/{worker_id}/claim", response_model=ClaimResponse)
@@ -290,6 +416,34 @@ def fail(worker_id: str, body: FailRequest, request: Request) -> None:
     _get_worker_or_404(request, worker_id)
     w = _get_workload_or_404(request, body.workload_slug)
     _qrepo(request).fail(w.queue_table, body.pk, max_attempts=w.max_attempts, error=body.error)
+
+
+@router.post("/{worker_id}/runs/start", status_code=status.HTTP_201_CREATED)
+def start_run(worker_id: str, body: RunStartRequest, request: Request) -> dict[str, str]:
+    _get_worker_or_404(request, worker_id)
+    rid = _rrepo(request).start(
+        workload_slug=body.workload_slug,
+        pk=body.pk,
+        worker_id=worker_id,
+        attempt=body.attempt,
+        started_at=body.started_at,
+    )
+    return {"id": rid}
+
+
+@router.post("/{worker_id}/runs/{run_id}/finish", status_code=status.HTTP_204_NO_CONTENT)
+def finish_run(worker_id: str, run_id: str, body: RunFinishRequest, request: Request) -> None:
+    _get_worker_or_404(request, worker_id)
+    _rrepo(request).finish(
+        run_id,
+        success=body.success,
+        exit_code=body.exit_code,
+        duration_ms=body.duration_ms,
+        stdout=body.stdout,
+        stderr=body.stderr,
+        output_json=body.output_json,
+        error=body.error,
+    )
 
 
 @router.post("/{worker_id}/runs", status_code=status.HTTP_201_CREATED)
