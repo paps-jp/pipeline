@@ -2,6 +2,8 @@
 
 pipeline-oss プラグインの最小サンプル。
 
+> ドキュメント: <https://paps-jp.github.io/pipeline/>
+
 ## 何をするか
 
 - task の `pk` と `extra` を print + `runs.output_json` に echo

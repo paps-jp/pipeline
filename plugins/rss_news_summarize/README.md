@@ -2,6 +2,8 @@
 
 RSS / Atom の 1 エントリ = 1 タスクで 本文を 取得し、 Claude haiku で 数行に 要約する。
 
+> Pipeline-oss のサンプル plugin。 ドキュメント: <https://paps-jp.github.io/pipeline/>
+
 [`rss-news-dispatcher`](../rss_news_dispatcher/) と セットで 使う:
 
 ```

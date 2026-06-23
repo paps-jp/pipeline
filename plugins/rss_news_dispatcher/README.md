@@ -3,6 +3,8 @@
 登録した RSS / Atom フィードを 定期 fetch し、 まだ処理していない 新エントリだけを
 [`rss-news-summarize`](../rss_news_summarize/) の queue に batch enqueue する。
 
+> Pipeline-oss のサンプル plugin。 ドキュメント: <https://paps-jp.github.io/pipeline/>
+
 self-loop 方式 (= 1 tick 完了 → sleep(interval_s) → 次 tick を pipeline-oss API へ
 self-enqueue) で 1 ワーカーを 専有する。
 
