@@ -1,5 +1,6 @@
-/* pipeline public docs — palette tuned to match the paprika admin UI
-   (warm cream background, paprika-red accent, white panels). */
+/* pipeline public docs — admin UI と同じ落ち着いた紙テクスチャを維持しつつ
+   アクセントは「配管色 (#b7b6eb 平均ペリウィンクル) の濃い目」 #4f47a3 に。
+   paprika 本体の 赤と 混同しないように 色相をはっきり 分けてある。 */
 
 :root {
   --bg: #f5f3ef;
@@ -7,33 +8,33 @@
   --fg: #222222;
   --fg-soft: #555555;
   --fg-dim: #888888;
-  --border: #e6e2d8;
-  --border-soft: #f0ece4;
-  --accent: #c0392b;
-  --accent-soft: rgba(192, 57, 43, 0.08);
-  --accent-strong: #9a2d23;
-  --code-bg: #f7f3ee;
-  --code-fg: #3a342e;
+  --border: #e2e0e6;
+  --border-soft: #ecebf0;
+  --accent: #4f47a3;
+  --accent-soft: rgba(79, 71, 163, 0.08);
+  --accent-strong: #3a3380;
+  --code-bg: #f3f2f7;
+  --code-fg: #2d2b3a;
   --warn-bg: #fff3e0;
   --warn-fg: #7a4500;
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
-  --shadow-lg: 0 6px 20px rgba(120, 60, 40, 0.10);
+  --shadow-lg: 0 6px 20px rgba(70, 60, 120, 0.12);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1c1a17;
-    --bg-soft: #25221d;
-    --fg: #ede9e1;
-    --fg-soft: #c3bdb2;
-    --fg-dim: #908a80;
-    --border: rgba(180, 160, 130, 0.18);
-    --border-soft: rgba(180, 160, 130, 0.10);
-    --accent: #e0654f;
-    --accent-soft: rgba(224, 101, 79, 0.14);
-    --accent-strong: #f0866f;
-    --code-bg: #2a2620;
-    --code-fg: #e0d8cb;
+    --bg: #16151c;
+    --bg-soft: #1f1e26;
+    --fg: #e8e7ee;
+    --fg-soft: #b8b6c8;
+    --fg-dim: #8a889c;
+    --border: rgba(170, 165, 200, 0.18);
+    --border-soft: rgba(170, 165, 200, 0.10);
+    --accent: #8a82d6;
+    --accent-soft: rgba(138, 130, 214, 0.14);
+    --accent-strong: #a8a2e6;
+    --code-bg: #25232e;
+    --code-fg: #d8d6e6;
     --warn-bg: #2a200c;
     --warn-fg: #f0c95c;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
@@ -112,7 +113,7 @@ header .gh:hover { background: rgba(255, 255, 255, 0.25); }
   padding: 8px;
   box-shadow:
     0 1px 3px rgba(0, 0, 0, 0.06),
-    0 16px 36px rgba(192, 57, 43, 0.16);
+    0 16px 36px rgba(79, 71, 163, 0.18);
   animation: hero-icon-float 6s ease-in-out infinite;
 }
 @keyframes hero-icon-float {
@@ -138,7 +139,7 @@ header .gh:hover { background: rgba(255, 255, 255, 0.25); }
 }
 .btn-primary {
   background: var(--accent); color: #fff;
-  box-shadow: 0 2px 6px rgba(192, 57, 43, 0.25);
+  box-shadow: 0 2px 6px rgba(79, 71, 163, 0.25);
 }
 .btn-primary:hover { background: var(--accent-strong); transform: translateY(-1px); }
 .btn-ghost {
