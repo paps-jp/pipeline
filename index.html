@@ -3,14 +3,15 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Pipeline — GUI-first batch fleet</title>
-<meta name="description" content="Pipeline — GUI から登録したワークロードをワーカープールで並列実行する、シンプルなバッチフリート制御プレーン。" />
+<title>Pipeline — GPU の 空き容量を バッチで 埋め尽くす</title>
+<meta name="description" content="Pipeline — 推論 / 学習の あいまに 残る GPU の 空き時間を、 複数バッチ ワークロードで 埋める 制御プレーン。 self-loop で キューを 絶やさず、 アイドル GPU を 残さない。" />
 <link rel="icon" type="image/x-icon" href="assets/favicon.ico" />
 <link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png" />
 <link rel="icon" type="image/png" sizes="192x192" href="assets/icon-192.png" />
 <link rel="apple-touch-icon" sizes="256x256" href="assets/icon-256.png" />
 <meta property="og:image" content="assets/icon-256.png" />
 <link rel="stylesheet" href="assets/site.css" />
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js" defer></script>
 </head>
 <body>
 
@@ -31,10 +32,11 @@
 
 <section class="hero">
   <img class="hero-icon" src="assets/icon-256.png" alt="Pipeline" />
-  <h1>GUI から登録した バッチを<br/>フリート全体で並列実行</h1>
+  <h1>アイドル GPU を、<br/>バッチで 埋め尽くす</h1>
   <p class="tagline">
-    Pipeline は ワークロードを Web UI から登録し、 複数ホストの ワーカープールで
-    実行する シンプルな バッチ制御プレーン。 SQLite + FastAPI + React 製。
+    推論 / 学習 / 解析 — 複数の バッチ ワークロードを 同じ GPU フリートに 同居させ、
+    self-loop で キューを 絶やさず、 残った 空き時間を 別 workload で 埋める。
+    GPU を 「ジョブ単独で 半分しか 使えない」 から 「常時 ほぼフル稼働」 へ。
   </p>
   <div class="cta-row">
     <a class="btn btn-primary" href="setup.html">セットアップを見る</a>
@@ -45,35 +47,66 @@
 <main>
 
 <section>
+  <h2>なぜ GPU の 空きを 埋め切れるのか</h2>
+  <p>
+    単一ジョブ で 動かす GPU は、 入力待ち / モデルロード / preprocess / 後処理 で
+    案外 半分くらい アイドル している。 Pipeline は 4 つの 構造で その 隙間を 別 workload に
+    流し込んで、 アイドル時間を 残さない。
+  </p>
+  <div class="feature-grid">
+    <div class="feature-card">
+      <div class="icon"><iconify-icon icon="lucide:infinity"></iconify-icon></div>
+      <h3>self-loop で キューを 絶やさない</h3>
+      <p>ワークロード 自身が 「次の tick」 を 自分で キューに 入れ続ける 設計。 外部の dispatcher / cron が 不要、 キューが 空になる 瞬間が 無いので、 ワーカーは 常に 次の 仕事を 受け取れる。</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon"><iconify-icon icon="lucide:list-checks"></iconify-icon></div>
+      <h3>1 タスク = 1 claim、 順序 自由</h3>
+      <p>ワーカーは キューから 1 件 取って 処理 → 完了 → 次の 1 件、 を 繰り返す だけ。 バッチ barrier (= N 件 揃ってから 次へ) が 無いので、 速い task と 遅い task が 同居しても 速い方が 先に 流れて GPU を 空かせない。</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon"><iconify-icon icon="lucide:sliders-horizontal"></iconify-icon></div>
+      <h3>複数 workload の 同居 + 重み配分</h3>
+      <p>同じ ワーカー fleet に N 個 workload を 登録できる。 優先度 + 重みを Optimizer が 自動調整、 「メインの 推論 70%、 隙間の 解析 30%」 のような 同居構成を 1 fleet で 実現する。 重い 学習が 来たら 軽い 推論を 一時 退避、 終わり次第 復帰。</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon"><iconify-icon icon="lucide:tag"></iconify-icon></div>
+      <h3>GPU タグで 必要な ワーカーへ</h3>
+      <p>ワーカーごとに <code>gpu</code> / <code>cpu</code> / 任意 タグを 付与。 GPU 必須の task は GPU ワーカーへ、 CPU で OK な task は CPU ワーカーへ アフィニティ 振り分け。 GPU は 「GPU が 本当に 要る タスク」 だけで 埋まる。</p>
+    </div>
+  </div>
+</section>
+
+<section>
   <h2>主な特徴</h2>
   <div class="feature-grid">
     <div class="feature-card">
-      <div class="icon">📋</div>
+      <div class="icon"><iconify-icon icon="lucide:clipboard-list"></iconify-icon></div>
       <h3>GUI でワークロード登録</h3>
       <p>シェルコマンドや Python モジュールを Web UI のフォームから登録。 開発者以外の運用担当でも追加・編集できる。</p>
     </div>
     <div class="feature-card">
-      <div class="icon">🔌</div>
+      <div class="icon"><iconify-icon icon="lucide:puzzle"></iconify-icon></div>
       <h3>プラグイン方式</h3>
       <p>ローカル <code>plugins/</code> ディレクトリに <code>plugin.yaml</code> + <code>main.py</code> を置けば 即フォーム化。 サンプル付属。</p>
     </div>
     <div class="feature-card">
-      <div class="icon">⚡</div>
+      <div class="icon"><iconify-icon icon="lucide:zap"></iconify-icon></div>
       <h3>シンプルな ワーカー</h3>
       <p>各ホストに 1 つのデーモンが HTTP heartbeat で参加。 クラスタマネージャ不要、 SSH 不要 (= 配信は HTTP 経由)。</p>
     </div>
     <div class="feature-card">
-      <div class="icon">📊</div>
+      <div class="icon"><iconify-icon icon="lucide:activity"></iconify-icon></div>
       <h3>ライブ可視化</h3>
       <p>ダッシュボードで 実行中タスク / 最近の失敗 / キュー深さ / GPU 温度を 3 秒更新で表示。</p>
     </div>
     <div class="feature-card">
-      <div class="icon">🔄</div>
+      <div class="icon"><iconify-icon icon="lucide:refresh-cw"></iconify-icon></div>
       <h3>失敗詳細 + 再実行</h3>
-      <p>各 run の stderr / Python traceback を ワンクリックで展開。 失敗した task は 同じ pk で 即 再投入できる。</p>
+      <p>各 run の stderr / Python traceback を ワンクリックで展開。 失敗した task は 同じ pk で 即 再投入できる。 1 件 詰まって 全体停止、 という Airflow 系の 落とし穴を 構造的に 回避。</p>
     </div>
     <div class="feature-card">
-      <div class="icon">🎯</div>
+      <div class="icon"><iconify-icon icon="lucide:database"></iconify-icon></div>
       <h3>SQLite シングルファイル</h3>
       <p>制御プレーンの全状態が 1 つの SQLite ファイルに収まる。 バックアップ・差分・grep が容易。</p>
     </div>
