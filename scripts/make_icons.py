@@ -23,7 +23,11 @@ def square_crop(im: Image.Image) -> Image.Image:
 
 
 def main() -> None:
-    im = Image.open(SRC).convert("RGB")
+    # RGBA を維持 (= 透明背景 source を そのまま伝播)。 旧 source は 白背景
+    # 不透明 (RGB) だったので convert("RGB") していたが、 新 source は 透明背景
+    # なので RGBA を保ったままサイズ落とした方が ヘッダの 赤地・カードの
+    # 白地・ダーク bg どこでも 自然に乗る。
+    im = Image.open(SRC).convert("RGBA")
     sq = square_crop(im)
     for s in SIZES:
         out = ASSETS / f"icon-{s}.png"
