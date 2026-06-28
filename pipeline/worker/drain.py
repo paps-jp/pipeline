@@ -89,6 +89,7 @@ class Worker:
         self,
         db: Database,
         *,
+        secondary_db: Database | None = None,
         worker_id: str | None = None,
         idle_sleep_s: float = 1.0,
         log_workdir_keep: bool = False,
@@ -100,7 +101,9 @@ class Worker:
         self._stop_evt = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._workloads = WorkloadRepository(db)
-        self._queue = QueueRepository(db)
+        # secondary_db (= MariaDB) 指定時は業務 queue を backend 切替可能に。
+        # 未指定なら SQLite-only (= 後方互換)。 配線は _wire_queue_backends で。
+        self._queue = QueueRepository(db, secondary_db)
         self._runs = RunsRepository(db)
         # executor instance cache: slug -> (config_hash, executor)
         # config が変わると hash が変わって自動で再構築される。
@@ -165,9 +168,21 @@ class Worker:
 
     # ---------------- internal ----------------
 
+    def _wire_queue_backends(self) -> None:
+        """workloads.queue_backend に従い QueueRepository の backend を配線。
+
+        secondary_db 未指定 (= SQLite-only) なら何もしない (= 余計な query もしない)。
+        dynamic: 毎 iteration 呼ぶので Session 2 で queue_backend を 'mariadb' に
+        切替えると次 tick から MariaDB 経路に乗る (= プロセス再起動不要)。
+        """
+        if self._queue.secondary_db is None:
+            return
+        self._queue.wire_from_workloads(self._workloads.list_all())
+
     async def _run(self) -> None:
         while not self._stop_evt.is_set():
             try:
+                self._wire_queue_backends()
                 did = await self._drain_once()
             except Exception:
                 log.exception("worker %s drain iteration failed", self.worker_id)
