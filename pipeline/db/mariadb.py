@@ -22,7 +22,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from pipeline.db.base import Connection, Cursor, Database
 
@@ -148,8 +148,9 @@ class MariadbDatabase(Database):
         parsed = urlparse(url)
         self._host = parsed.hostname or "localhost"
         self._port = parsed.port or 3306
-        self._user = parsed.username or ""
-        self._password = parsed.password or ""
+        # user/password は URL-encode 前提で unquote (= パスワードに @ : / 等を含む場合)
+        self._user = unquote(parsed.username) if parsed.username else ""
+        self._password = unquote(parsed.password) if parsed.password else ""
         self._db = (parsed.path or "/").lstrip("/")
         if not self._db:
             raise ValueError(f"mariadb URL に database 名が無い: {url!r}")
