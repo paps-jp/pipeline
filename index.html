@@ -84,6 +84,77 @@
 </section>
 
 <section>
+  <h2>実測 — 1 GPU × 4 worker 同居の Before / After</h2>
+  <p>
+    社内環境 (NVIDIA RTX PRO 2000 Blackwell 16GB、 顔検出 + 顔埋め込みの推論ワークロード 6 種、
+    4 worker / 1 GPU 構成) で MPS 有効化前後を 30 分ずつ実測した数字です。 単一ジョブで動かしたままだと
+    GPU は idle が長く、 複数 workload を同居させると埋まる、 という上の主張の具体例です。
+  </p>
+  <div style="overflow-x: auto; margin-top: 1.2rem;">
+  <table style="border-collapse: collapse; width: 100%; font-size: 0.94rem; min-width: 540px;">
+    <thead>
+      <tr style="background: var(--accent-soft); text-align: left;">
+        <th style="padding: 10px 12px; border-bottom: 2px solid var(--accent);">指標</th>
+        <th style="padding: 10px 12px; border-bottom: 2px solid var(--accent); text-align: right;">Before<br /><small style="opacity:0.65; font-weight: 400;">(MPS 無し)</small></th>
+        <th style="padding: 10px 12px; border-bottom: 2px solid var(--accent); text-align: right;">After<br /><small style="opacity:0.65; font-weight: 400;">(MPS 有効)</small></th>
+        <th style="padding: 10px 12px; border-bottom: 2px solid var(--accent); text-align: right;">差分</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft);">throughput <small style="opacity: 0.65;">(.23 / 4 worker 合算)</small></td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums;">45.5 runs/min</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent-strong);">52.3 runs/min</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; color: #2d8a4c;">+14.7%</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft);">1 task あたり平均所要</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums;">5194 ms</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent-strong);">4261 ms</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; color: #2d8a4c;">-18.0%</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft);">GPU 利用率 <small style="opacity: 0.65;">(idle 時 nvidia-smi)</small></td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums;">0%</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent-strong);">36%</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; color: #2d8a4c;">+36 ppt</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft);">GPU メモリ使用</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums;">8.5 / 16 GB</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums;">8.8 / 16 GB</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; opacity: 0.55;">+0.3 GB</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft);">worker あたり (4 worker 均し)</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums;">11.4 runs/min</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent-strong);">13.1 runs/min</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid var(--border-soft); text-align: right; font-variant-numeric: tabular-nums; color: #2d8a4c;">+14.9%</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 12px;">障害 <small style="opacity: 0.65;">(30 分間)</small></td>
+        <td style="padding: 8px 12px; text-align: right; font-variant-numeric: tabular-nums;">0 件</td>
+        <td style="padding: 8px 12px; text-align: right; font-variant-numeric: tabular-nums;">0 件</td>
+        <td style="padding: 8px 12px; text-align: right; opacity: 0.55;">―</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="margin-top: 0.9rem; font-size: 0.88rem; opacity: 0.75;">
+    計測法: <code>started_at</code> でフィルタした <code>runs</code> テーブルから 1 GPU host (.23) の
+    全 run を集計。 Before = MPS daemon 未起動・4 worker 直接 CUDA、 After = <code>nvidia-cuda-mps-control -d</code>
+    起動 + worker 4 個再起動。 ワークロード構成は同一 (= 顔検出 hash-detect / 顔埋込 embed / 動画→顔抽出 video-face-extract /
+    クロール dispatcher / index writer)。 ONNX Runtime CUDA EP は MPS 経由でも問題なく動作。
+  </p>
+  <p style="margin-top: 0.6rem; font-size: 0.88rem; opacity: 0.75;">
+    示唆: 上のセクションで述べた「単一ジョブだとGPUは 40-60% アイドル」 は実測でも裏付けられました。
+    MPS で物理共存させただけ (= Pipeline オーケストレータ + 4 worker 同居) で、
+    <strong>同じハードウェア・同じワークロード構成のまま +14.7% throughput / GPU 利用率 0%→36%</strong>
+    に変化しました。 ハードウェア追加投資ゼロでのリターンです。
+  </p>
+</section>
+
+<section>
   <h2>主な特徴</h2>
   <div class="feature-grid">
     <div class="feature-card">
