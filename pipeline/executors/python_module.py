@@ -27,6 +27,7 @@ Plugin module の規約は executors/base.py のコメント参照。
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import logging
 import sys
 import time
@@ -63,27 +64,73 @@ class PythonModuleExecutor:
             config.get("source_path") or config.get("module_search_path") or None
         )
 
-        # sys.path 操作はモジュール load 中だけに留める (他 plugin との干渉を抑える)
-        added_path: str | None = None
+        # plugin module 名空間の衝突防止:
+        # 複数 plugin が同名 module (例: 2 つの dispatcher が両方 `dispatch_main.py`)
+        # を持つと、 importlib.import_module() は `sys.modules` キャッシュを共有する
+        # ので、 最初に load された側のコードが両方の workload で動いてしまう
+        # (= 2026-06-23 video-dispatcher が image dispatcher のコードを実行する
+        #    incident で発覚)。
+        #
+        # 対策: source_path 指定時は `spec_from_file_location` + plugin slug 入りの
+        # unique `sys.modules` キー (`_pipeline_plugin_<slug>_<module>`) で load し、
+        # キャッシュ衝突を物理的に切り離す。
+        # source_path が無い旧方式 (= module_search_path) はそのまま import_module。
+        sp_resolved: str | None = None
         if self._search_path:
-            sp = str(Path(self._search_path).expanduser().resolve())
-            if sp not in sys.path:
-                sys.path.insert(0, sp)
-                added_path = sp
+            sp_resolved = str(Path(self._search_path).expanduser().resolve())
+            if sp_resolved not in sys.path:
+                # plugin 内 sub-import (from .lib import xxx 等) のため sys.path にも追加。
+                # ただし top-level module は下の spec ベース load で別キーに置くので
+                # 衝突は起きない。
+                sys.path.insert(0, sp_resolved)
         try:
-            try:
-                self._module = importlib.import_module(module_name)
-            except ImportError as e:
-                raise PluginConfigError(
-                    f"python_module executor: cannot import {module_name!r}: {e}"
-                ) from e
+            if sp_resolved:
+                plugin_slug = Path(sp_resolved).name  # e.g. "crawl_video_dispatcher"
+                unique_key = f"_pipeline_plugin_{plugin_slug}_{module_name}"
+                module_file = Path(sp_resolved) / f"{module_name}.py"
+                if not module_file.exists():
+                    # `.py` ファイルがない場合は package (= __init__.py) の可能性
+                    pkg_dir = Path(sp_resolved) / module_name
+                    pkg_init = pkg_dir / "__init__.py"
+                    if pkg_init.exists():
+                        module_file = pkg_init
+                    else:
+                        raise PluginConfigError(
+                            f"python_module executor: cannot find "
+                            f"{module_name!r} under {sp_resolved!r}"
+                        )
+                spec = importlib.util.spec_from_file_location(
+                    unique_key, str(module_file)
+                )
+                if spec is None or spec.loader is None:
+                    raise PluginConfigError(
+                        f"python_module executor: spec_from_file_location failed for "
+                        f"{module_file}"
+                    )
+                self._module = importlib.util.module_from_spec(spec)
+                # exec 前に sys.modules に登録 → plugin 内の sub-import が正しく解決
+                sys.modules[unique_key] = self._module
+                # `module_name` でも参照したい sub-import 用に top-level alias を立てる
+                # (= 例: `from dispatch_main import _foo` 形式の self-reference 救済)。
+                # ただし、 上書きすると他 plugin の同名 module 参照を壊すので、 既存
+                # entry がある場合は alias を作らず unique_key だけ生かす。
+                sys.modules.setdefault(module_name, self._module)
+                try:
+                    spec.loader.exec_module(self._module)
+                except Exception:
+                    sys.modules.pop(unique_key, None)
+                    raise
+            else:
+                # 旧方式: module_search_path のみ → import_module で OK
+                try:
+                    self._module = importlib.import_module(module_name)
+                except ImportError as e:
+                    raise PluginConfigError(
+                        f"python_module executor: cannot import {module_name!r}: {e}"
+                    ) from e
         finally:
-            if added_path is not None and added_path in sys.path:
-                # 追加した path は残しておく — plugin の sub-import が後で走る可能性
-                # (plugin 内 from .lib import xxx 等)。複数 plugin が同名 module を
-                # 持つ場合は version 付きの "<slug>_<hash>" を上位 package 名にする
-                # 規約を Plugin Registry 側で強制する想定。
-                pass
+            # sp_resolved は sys.path に残す (= plugin sub-import の解決経路)
+            pass
 
         process_fn = getattr(self._module, self._callable_name, None)
         if not callable(process_fn):

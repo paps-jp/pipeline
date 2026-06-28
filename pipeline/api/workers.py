@@ -17,6 +17,8 @@ HTTP で叩いて control plane と通信する:
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -82,6 +84,9 @@ class WorkerRegisterRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
     resources: dict[str, Any] = Field(default_factory=dict)
     worker_id: str | None = None
+    # 起動時の env-fallback filter (= PIPELINE_WORKLOAD_FILTER)。
+    # None = env 未設定 (= 全 workload 受け)、 list = この list のみ。
+    env_filter: list[str] | None = None
 
 
 class WorkerInfo(BaseModel):
@@ -97,6 +102,14 @@ class WorkerInfo(BaseModel):
     current_phase: str | None = None
     rows_processed: int = 0
     errors_total: int = 0
+    # 自動切替: 制御プレーンが保持する workload allow-list (= 空/None=フィルタ解除)。
+    # worker daemon は 30s 毎にこれを poll し、 変化があれば executor cache を捨てて
+    # 反映する (= プロセス再起動なしの runtime 切替)。
+    workload_filter: list[str] | None = None
+    filter_updated_at: str | None = None
+    filter_updated_by: str | None = None
+    # 起動時の systemd PIPELINE_WORKLOAD_FILTER env (= DB filter=null 時の fallback)
+    env_filter: list[str] | None = None
 
 
 class WorkersListResponse(BaseModel):
@@ -122,6 +135,9 @@ class HeartbeatRequest(BaseModel):
     rows_processed_delta: int = 0
     errors_total_delta: int = 0
     gpu_metrics: list[GpuMetric] | None = None
+    host_cpu_pct: float | None = None    # /proc/loadavg ベース、 lane scaler が読む
+    gpu_throttle: bool | None = None     # サーマルスロットル発動中
+    gpu_temp_c: float | None = None      # GPU 温度 (報告用)
 
 
 class ClaimRequest(BaseModel):
@@ -187,7 +203,151 @@ class WorkloadsForWorkerResponse(BaseModel):
     workloads: list[Workload]
 
 
+class SetWorkerFilterRequest(BaseModel):
+    # mode の意味:
+    # - replace: workloads で完全上書き (= 既存の DB filter を捨てる)
+    # - add:     workloads を **追加**。 DB filter=None なら env_filter を base に union
+    # - remove:  workloads を **除去**。 DB filter=None なら env_filter を base に差分
+    # 既存 client 互換: mode 未指定なら "replace"。
+    mode: str = "replace"
+    # mode=replace: None / [] = 解除 (= env fallback)
+    # mode=add/remove: 追加 or 削除する slug の list
+    workloads: list[str] | None = None
+    # 監査用: "supervisor:rule-xyz" / "operator" 等。 未指定 = "operator"。
+    updated_by: str | None = None
+
+
+class WorkerConfigResponse(BaseModel):
+    """worker daemon が poll する設定。 SoT は workers テーブル。"""
+    workload_filter: list[str] | None = None
+    filter_updated_at: str | None = None
+    filter_updated_by: str | None = None
+    # 将来の拡張用: 1 ペイロードでまとめて返す (= round-trip 削減)
+    # 例: idle_sleep_s, claim_limit_override 等。 現状は filter のみ。
+
+
 # ---------------- helpers ----------------
+
+
+def _host_matches_affinity(worker_host: str | None,
+                            affinity: list[str]) -> bool:
+    """worker.host (= "ai-gpu1-1" のような systemd instance suffix 付き形式)が
+    workload.host_affinity (= "ai-gpu1" のような host family、 もしくは完全一致 host)
+    にマッチするか。
+
+    マッチ条件:
+      - 完全一致 ("ai-gpu1-1" == "ai-gpu1-1")
+      - host family のプレフィックスマッチ ("ai-gpu1-1" starts with "ai-gpu1-")
+        ← supervisor の `add_host_affinity` が `_host_stats` 由来の "ai-gpu1" 形式で
+          書くため、 worker の "ai-gpu1-1" がここでマッチするように。
+    """
+    if not affinity:
+        return True
+    if not worker_host:
+        return False
+    for entry in affinity:
+        if not isinstance(entry, str):
+            continue
+        if worker_host == entry:
+            return True
+        if worker_host.startswith(entry + "-"):
+            return True
+    return False
+
+
+def _host_family(worker_host: str) -> str:
+    """systemd instance suffix を剥がして "ai-gpu1-3" → "ai-gpu1" にする。
+    suffix が数字以外なら原文をそのまま返す (= "delian-prod" 等は触らない)。
+    """
+    parts = worker_host.rsplit("-", 1)
+    return parts[0] if (len(parts) == 2 and parts[1].isdigit()) else worker_host
+
+
+def _count_host_concurrency(db: Any, worker_host: str, slug: str) -> int:
+    """同じ host で current_workload=slug の worker 数 (= 自分自身も含む)。
+
+    `max_concurrent_per_host` ガード用。 worker のホスト名は systemd instance
+    suffix 付き (ai-gpu1-1, ai-gpu1-2…) で、 同一物理 GPU を共有するため、
+    suffix を剥がして家族単位で数える。
+
+    "active" 系の state のみカウント (= idle/dead/connecting は除外、 false-block 防止)。
+    best-effort: race で多少超えても次 cycle で収束する想定。
+    """
+    if not worker_host:
+        return 0
+    family = _host_family(worker_host)
+    family_glob = family + "-%"
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM workers "
+            "WHERE current_workload = :s "
+            "  AND state IN ('active','running','claiming','draining') "
+            "  AND (host = :exact OR host LIKE :glob)",
+            {"s": slug, "exact": family, "glob": family_glob},
+        )
+        row = cur.fetchone()
+    # sqlite3.Row は string キーのみ、 数値 index は KeyError になる環境がある。
+    return int(row["cnt"]) if row else 0
+
+
+def _host_vram_budget(
+    db: Any,
+    worker_host: str,
+    self_worker_id: str | None,
+    cost_by_slug: dict[str, int],
+) -> tuple[int, int]:
+    """同じ host family の active workers の VRAM 使用見積と host capacity を返す。
+
+    返り値: (used_mb, capacity_mb)
+      - used_mb     = 他 active worker の current_workload の cost (= avg or p95) 合計
+      - capacity_mb = 同 family worker が `resources.gpu_vram_mb` で申告した最大値
+                      (= host 全 GPU メモリ容量。 0 = 申告なし → fail-open)
+
+    `cost_by_slug` は呼出側で「実態の VRAM 占有」 を反映した dict を渡す。
+    既存 peak ベースだと過大評価で worker idle 化したため、 2026-06-28 から
+    avg 寄り (= 通常時の値) を使う。 burst 耐性は呼出側で new workload の peak を
+    足す形で確保する。
+
+    CPU instance (= hostname suffix "cpu" 含む) は resources.gpu_vram_mb=16311 と
+    申告するが、 物理的に GPU 使わないので capacity 計算から除外する。
+
+    `self_worker_id` を渡せばその worker 自身は used から除外する。
+
+    fail-open: capacity_mb=0 (= 申告ない / 全 CPU instance) なら呼び出し側で skip。
+    """
+    if not worker_host:
+        return 0, 0
+    family = _host_family(worker_host)
+    family_glob = family + "-%"
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "SELECT id, host, current_workload, resources FROM workers "
+            "WHERE state IN ('active','running','claiming','draining') "
+            "  AND (host = :exact OR host LIKE :glob)",
+            {"exact": family, "glob": family_glob},
+        )
+        rows = cur.fetchall()
+    used_mb = 0
+    capacity_mb = 0
+    for row in rows:
+        wid = row["id"]
+        host = row["host"] or ""
+        cw = row["current_workload"]
+        res_raw = row["resources"]
+        # CPU instance は GPU を物理的に使わない → used にも capacity にも入れない
+        is_cpu_instance = "cpu" in host.lower()
+        if not is_cpu_instance and wid != self_worker_id and cw:
+            used_mb += int(cost_by_slug.get(cw, 0) or 0)
+        if is_cpu_instance:
+            continue
+        try:
+            res = json.loads(res_raw) if isinstance(res_raw, str) else (res_raw or {})
+        except Exception:
+            res = {}
+        gpu_mb = int(res.get("gpu_vram_mb") or 0)
+        if gpu_mb > capacity_mb:
+            capacity_mb = gpu_mb
+    return used_mb, capacity_mb
 
 
 def _wrepo(request: Request) -> WorkerRepository:
@@ -235,6 +395,7 @@ def register_worker(body: WorkerRegisterRequest, request: Request) -> WorkerInfo
         host=body.host, pid=body.pid,
         tags=body.tags, resources=body.resources,
         worker_id=body.worker_id,
+        env_filter=body.env_filter,
     )
     return WorkerInfo(**rec)
 
@@ -268,7 +429,65 @@ def heartbeat(worker_id: str, body: HeartbeatRequest, request: Request) -> Worke
                      "mup": g.mem_util_pct, "mt": g.mem_total_mb,
                      "pw": g.power_w, "sc": g.sm_clock_mhz, "mc": g.mem_clock_mhz},
                 )
+    # CPU% / サーマル状態は DB 不要 (= 揮発で十分)、 in-memory store
+    if body.host_cpu_pct is not None or body.gpu_throttle is not None or body.gpu_temp_c is not None:
+        from datetime import datetime, timezone
+        store = getattr(request.app.state, "worker_cpu", None)
+        if store is None:
+            store = {}
+            request.app.state.worker_cpu = store
+        existing = store.get(worker_id, {})
+        store[worker_id] = {
+            "cpu_pct": float(body.host_cpu_pct) if body.host_cpu_pct is not None else existing.get("cpu_pct"),
+            "host": rec.get("host"),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "gpu_throttle": bool(body.gpu_throttle) if body.gpu_throttle is not None else existing.get("gpu_throttle", False),
+            "gpu_temp_c": float(body.gpu_temp_c) if body.gpu_temp_c is not None else existing.get("gpu_temp_c"),
+        }
     return WorkerInfo(**rec)
+
+
+@router.get("/cpu", response_model=dict[str, Any])
+def list_workers_cpu(request: Request) -> dict[str, Any]:
+    """各 worker (= host) の最新 CPU 利用率を返す。 lane scaler が読む。
+
+    形式:
+      {"per_worker": {"<wid>": {"host": "...", "cpu_pct": 23.4, "ts": "..."}, ...},
+       "per_host":   {"<host>": {"cpu_pct": 23.4, "n_workers": 7, "ts": "..."}},
+       "cluster_max": 79.0}
+    """
+    from datetime import datetime, timezone, timedelta
+    store: dict[str, dict[str, Any]] = getattr(request.app.state, "worker_cpu", {}) or {}
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=120)  # 2 分以内の値のみ採用
+    per_worker: dict[str, dict[str, Any]] = {}
+    per_host_vals: dict[str, list[float]] = {}
+    per_host_ts: dict[str, str] = {}
+    for wid, v in store.items():
+        try:
+            ts_dt = datetime.fromisoformat(v["ts"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ts_dt < cutoff:
+            continue
+        per_worker[wid] = v
+        host = v.get("host") or wid
+        per_host_vals.setdefault(host, []).append(float(v["cpu_pct"]))
+        # 最新 ts を host 代表に
+        if host not in per_host_ts or v["ts"] > per_host_ts[host]:
+            per_host_ts[host] = v["ts"]
+    per_host = {
+        h: {"cpu_pct": round(max(vs), 1),    # 同 host 上の worker 全 reading から max
+            "n_workers": len(vs), "ts": per_host_ts.get(h)}
+        for h, vs in per_host_vals.items()
+    }
+    cluster_max = max((d["cpu_pct"] for d in per_host.values()), default=0.0)
+    return {
+        "per_worker": per_worker,
+        "per_host": per_host,
+        "cluster_max": cluster_max,
+        "now": now.isoformat(),
+    }
 
 
 @router.get("/metrics", response_model=dict[str, Any])
@@ -325,6 +544,47 @@ def list_workers(request: Request) -> WorkersListResponse:
 # ---------------- drain / queue access ----------------
 
 
+@router.get("/{worker_id}/config", response_model=WorkerConfigResponse)
+def worker_config(worker_id: str, request: Request) -> WorkerConfigResponse:
+    """worker daemon が 30s 毎に poll するエンドポイント。
+
+    返却される `workload_filter` が現在 daemon が知ってる filter と違えば、
+    daemon は executor cache を捨てて新 filter を適用 (= プロセス再起動なし)。
+    """
+    rec = _get_worker_or_404(request, worker_id)
+    return WorkerConfigResponse(
+        workload_filter=rec.get("workload_filter"),
+        filter_updated_at=rec.get("filter_updated_at"),
+        filter_updated_by=rec.get("filter_updated_by"),
+    )
+
+
+@router.post("/{worker_id}/filter", response_model=WorkerInfo)
+def set_worker_filter(
+    worker_id: str, body: SetWorkerFilterRequest, request: Request
+) -> WorkerInfo:
+    """worker の workload_filter を変更。 supervisor / operator から叩く。
+
+    mode:
+      - replace (default): body.workloads で完全上書き。 None/[] = 解除 (= env fallback)
+      - add:    body.workloads を **追加** (= 既存 + 新規の union)。
+                DB filter=None の worker は env_filter を base にして安全マージ
+      - remove: body.workloads を **除去**。 結果が env_filter と同じなら null に
+    """
+    try:
+        rec = _wrepo(request).set_filter(
+            worker_id,
+            filter_list=body.workloads,
+            mode=body.mode,
+            updated_by=body.updated_by,
+        )
+    except WorkerNotFound as e:
+        raise HTTPException(404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    return WorkerInfo(**rec)
+
+
 @router.get("/{worker_id}/workloads", response_model=WorkloadsForWorkerResponse)
 def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorkerResponse:
     """この worker が claim できる enabled workload を返す。
@@ -341,14 +601,56 @@ def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorker
     """
     worker = _get_worker_or_404(request, worker_id)
     worker_host = worker.get("host") if isinstance(worker, dict) else getattr(worker, "host", None)
+    worker_current = worker.get("current_workload") if isinstance(worker, dict) else getattr(worker, "current_workload", None)
+    # worker.workload_filter (= operator 設定の class 分離 SoT) を hub 側でも適用。
+    # worker daemon が古い list で claim 呼んで filter 違反する事故を防ぐ
+    # (= 2026-06-28 nas-cpu が video-face-extract 取りに行った bug 修正)。
+    worker_filter_raw = worker.get("workload_filter") if isinstance(worker, dict) else None
+    worker_filter: set[str] | None = None
+    if worker_filter_raw:
+        try:
+            parsed = json.loads(worker_filter_raw) if isinstance(worker_filter_raw, str) else list(worker_filter_raw)
+            worker_filter = set(parsed) if parsed else None
+        except Exception:
+            worker_filter = None
     all_wls = _wlrepo(request).list_all()
+    # VRAM 予算チェック用 lookup
+    # cost = peak ベース (= 常時 peak 近く使う plugin で avg 採用すると race で OOM 再発、
+    # 2026-06-28 Phase 1D で検証して逆戻り)。 avg/p95 は UI 表示用にとどめる。
+    cost_by_slug = {w.slug: int(w.observed_vram_mb_peak or 0) for w in all_wls}
+    new_cost_by_slug = cost_by_slug
+    # 同 family の active workers の VRAM 使用見積 + host capacity。
+    # capacity_mb=0 (= CPU instance 群 or 申告なし) は fail-open。
+    host_used_mb, host_capacity_mb = _host_vram_budget(
+        request.app.state.db, worker_host, worker_id, cost_by_slug
+    )
+    safety = float(os.environ.get("PIPELINE_VRAM_SAFETY_FRAC", "0.85") or "0.85")
     out = []
     for w in all_wls:
         if not w.enabled:
             continue
-        affinity = list(w.host_affinity or [])
-        if affinity and worker_host not in affinity:
+        if worker_filter is not None and w.slug not in worker_filter:
             continue
+        affinity = list(w.host_affinity or [])
+        if not _host_matches_affinity(worker_host, affinity):
+            continue
+        # 同一 host 上の同時実行ワーカー数を上限制御 (= 横方向、 簡易ガード)。
+        limit = w.max_concurrent_per_host
+        if limit is not None and limit > 0 and worker_host:
+            active = _count_host_concurrency(request.app.state.db, worker_host, w.slug)
+            own = 1 if worker_current == w.slug else 0
+            if max(0, active - own) >= limit:
+                continue
+        # 縦方向: VRAM 予算チェック。 「他 active worker の avg 合計 + この workload
+        # の p95」 が host capacity * safety を超える時 claim 候補から外す。
+        # 他 worker は avg (= 通常時)、 自分が乗せる新分は p95 (= burst 想定) で
+        # 安全側に倒す。 capacity=0 (= CPU instance / 容量未申告) は skip。
+        if host_capacity_mb > 0:
+            new_cost = new_cost_by_slug.get(w.slug, 0)
+            if new_cost > 0:
+                budget_mb = int(host_capacity_mb * safety)
+                if host_used_mb + new_cost > budget_mb:
+                    continue
         out.append(w)
     recent_counts = _recent_run_counts(request.app.state.db)
     out.sort(key=lambda w: (
@@ -368,6 +670,16 @@ def higher_pending(worker_id: str, than: int, request: Request) -> dict[str, Any
     """
     worker = _get_worker_or_404(request, worker_id)
     worker_host = worker.get("host") if isinstance(worker, dict) else getattr(worker, "host", None)
+    # worker_filter は workloads_for_worker と同じく適用 (= filter 違反 workload を
+    # higher と判定して drain 誘発するのを防ぐ、 2026-06-28)
+    worker_filter_raw = worker.get("workload_filter") if isinstance(worker, dict) else None
+    worker_filter: set[str] | None = None
+    if worker_filter_raw:
+        try:
+            parsed = json.loads(worker_filter_raw) if isinstance(worker_filter_raw, str) else list(worker_filter_raw)
+            worker_filter = set(parsed) if parsed else None
+        except Exception:
+            worker_filter = None
     qrepo = _qrepo(request)
     higher_slugs: list[str] = []
     for w in _wlrepo(request).list_all():
@@ -375,8 +687,10 @@ def higher_pending(worker_id: str, than: int, request: Request) -> dict[str, Any
             continue
         if int(w.priority or 0) <= than:
             continue
+        if worker_filter is not None and w.slug not in worker_filter:
+            continue
         affinity = list(w.host_affinity or [])
-        if affinity and worker_host not in affinity:
+        if not _host_matches_affinity(worker_host, affinity):
             continue
         # 安全な queue_table のみ count、 失敗時 (= 表未作成等) は skip
         try:
@@ -392,8 +706,23 @@ def higher_pending(worker_id: str, than: int, request: Request) -> dict[str, Any
 
 @router.post("/{worker_id}/claim", response_model=ClaimResponse)
 def claim(worker_id: str, body: ClaimRequest, request: Request) -> ClaimResponse:
-    _get_worker_or_404(request, worker_id)
+    worker = _get_worker_or_404(request, worker_id)
     w = _get_workload_or_404(request, body.workload_slug)
+    # enabled=0 (= operator が停止指定) なら新規 claim 拒否。
+    if not w.enabled:
+        return ClaimResponse(workload_slug=w.slug, tasks=[])
+    # worker.workload_filter が設定されていて、 リクエストの slug がそこに無いなら
+    # 拒否。 workloads_for_worker は filter 適用するが、 worker daemon が古い list で
+    # claim 呼ぶと filter ない workload も通っていた (= nas-cpu worker が
+    # video-face-extract claim → movie2face 不在で setup fail 連続、 2026-06-28)。
+    wf = worker.get("workload_filter") if isinstance(worker, dict) else None
+    if wf:
+        try:
+            allowed = json.loads(wf) if isinstance(wf, str) else list(wf)
+        except Exception:
+            allowed = None
+        if allowed is not None and w.slug not in allowed:
+            return ClaimResponse(workload_slug=w.slug, tasks=[])
     tasks = _qrepo(request).claim(
         w.queue_table,
         worker_id=worker_id,

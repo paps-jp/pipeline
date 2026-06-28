@@ -169,6 +169,26 @@ class RunsRepository:
             rows = cur.fetchall()
         return [self._row(r) for r in rows]
 
+    def list_since(self, started_after_iso: str) -> list[dict[str, Any]]:
+        # 時刻ベース取得。 limit ベースだと高頻度 workload (= image-embed) が枠を
+        # 食い尽くし、 長 interval workload (= paprika-links-pull) の最新 run を
+        # 押し出して flow の throughput=0/state=idle 誤判定を起こす (2026-06-27)。
+        # 5min カットオフを引数として渡す前提。
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, workload_slug, pk, worker_id, attempt,
+                       started_at, finished_at, success, exit_code, duration_ms,
+                       stdout, stderr, output_json, error
+                FROM runs
+                WHERE started_at >= :since
+                ORDER BY started_at DESC, id DESC
+                """,
+                {"since": str(started_after_iso)},
+            )
+            rows = cur.fetchall()
+        return [self._row(r) for r in rows]
+
     def list_recent_failures(self, limit: int = 10) -> list[dict[str, Any]]:
         # list_recent(limit=300) で fold すると、 高スループット workload で recent window が
         # 数分しか無く成功で埋まり failure が見えなくなる (=ダッシュボード "失敗はありません"
