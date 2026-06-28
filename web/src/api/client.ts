@@ -56,6 +56,8 @@ export interface Workload {
   name: string;
   description: string | null;
   enabled: boolean;
+  // 既定 true。 false の時 supervisor の patch/filter 介入が skip される。
+  supervisor_enabled: boolean;
   queue_table: string;
   executor_type: string;
   executor_config: Record<string, unknown>;
@@ -72,6 +74,9 @@ export interface Workload {
   observed_depth: number;
   observed_age_secs: number;
   observed_rate: number;
+  observed_vram_mb_peak: number | null;
+  observed_vram_sample_count: number;
+  observed_vram_updated_at: string | null;
   created_by: string | null;
   created_at: string;
   updated_at: string;
@@ -132,6 +137,9 @@ export interface WorkerInfo {
   current_phase: string | null;
   rows_processed: number;
   errors_total: number;
+  workload_filter: string[] | null;
+  filter_updated_at: string | null;
+  filter_updated_by: string | null;
 }
 
 // ----------------- Plugin Registry -----------------
@@ -153,6 +161,8 @@ export interface PluginManifest {
   description?: string;
   init_kwargs: PluginKwargField[];
   hidden_kwargs: string[];
+  ui_panel?: boolean;
+  ui_panel_mode?: "video" | "image";
 }
 
 export interface AvailablePlugin {
@@ -160,6 +170,7 @@ export interface AvailablePlugin {
   path: string;
   modules: string[];
   has_requirements: boolean;
+  has_ui_panel?: boolean;
   manifest?: PluginManifest | null;
 }
 
@@ -176,6 +187,11 @@ export const api = {
     request<Workload>(`/api/v1/workloads/${slug}`, { method: "PUT", json: payload }),
   setWorkloadEnabled: (slug: string, enabled: boolean) =>
     request<Workload>(`/api/v1/workloads/${slug}/enabled`, {
+      method: "PATCH",
+      json: { enabled },
+    }),
+  setSupervisorEnabled: (slug: string, enabled: boolean) =>
+    request<Workload>(`/api/v1/workloads/${slug}/supervisor_enabled`, {
       method: "PATCH",
       json: { enabled },
     }),
@@ -200,14 +216,48 @@ export const api = {
     ),
 
   listWorkersMetrics: (minutes = 30) =>
-    request<{ workers: Record<string, Record<string, Array<{ ts: string; temp_c: number | null; util_pct: number | null; mem_used_mb: number | null }>>>; since_minutes: number }>(
-      `/api/v1/workers/metrics?minutes=${minutes}`,
-    ),
+    request<{
+      workers: Record<string, Record<string, Array<{
+        ts: string;
+        temp_c: number | null;
+        util_pct: number | null;
+        mem_used_mb: number | null;
+        mem_util_pct: number | null;
+        mem_total_mb: number | null;
+        power_w: number | null;
+        sm_clock_mhz: number | null;
+        mem_clock_mhz: number | null;
+      }>>>;
+      since_minutes: number;
+    }>(`/api/v1/workers/metrics?minutes=${minutes}`),
 
   listWorkers: () =>
     request<{ workers: WorkerInfo[]; total: number }>("/api/v1/workers"),
+  setWorkerFilter: (workerId: string, workloads: string[] | null,
+                    updatedBy?: string) =>
+    request<WorkerInfo>(`/api/v1/workers/${workerId}/filter`, {
+      method: "POST",
+      json: { workloads, updated_by: updatedBy ?? "ui" },
+    }),
   listRecentRuns: (limit = 200) =>
     request<{ runs: RunRecord[]; total: number }>(`/api/v1/runs?limit=${limit}`),
+
+  // ---------------- settings ----------------
+  listSettings: () => request<{ settings: SettingItem[] }>("/api/v1/settings"),
+  setSetting: (key: string, value: string | null, updatedBy?: string) =>
+    request<SettingItem>(`/api/v1/settings/${encodeURIComponent(key)}`, {
+      method: "PATCH",
+      json: { value, updated_by: updatedBy ?? "ui" },
+    }),
+  testLlm: (body: { endpoint?: string; api_key?: string; model?: string; timeout_s?: number }) =>
+    request<{
+      ok: boolean; status_code: number | null; latency_ms: number;
+      model: string; response_excerpt: string | null; error: string | null;
+    }>("/api/v1/settings/llm/test", { method: "POST", json: body }),
+
+  listLlmCalls: (limit = 50) =>
+    request<{ calls: LlmCallSummary[]; total: number }>(`/api/v1/llm_calls?limit=${limit}`),
+  getLlmCall: (id: number) => request<LlmCallDetail>(`/api/v1/llm_calls/${id}`),
 
   dashboardOverview: () =>
     request<DashboardOverview>("/api/v1/dashboard/overview"),
@@ -235,7 +285,83 @@ export const api = {
       `/api/v1/service-logs${q ? "?" + q : ""}`,
     );
   },
+
+  flowSnapshot: () => request<FlowSnapshot>("/api/v1/flow/snapshot"),
+  saveFlowLayout: (positions: Array<{ id: string; x: number; y: number }>) =>
+    request<{ updated: number; skipped: number }>("/api/v1/flow/layout", {
+      method: "POST",
+      json: { positions },
+    }),
 };
+
+export interface FlowNode {
+  id: string;
+  kind: "workload" | "tank" | "external";
+  x: number;
+  y: number;
+  label: string;
+  icon?: string | null;
+  workload_slug?: string | null;
+  url?: string | null;
+  state?: "running" | "idle" | "failed" | "backoff" | null;
+  throughput_per_min?: number | null;
+  last_run_at?: string | null;
+  last_output?: Record<string, unknown> | null;
+  adapt?: Record<string, unknown> | null;
+  pending?: number | null;
+  capacity_warn?: number | null;
+  fill_ratio?: number | null;
+  error?: string | null;
+}
+
+export interface FlowEdge {
+  id: string;
+  source: string;
+  target: string;
+  label?: string | null;
+  metric_field?: string | null;
+  dashed?: boolean;
+  rate_per_min?: number | null;
+}
+
+// ---------------- settings + llm ----------------
+
+export interface SettingItem {
+  key: string;
+  value: string | null;
+  value_masked?: string | null;
+  description: string | null;
+  is_secret: number;
+  updated_at: string | null;
+  updated_by?: string | null;
+}
+
+export interface LlmCallSummary {
+  id: number;
+  called_at: string;
+  provider: string;
+  model: string;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  duration_ms: number;
+  success: number;
+  error: string | null;
+  actions_applied: number;
+  analysis: string | null;
+}
+
+export interface LlmCallDetail extends LlmCallSummary {
+  prompt_json?: unknown;
+  response_text?: string;
+  actions_json?: unknown;
+}
+
+export interface FlowSnapshot {
+  canvas: { width?: number; height?: number; background?: string };
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+}
 
 export interface RunningRun {
   id: string;

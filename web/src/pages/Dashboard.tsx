@@ -54,6 +54,9 @@ const ELLIPSIS: React.CSSProperties = {
   display: "inline-block",
 };
 
+// 実行中パネルに並べる最大行数 (=空きスペースに合わせ 5→20 へ拡張、 余りは "...他 N 件")
+const RUNNING_PANEL_ROWS = 20;
+
 // Light / Dark 両対応のヒーローパネル スタイル + 背景アイコン。
 // Mantine v7 は `[data-mantine-color-scheme]` を <html> に付与するのでこのセレクタで分岐できる。
 // 各 tone の light は色付き淡背景、 dark は同色の rgba 低透明 で控えめにする。
@@ -308,7 +311,7 @@ function RunningPanel() {
         )}
         {count > 0 && (
           <Stack gap={6} mt={4} className="paprika-divided-rows">
-            {q.data!.running.slice(0, 5).map((r) => (
+            {q.data!.running.slice(0, RUNNING_PANEL_ROWS).map((r) => (
               <Group key={r.id} gap="xs" wrap="nowrap" justify="space-between">
                 <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
                   <Badge color="indigo" variant="light" size="sm" maw={150} style={{ flexShrink: 0 }} title={r.workload_slug}>
@@ -322,8 +325,8 @@ function RunningPanel() {
                 </Group>
               </Group>
             ))}
-            {count > 5 && (
-              <Text size="xs" c="dimmed">…他 {count - 5} 件</Text>
+            {count > RUNNING_PANEL_ROWS && (
+              <Text size="xs" c="dimmed">…他 {count - RUNNING_PANEL_ROWS} 件</Text>
             )}
           </Stack>
         )}

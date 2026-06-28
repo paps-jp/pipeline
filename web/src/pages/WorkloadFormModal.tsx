@@ -58,6 +58,10 @@ interface FormValues {
   batch_size: number;
   lease_secs: number;
   max_attempts: number;
+  // 1 worker instance あたり想定 VRAM (MB)。
+  // install-multi-worker.sh の --auto-from-workloads がここを読んで N を算出する。
+  // 0 / 未指定 = GPU 不要 (CPU only / dispatcher 系)。
+  vram_mb: number;
 }
 
 interface Props {
@@ -79,6 +83,7 @@ function valuesForWorkload(w: Workload): FormValues {
     batch_size: w.batch_size,
     lease_secs: w.lease_secs,
     max_attempts: w.max_attempts,
+    vram_mb: Number((w.resources as Record<string, unknown> | undefined)?.vram_mb ?? 0),
   };
 }
 
@@ -93,6 +98,7 @@ const DEFAULT_VALUES: FormValues = {
   batch_size: 16,
   lease_secs: 120,
   max_attempts: 3,
+  vram_mb: 0,
 };
 
 export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
@@ -111,10 +117,18 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
     enabled: opened,
   });
   const availablePlugins: AvailablePlugin[] = availablePluginsQ.data?.plugins ?? [];
-  const selectedPlugin = useMemo(
-    () => availablePlugins.find((p) => p.path === sourcePath) ?? null,
-    [availablePlugins, sourcePath],
-  );
+  const selectedPlugin = useMemo(() => {
+    if (!sourcePath) return null;
+    // 1) path 完全一致 (= control plane と同じパスを指してる場合)
+    let m = availablePlugins.find((p) => p.path === sourcePath);
+    if (m) return m;
+    // 2) ディレクトリ名 (basename) で fallback match
+    //    control plane = /home/paps-ai/...、GPU worker = /opt/pipeline/... のように
+    //    パス prefix が違っても、 末端のディレクトリ名 (= plugin slug) が一致すれば同じ plugin
+    const baseName = sourcePath.replace(/\/+$/, "").split("/").pop();
+    if (!baseName) return null;
+    return availablePlugins.find((p) => p.slug === baseName) ?? null;
+  }, [availablePlugins, sourcePath]);
 
   // plugin 切替時に init_kwargs を manifest.default で seed (= 既存値があれば優先)
   useEffect(() => {
@@ -302,6 +316,15 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
     } else {
       executorConfig = JSON.parse(values.executor_config);
     }
+    // resources は既存値を保持しつつ vram_mb だけ更新する (= 他フィールドを消さない)
+    const baseResources: Record<string, unknown> = {
+      ...((editing?.resources as Record<string, unknown> | undefined) ?? {}),
+    };
+    if (values.vram_mb && values.vram_mb > 0) {
+      baseResources.vram_mb = values.vram_mb;
+    } else {
+      delete baseResources.vram_mb;
+    }
     const body = {
       name: values.name,
       description: values.description.trim() || null,
@@ -312,6 +335,7 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
       batch_size: values.batch_size,
       lease_secs: values.lease_secs,
       max_attempts: values.max_attempts,
+      resources: baseResources,
     };
     if (isEdit) {
       updateMut.mutate({ slug: editing!.slug, payload: body });
@@ -392,7 +416,10 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
                   value: p.path,
                   label: `${p.slug}${p.has_requirements ? " (= requirements.txt あり)" : ""}`,
                 }))}
-                value={sourcePath}
+                // workload に保存されてる source_path が control plane の path と
+                // 違っていても (e.g. worker side /opt/pipeline/... vs control side
+                // /home/paps-ai/...) slug 突合した plugin の path を表示する。
+                value={selectedPlugin?.path ?? sourcePath}
                 onChange={(v) => {
                   setSourcePath(v);
                   setPluginModule(null);
@@ -501,6 +528,16 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
                     label={t("workloads.create.max_attempts")}
                     min={1}
                     {...form.getInputProps("max_attempts")}
+                  />
+                  <NumberInput
+                    label={t("workloads.create.vram_mb", "想定 VRAM (MB / worker)")}
+                    description={t(
+                      "workloads.create.vram_mb_help",
+                      "1 worker instance あたり消費する VRAM の目安。 install-multi-worker.sh の --auto-from-workloads がここを読んで GPU ホスト 1 台あたりのインスタンス数を算出する。 0 = GPU 不要 (CPU only / dispatcher 系)",
+                    )}
+                    min={0}
+                    step={256}
+                    {...form.getInputProps("vram_mb")}
                   />
                 </Stack>
               </Accordion.Panel>
