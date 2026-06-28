@@ -30,14 +30,10 @@ local/
 scratch/
 
 # plugins/ — face_search 固有の本番プラグインは個別に除外、 sample/ などのサンプルは公開
-plugins/crawl_image_dispatcher/
-plugins/embed_production/
-plugins/embed_writer/
-plugins/hash_detect_cpuread/
-plugins/hash_detect_dryrun/
-plugins/hash_detect_drywrite/
-plugins/hash_detect_gpuread/
-plugins/hash_detect_production/
+plugins/image_dispatcher/
+plugins/image_embed/
+plugins/image_hash_extract/
+plugins/embed_write/
 
 # docs/ = ワークロード内部設計 (= operator 判断で OSS リポジトリには載せない、 ローカルにだけ残す)
 docs/
@@ -72,5 +68,5 @@ htmlcov/
 # Docs build
 docs/_build/
 site/
-plugins/crawl_video_dispatcher/
+plugins/video_dispatcher/
 plugins/video_face_extract/
