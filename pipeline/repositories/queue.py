@@ -43,13 +43,46 @@ class ClaimedTask:
 
 
 class QueueRepository:
-    def __init__(self, db: Database) -> None:
+    """workload queue (= <slug>_queue) の CRUD。
+
+    Phase 2-α (2026-06-29): 「workload 別 backend 切替」 をサポート。
+    - primary_db: SQLite (= pipeline-oss control plane と共有、 既存挙動と互換)
+    - secondary_db: MariaDB (= 業務 queue 用、 optional)
+    - set_backend(queue_table, 'mariadb') で 個別 workload を MariaDB に振り替え
+
+    既存 init (= QueueRepository(db) 1 引数) は SQLite-only モードで動く。
+    """
+
+    def __init__(self, db: Database, secondary_db: Database | None = None) -> None:
         self.db = db
+        self.secondary_db = secondary_db
+        # queue_table → 'primary' (default) or 'secondary'。 drain.py / control が
+        # 起動時に workloads.queue_backend を読んで set_backend() で配線。
+        self._backend_map: dict[str, str] = {}
+
+    def set_backend(self, queue_table: str, backend: str) -> None:
+        """queue_table の backend を切替 ('primary' or 'secondary')。
+
+        'secondary' を指定したのに secondary_db=None の場合は primary に fallback。
+        """
+        if backend not in ("primary", "secondary"):
+            raise ValueError(f"backend must be 'primary' or 'secondary', got {backend!r}")
+        if backend == "secondary" and self.secondary_db is None:
+            # secondary 未配線なら無視 (= primary 動作継続)
+            self._backend_map.pop(queue_table, None)
+            return
+        self._backend_map[queue_table] = backend
+
+    def _get_db(self, queue_table: str) -> Database:
+        """queue_table に対応する DB instance を返す (= primary or secondary)。"""
+        if self._backend_map.get(queue_table) == "secondary" and self.secondary_db is not None:
+            return self.secondary_db
+        return self.db
 
     def enqueue(self, queue_table: str, pk: str, extra: dict[str, Any] | None = None) -> bool:
         """重複 pk は INSERT OR IGNORE で黙ってスキップ。1 件挿入できたら True。"""
         _validate_queue_table(queue_table)
-        with self.db.transaction() as conn:
+        with self._get_db(queue_table).transaction() as conn:
             cur = conn.execute(
                 f"INSERT OR IGNORE INTO {queue_table} (pk, extra) VALUES (:pk, :extra)",
                 {"pk": str(pk), "extra": json.dumps(extra or {})},
@@ -62,7 +95,7 @@ class QueueRepository:
         if not items:
             return 0
         inserted = 0
-        with self.db.transaction() as conn:
+        with self._get_db(queue_table).transaction() as conn:
             for pk, extra in items:
                 cur = conn.execute(
                     f"INSERT OR IGNORE INTO {queue_table} (pk, extra) VALUES (:pk, :extra)",
@@ -88,7 +121,7 @@ class QueueRepository:
             datetime.now(timezone.utc) - timedelta(seconds=max(1, lease_secs))
         ).isoformat(timespec="microseconds")
 
-        with self.db.transaction() as conn:
+        with self._get_db(queue_table).transaction() as conn:
             conn.execute(
                 f"""
                 UPDATE {queue_table}
@@ -130,7 +163,7 @@ class QueueRepository:
     def complete(self, queue_table: str, pk: str) -> None:
         """成功時に row を DELETE。"""
         _validate_queue_table(queue_table)
-        with self.db.transaction() as conn:
+        with self._get_db(queue_table).transaction() as conn:
             conn.execute(f"DELETE FROM {queue_table} WHERE pk = :pk", {"pk": str(pk)})
 
     def fail(self, queue_table: str, pk: str, max_attempts: int, error: str | None) -> str:
@@ -139,7 +172,7 @@ class QueueRepository:
         戻り値: 'pending'(retry 可) or 'failed'(打切り)。
         """
         _validate_queue_table(queue_table)
-        with self.db.transaction() as conn:
+        with self._get_db(queue_table).transaction() as conn:
             cur = conn.execute(
                 f"SELECT attempt FROM {queue_table} WHERE pk=:pk", {"pk": str(pk)}
             )
@@ -172,7 +205,7 @@ class QueueRepository:
 
     def count_by_state(self, queue_table: str) -> dict[str, int]:
         _validate_queue_table(queue_table)
-        with self.db.transaction() as conn:
+        with self._get_db(queue_table).transaction() as conn:
             cur = conn.execute(
                 f"SELECT state, COUNT(*) as c FROM {queue_table} GROUP BY state"
             )
@@ -182,7 +215,7 @@ class QueueRepository:
     def peek(self, queue_table: str, limit: int = 20) -> list[dict[str, Any]]:
         """admin 用: queue の中身を limit 件覗く。"""
         _validate_queue_table(queue_table)
-        with self.db.transaction() as conn:
+        with self._get_db(queue_table).transaction() as conn:
             cur = conn.execute(
                 f"""
                 SELECT pk, state, attempt, claimed_by, claimed_at,

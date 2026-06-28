@@ -21,7 +21,9 @@ def get_db(url: str) -> Database:
     if url.startswith(("postgresql:", "postgres:")):
         raise NotImplementedError("postgres adapter は F1 で実装予定")
     if url.startswith(("mysql:", "mariadb:")):
-        raise NotImplementedError("mariadb adapter は F1 で実装予定")
+        from pipeline.db.mariadb import MariadbDatabase
+
+        return MariadbDatabase(url)
     raise ValueError(f"unsupported DB URL scheme: {url!r}")
 
 
