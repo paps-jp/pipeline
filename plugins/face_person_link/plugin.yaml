@@ -1,0 +1,46 @@
+name: face-person-link
+description: |
+  crawl_face → AdaFace embedding を shard memmap から取得 → FAISS knn 検索 →
+  person assign (= 既存 person に紐付け) or create (= 新 person 生成) + 拡散統計 update。
+  動画 0.65 / 画像 0.75 で threshold 分け。 既存 FAISS infra (faiss_api :9000) 流用。
+
+init_kwargs:
+  - key: face_search_path
+    type: path
+    default: /mnt/paps-ai/ai/face_search
+    label: legacy face_search パス (= shard 読み込み起点)
+
+  - key: db_env_file
+    type: path
+    default: /mnt/paps-ai/ai/.env
+    label: DB 接続 (.env)
+
+  - key: faiss_api_url
+    type: str
+    default: http://10.10.50.27:9000
+    label: FAISS search API endpoint
+
+  - key: threshold_video
+    type: float
+    default: 0.65
+    label: 動画 face assign 閾値 (cosine)
+    min: 0.0
+    max: 1.0
+
+  - key: threshold_image
+    type: float
+    default: 0.75
+    label: 画像 face assign 閾値 (cosine)
+    min: 0.0
+    max: 1.0
+
+  - key: topk
+    type: int
+    default: 10
+    label: knn 検索 top-K (候補数)
+    min: 1
+    max: 100
+
+hidden_kwargs:
+  - workload_slug
+  - control_url

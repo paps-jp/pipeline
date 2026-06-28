@@ -1,0 +1,77 @@
+name: paprika-job-submit
+description: |
+  crawl_config (= site 一覧) から空き site を 1 件 lock し、 crawl table の未取得
+  URL を paprika hub に create_job 投入する pipeline plugin。
+
+  crawl.py の `acquire_site + get_target_urls + crawl_page 上半分 (= 投入のみ)`
+  を移植。 paprika 内での fetch + assets pull は別 plugin (= paprika-video-pull /
+  paprika-image-pull) が行う。 = push と pull の責務分離。
+
+  1 tick = 1 site 処理 (= up to max_pages_per_run 件投入) → 次 tick で次 site。
+  site lock は crawl_config.locked_at で排他 (= 既存 crawl.py 互換)。
+workload_type: self_loop
+
+init_kwargs:
+  - key: db_env_file
+    type: path
+    default: /mnt/paps-ai/ai/.env
+    label: DB 接続情報 (.env)
+
+  - key: paprika_hub
+    type: str
+    default: http://10.10.50.34:8000
+    label: paprika hub URL
+
+  - key: interval_s
+    type: int
+    default: 30
+    label: ループ間隔 (秒)
+    min: 5
+    max: 600
+
+  - key: max_pages_per_run
+    type: int
+    default: 20
+    label: 1 site 1 tick の最大投入数
+    min: 1
+    max: 100
+
+  - key: lock_timeout_minutes
+    type: int
+    default: 120
+    label: site lock タイムアウト (分)
+    min: 10
+    max: 1440
+
+  - key: download_video
+    type: bool
+    default: true
+    label: paprika に download_video=true で投入
+
+  - key: min_asset_size_bytes
+    type: int
+    default: 2048
+    label: paprika asset capture の最小 size
+
+  - key: head_check_enabled
+    type: bool
+    default: true
+    label: 投入前に HEAD で 404/410 をフィルタ
+
+hidden_kwargs:
+  - workload_slug
+  - control_url
+
+success_criteria:
+  type: exit_code
+  expected: 0
+
+priority: 50
+weight: 1.0
+batch_size: 1
+lease_secs: 900
+max_attempts: 3
+resources:
+  vram_mb: 0
+
+host_affinity: []

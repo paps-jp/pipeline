@@ -1,0 +1,163 @@
+# pipeline-supervisor が解釈する if-then ルール集。
+#
+# 評価コンテキスト:
+#   - host:     { id, util_avg, util_max, power_avg, mem_avg,
+#                 mem_used_peak_mb, mem_total_mb, vram_free_mb }
+#   - workload: { slug, backlog, throughput_min, drain_eta_min, priority,
+#                 lease_secs, host_affinity, enabled, dup_ratio, miss_streak,
+#                 streak_starved, streak_backlogged, streak_idle_consumer }
+#
+# 条件は単純な `field op value` を AND で連結。 連続性 (= n tick 連続でヒット)
+# は `streak: N` で書ける。 `streak_*` はその条件が連続成立した tick 数。
+#
+# action:
+#   patch_workload: { slug, priority, lease_secs, host_affinity_add, enabled }
+#   add_host_affinity: { slug, host }
+#   add_workload_to_host_workers: { workload }
+#     - host 配下の全 active worker の workload_filter に workload を「足す」 (= 重複は無視)。
+#     - filter が None (= no filter / 全受) の worker は skip。
+#     - 用途: ある host に余力ができたので新しい workload も受けさせる。
+#   remove_workload_from_host_workers: { workload, set_to?: [str] }
+#     - host 配下の全 active worker の workload_filter から workload を「引く」。
+#     - filter が None の worker は skip (= 列挙元を知らないので)、 `set_to: [...]` で
+#       「外した後の filter」 を明示すれば skip せず置換する。
+#     - 用途: VRAM 不足 / GPU saturated を検知して重い workload を一時 shed。
+#   set_worker_filter: { workloads }
+#     - host 配下の全 active worker の workload_filter を完全置換 (= 強い手)。
+#     - workloads: null / [] → フィルタ解除 (= env fallback / 全受)。
+#   log: { message }   ← dry-run でも apply 同じ
+
+rules:
+  # 1. starvation: throughput<0.5/min かつ backlog>100 が 3 tick 連続 → priority +20
+  # ただし以下のいずれかで bump を抑止 (= 2026-06-27 paprika-job-submit 100→180 暴走事故対策):
+  #   - fail_ratio>0.5 = workload 自体が失敗連発中 → priority 上げても無意味
+  #   - claimable_workers<1 = 誰の filter にも入ってない → priority 上げても claim 不可
+  - id: starved-priority-bump
+    when:
+      workload.throughput_min:    { lt: 0.5 }
+      workload.backlog:           { gt: 100 }
+      workload.fail_ratio:        { lt: 0.5 }   # 失敗率 50% 未満時のみ
+      workload.claimable_workers: { gt: 0 }     # 受け取れる worker が居る時のみ
+      streak: 3
+    action:
+      patch_workload:
+        priority:    "+20"          # = 現在値 + 20。 max 200
+    cooldown_ticks: 5               # = 同 workload に同 rule を 5 tick 内では再適用しない
+
+  # 2. backlog drain: 詰まりすぎ → lease_secs を 0.7 倍 (= 短サイクル)
+  - id: backlog-drain-boost
+    when:
+      workload.drain_eta_min:     { gt: 60 }
+      workload.throughput_min:    { gt: 1.0 }
+      streak: 3
+    action:
+      patch_workload:
+        lease_secs:  "*0.7"          # = 現在値 × 0.7、 最小 15
+    cooldown_ticks: 10
+
+  # 3. idle host: 10 tick (= 5 min) 連続 util<40% かつ power<100W → image-embed の
+  #    affinity に追加 (= 余ってる GPU 使う)
+  - id: idle-host-shard-add
+    when:
+      host.util_avg:              { lt: 40 }
+      host.power_avg:             { lt: 100 }
+      streak: 10
+    action:
+      add_host_affinity:
+        slug: image-embed
+        # host は host loop から自動代入
+    cooldown_ticks: 60               # = 一度足したら 30 min は触らない
+
+  # 4. dup ratio 警告 (= 自動修正はしない、 ログのみ)
+  - id: dup-rate-alert
+    when:
+      workload.dup_ratio:         { gt: 0.95 }
+      streak: 5
+    action:
+      log:
+        message: "{slug} dup ratio sustained > 95% — check URL normalization upstream"
+    cooldown_ticks: 20
+
+  # 5. GPU idle host へ image-embed の affinity 拡張 (= 余力 host を組み込み)
+  #    host が 10 tick (= 5 min) 連続で util<40% かつ power<50W のとき、
+  #    image-embed の host_affinity に追加。
+  - id: idle-host-attach-embed
+    when:
+      host.util_avg:              { lt: 40 }
+      host.power_avg:             { lt: 50 }
+      streak: 10
+    action:
+      add_host_affinity:
+        slug: image-embed
+    cooldown_ticks: 60
+
+  # 6. ai-gpu4 の飽和を検知して image-embed の affinity から外す
+  #    util_avg > 90 が 5 tick 連続 → 該当 host を除外し、 余力 host へ流す。
+  #    (= remove_host_affinity アクションは MVP では未実装 = log のみ)
+  - id: hot-host-alert
+    when:
+      host.util_avg:              { gt: 90 }
+      streak: 5
+    action:
+      log:
+        message: "{host} sustained util > 90% — consider removing from heavy workload affinity"
+    cooldown_ticks: 30
+
+  # 7. paprika-job-submit が "完全 idle (= submitted=0 が長期)" の場合は priority を戻す
+  #    (= rule 1 で priority を上げすぎた後の安全弁)
+  - id: paprika-submit-cooldown
+    when:
+      workload.throughput_min:    { lt: 0.2 }
+      workload.backlog:           { lt: 10 }
+      streak: 10
+    action:
+      patch_workload:
+        priority:    "-10"
+    cooldown_ticks: 20
+
+  # 10. no-claimer 検知: 大量 backlog があるのに受け取れる worker がゼロ。
+  # priority bump rule (#1) と独立して log 警告 (= rule #1 の補助通知)。
+  # 自動修復はしない (= filter 変更は人/別の host-side rule が決める)。
+  - id: starved-no-claimer
+    when:
+      workload.backlog:           { gt: 100 }
+      workload.claimable_workers: { eq: 0 }
+      streak: 5
+    action:
+      log:
+        message: "{slug} backlog>100 but 0 worker can claim it — adjust worker filter"
+    cooldown_ticks: 30
+
+  # ---------- 自動切替 (= VRAM ベースで worker filter を runtime 変更) ----------
+  # 前提:
+  #  - worker daemon は 30s 毎に /api/v1/workers/{id}/config を poll する。
+  #  - filter 変更時は executor cache を捨てて runtime 反映 (= プロセス再起動不要)。
+  #  - 兼任 (= filter に複数 workload) の worker は、 queue 状況に応じて
+  #    自動でどちらかを claim する (= dual-filter)。
+
+  # 8. VRAM 圧迫を検知して video-face-extract を host 内 worker から外す
+  #    vram_free が 3 tick 連続で 4 GiB 未満 → 重 workload を引き算。
+  #    image-embed は残るので、 GPU は image-embed だけ続行 (= 軽負荷)。
+  - id: vram-pressure-shed-video
+    when:
+      host.vram_free_mb:          { lt: 4000 }
+      streak: 3
+    action:
+      remove_workload_from_host_workers:
+        workload: video-face-extract
+        # 兼任していない場合 (= filter が ["image-embed"] のみ等) は無視されるので安全。
+        # filter が None (= 全受) の worker は skip = 明示 filter の worker のみ対象。
+    cooldown_ticks: 10
+
+  # 9. VRAM 余裕を検知して video-face-extract を host 内 worker に乗せる
+  #    vram_free > 10 GiB かつ util_avg < 60% が 5 tick 連続 →
+  #    その host の filter 付き worker (= 兼任候補) に video を「足す」。
+  - id: vram-headroom-take-video
+    when:
+      host.vram_free_mb:          { gt: 10000 }
+      host.util_avg:              { lt: 60 }
+      streak: 5
+    action:
+      add_workload_to_host_workers:
+        workload: video-face-extract
+    cooldown_ticks: 20

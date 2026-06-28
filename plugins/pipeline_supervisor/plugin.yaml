@@ -1,0 +1,79 @@
+name: pipeline-supervisor
+description: |
+  パイプライン全体のオーケストレーター。 30s ごとに以下を観測:
+   - GPU host 別の利用率 / power / mem (= /api/v1/workers/metrics)
+   - 各 workload の queue 深さ + throughput + drain ETA
+   - 直近 run output_json (= adapt 状態 / dup ratio 等)
+
+  外部 yaml (`orchestration_rules.yaml`) に書かれた if-then ルールを当て、
+  必要なら `PUT /api/v1/workloads/<slug>` で priority / lease_secs /
+  host_affinity / enabled を書き換える。
+
+  race 防止: host_affinity を 1 ホストに限定して 1 インスタンス保証。
+  既定 = dry-run (= action は service_logs に出すだけで PUT しない)。
+  検証後 `apply_mode=true` で実適用に切替。
+
+workload_type: self_loop
+
+init_kwargs:
+  - key: control_url
+    type: str
+    default: http://127.0.0.1:8001
+    label: pipeline-oss 制御プレーン URL
+    help: 別ホストの worker daemon で動かす場合は LAN IP を指定
+  - key: rules_path
+    type: path
+    default: ""
+    label: ルール定義 yaml の絶対パス (= 空ならプラグイン同梱の orchestration_rules.yaml)
+    help: 編集 → 次 tick から反映 (= worker daemon の再起動不要)
+  - key: interval_s
+    type: int
+    default: 30
+    label: 評価間隔 (秒)
+    min: 10
+    max: 600
+  - key: metrics_minutes
+    type: int
+    default: 10
+    label: GPU メトリクス window (分)
+    min: 1
+    max: 60
+  - key: throughput_window_min
+    type: int
+    default: 10
+    label: スループット計算 window (分)
+    min: 1
+    max: 60
+  - key: apply_mode
+    type: int
+    default: 0
+    label: 1=実際に PUT 適用 / 0=dry-run (= log のみ)
+    min: 0
+    max: 1
+  - key: max_priority
+    type: int
+    default: 200
+    label: priority bump 上限
+    min: 100
+    max: 1000
+
+hidden_kwargs:
+  - workload_slug
+  - control_url
+
+success_criteria:
+  type: exit_code
+  expected: 0
+
+priority: 50
+weight: 1.0
+batch_size: 1
+lease_secs: 60
+max_attempts: 3
+resources:
+  vram_mb: 0
+
+# race 防止: 1 ホストに固定して 1 インスタンス保証する想定。
+# 既定は空 (= 任意 worker)。 本番では UI / API で 1 host 限定推奨。
+# 例: ["ai-gpu1-1"] = 特定の worker daemon インスタンスに固定。
+host_affinity: []

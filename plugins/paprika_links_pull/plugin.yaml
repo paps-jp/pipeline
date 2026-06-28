@@ -1,0 +1,85 @@
+name: paprika-links-pull
+description: |
+  paprika hub の completed/review ジョブから links を pull し、 同 domain の
+  crawlable URL を `crawl` table に INSERT する pipeline plugin。
+  これにより crawler が URL discovery を続け、 crawl table が枯渇しない。
+
+  crawl.py の `sc.get_links + same-domain filter + save_link_url` を移植。
+  self-loop 方式 (= 1 tick = 1 page → sleep → 次 tick を self-enqueue)。
+workload_type: self_loop
+
+init_kwargs:
+  - key: db_env_file
+    type: path
+    default: /mnt/paps-ai/ai/.env
+    label: DB 接続情報 (.env)
+
+  - key: paprika_hub
+    type: str
+    default: http://10.10.50.34:8000
+    label: paprika hub URL
+
+  - key: interval_s
+    type: int
+    default: 60
+    label: ループ間隔 初期値 (秒) — AIMD で動的調整
+    min: 5
+    max: 600
+
+  - key: interval_min_s
+    type: int
+    default: 5
+    label: ループ間隔 下限 (秒)
+    min: 1
+    max: 60
+
+  - key: interval_max_s
+    type: int
+    default: 600
+    label: ループ間隔 上限 (秒)
+    min: 60
+    max: 3600
+
+  - key: page_limit
+    type: int
+    default: 100
+    label: 1 tick で取得するジョブ数 初期値
+    min: 10
+    max: 500
+
+  - key: page_limit_min
+    type: int
+    default: 30
+    label: page_limit 下限
+    min: 10
+    max: 500
+
+  - key: page_limit_max
+    type: int
+    default: 500
+    label: page_limit 上限
+    min: 50
+    max: 1000
+
+  - key: statuses
+    type: str
+    default: completed,review
+    label: 取込対象 status (カンマ区切り)
+
+hidden_kwargs:
+  - workload_slug
+  - control_url
+
+success_criteria:
+  type: exit_code
+  expected: 0
+
+priority: 100
+weight: 1.0
+batch_size: 1
+lease_secs: 90
+max_attempts: 3
+resources:
+  vram_mb: 0
+
+host_affinity: []

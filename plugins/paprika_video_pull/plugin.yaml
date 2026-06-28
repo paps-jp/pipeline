@@ -1,0 +1,120 @@
+name: paprika-video-pull
+description: |
+  paprika hub 上の completed/review ジョブを polling し、 動画 asset を
+  `crawl_video` テーブルへ INSERT する bridge plugin。
+
+  crawl.py の `save_one_video_asset` 相当の処理を pipeline-oss 側で実行する。
+  これにより:
+   - user が paprika UI から手動投入したジョブも自動で pipeline に流れる
+   - crawl.py が 409 / review でつまずいた既存ジョブも救える
+   - crawl_video.source_url_sha256 (UNIQUE) で自動 dedup
+  self-loop 方式 (= 1 tick 完了 → sleep → 次 tick を self-enqueue)。
+workload_type: self_loop
+
+init_kwargs:
+  - key: db_env_file
+    type: path
+    default: /mnt/paps-ai/ai/.env
+    label: DB 接続情報 (.env)
+    help: MariaDB の DB_HOST/DB_USER/DB_PASS/DB_NAME を含む .env
+
+  - key: paprika_hub
+    type: str
+    default: http://10.10.50.34:8000
+    label: paprika hub URL
+
+  - key: interval_s
+    type: int
+    default: 60
+    label: ループ間隔 初期値 (秒)
+    help: AIMD で動的調整される (= hit で短縮 / 連続 miss で延長)
+    min: 5
+    max: 600
+
+  - key: interval_min_s
+    type: int
+    default: 5
+    label: ループ間隔 下限 (秒)
+    min: 1
+    max: 60
+
+  - key: interval_max_s
+    type: int
+    default: 600
+    label: ループ間隔 上限 (秒) — idle 時の最大 sleep
+    min: 60
+    max: 3600
+
+  - key: page_limit
+    type: int
+    default: 200
+    label: 1 ページのジョブ数 初期値
+    help: AIMD で 1.3x ↑ / 0.8x ↓ で page_limit_min .. page_limit_max の間を可変
+    min: 10
+    max: 500
+
+  - key: page_limit_min
+    type: int
+    default: 50
+    label: page_limit 下限
+    min: 10
+    max: 500
+
+  - key: page_limit_max
+    type: int
+    default: 500
+    label: page_limit 上限
+    min: 50
+    max: 1000
+
+  - key: max_pages
+    type: int
+    default: 50
+    label: 1 tick の最大ページ数 初期値
+    help: 全件 INSERT IGNORE 済みの page が出るまで paginate。 hit で +2 / miss で /2 で max_pages_min..max_pages_max を可変。
+    min: 1
+    max: 200
+
+  - key: max_pages_min
+    type: int
+    default: 2
+    label: max_pages 下限 — idle 時の最低 paginate 深
+    min: 1
+    max: 20
+
+  - key: max_pages_max
+    type: int
+    default: 50
+    label: max_pages 上限 — catch-up 時の最大 paginate 深
+    min: 10
+    max: 200
+
+  - key: statuses
+    type: str
+    default: completed,review
+    label: 取込対象 status (カンマ区切り)
+
+  - key: min_video_bytes
+    type: int
+    default: 1048576
+    label: pending 判定の最小サイズ (bytes)
+    help: これ未満の動画は skipped_small で INSERT (= video-face-extract に流れない)
+    min: 0
+
+hidden_kwargs:
+  - workload_slug
+  - control_url
+
+success_criteria:
+  type: exit_code
+  expected: 0
+
+priority: 50
+weight: 1.0
+batch_size: 1
+lease_secs: 90
+max_attempts: 3
+resources:
+  vram_mb: 0
+
+host_affinity: []

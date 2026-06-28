@@ -1,0 +1,103 @@
+name: paprika-image-pull
+description: |
+  paprika hub の completed/review ジョブから kind=image asset を pull し、
+  画像 byte download + raw/{dir_no}/{id}.jpg 保存 + crawl_image table INSERT
+  を行う pipeline plugin。
+
+  crawl.py の `crawl_page 画像 ingest 部分` を移植。 normalize_image_url +
+  data_url_to_sha256 + save_one_image_url + download_image_to_tmp の
+  helper を全部コピー (= B-full Approach、 crawl.py 依存無し)。
+
+  self-loop 方式 (= 1 tick で N jobs 処理 → sleep → 次 tick 自己 enqueue)。
+workload_type: self_loop
+
+init_kwargs:
+  - key: db_env_file
+    type: path
+    default: /mnt/paps-ai/ai/.env
+    label: DB 接続情報 (.env)
+
+  - key: paprika_hub
+    type: str
+    default: http://10.10.50.34:8000
+    label: paprika hub URL
+
+  - key: raw_dir
+    type: path
+    default: /mnt/paps-ai-data/crawl/raw
+    label: 画像保存先 root (= /raw/{dir_no}/{image_id}.jpg)
+
+  - key: tmp_dir
+    type: path
+    default: /mnt/paps-ai-data/crawl/raw/work
+    label: 一時 download 先
+
+  - key: interval_s
+    type: int
+    default: 60
+    label: ループ間隔 初期値 (秒) — AIMD で動的調整
+    min: 5
+    max: 600
+
+  - key: interval_min_s
+    type: int
+    default: 5
+    label: ループ間隔 下限 (秒)
+    min: 1
+    max: 60
+
+  - key: interval_max_s
+    type: int
+    default: 600
+    label: ループ間隔 上限 (秒)
+    min: 60
+    max: 3600
+
+  - key: page_limit
+    type: int
+    default: 30
+    label: 1 tick で取得するジョブ数 初期値
+    min: 1
+    max: 200
+
+  - key: page_limit_min
+    type: int
+    default: 10
+    label: page_limit 下限
+    min: 1
+    max: 200
+
+  - key: page_limit_max
+    type: int
+    default: 200
+    label: page_limit 上限
+    min: 10
+    max: 500
+
+  - key: statuses
+    type: str
+    default: completed,review
+    label: 取込対象 status
+
+  - key: dir_base
+    type: int
+    default: 1000
+    label: dir 番号の単位 (= file_no // dir_base)
+
+hidden_kwargs:
+  - workload_slug
+  - control_url
+
+success_criteria:
+  type: exit_code
+  expected: 0
+
+priority: 100
+weight: 1.0
+batch_size: 1
+lease_secs: 600
+max_attempts: 3
+resources:
+  vram_mb: 0
+
+host_affinity: []

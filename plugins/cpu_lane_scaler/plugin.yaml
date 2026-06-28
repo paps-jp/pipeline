@@ -1,0 +1,65 @@
+name: cpu-lane-scaler
+description: |
+  CPU 利用率を見て、 CPU-only workload の同時実行ティック数 (= lane) を動的に調整。
+  - 各 worker daemon が heartbeat に乗せた host_cpu_pct (= /proc/loadavg 由来) を
+    `/api/v1/workers/cpu` から集約取得 (= ssh 不要)。
+  - 管理対象 workload の queue pending を観測し、 target_lanes (cpu に応じ線形補間)
+    に届かなければ tick PK を不足分 enqueue。
+  - 既存の self-loop (= baseline 1 lane) は触らず、 scaler が上に積む形。
+
+workload_type: self_loop
+
+init_kwargs:
+  - key: managed_workloads
+    type: str
+    default: "paprika-links-pull,paprika-image-pull,paprika-video-pull,image-dispatcher,video-dispatcher"
+    label: lane scale 対象 workload (CSV)
+    help: paprika-job-submit は内部 scaler 持ちなので除外
+  - key: lanes_min
+    type: int
+    default: 1
+    label: 同時実行 lanes 下限 (CPU 高負荷時)
+    min: 1
+    max: 10
+  - key: lanes_max
+    type: int
+    default: 5
+    label: 同時実行 lanes 上限 (CPU 低負荷時)
+    min: 1
+    max: 30
+  - key: cpu_low_pct
+    type: int
+    default: 40
+    label: lanes_max を維持する CPU 上限 (%)
+    min: 10
+    max: 90
+  - key: cpu_high_pct
+    type: int
+    default: 80
+    label: lanes_min まで落とす CPU 下限 (%)
+    min: 30
+    max: 95
+  - key: interval_s
+    type: int
+    default: 20
+    label: 観測間隔 (秒)
+    min: 5
+    max: 600
+
+hidden_kwargs:
+  - workload_slug
+  - control_url
+
+success_criteria:
+  type: exit_code
+  expected: 0
+
+priority: 90
+weight: 1.0
+batch_size: 1
+lease_secs: 60
+max_attempts: 3
+resources:
+  vram_mb: 0
+
+host_affinity: []

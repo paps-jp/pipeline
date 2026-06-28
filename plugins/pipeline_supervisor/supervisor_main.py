@@ -1,0 +1,999 @@
+"""pipeline-supervisor: パイプライン全体のオーケストレーター。
+
+30s ごとに pipeline-oss control plane から:
+ - GPU host metrics (/api/v1/workers/metrics)
+ - workload list (/api/v1/workloads)
+ - 各 workload の queue 深さ (/api/v1/workloads/<slug>/queue)
+ - 直近 run output_json (/api/v1/runs)
+
+を取得し、 外部 yaml ルールを当てて必要なら PUT で workload 設定を書き換える。
+
+race 防止: host_affinity 1 host 限定 (= plugin.yaml で固定)。
+dry-run 既定 (= apply_mode=0)。
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import logging
+import os
+import time
+import urllib.parse
+import urllib.request
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Any
+
+import requests
+
+log = logging.getLogger(__name__)
+
+DEFAULT_CONTROL_URL = "http://127.0.0.1:8001"
+# 既定はプラグイン dir 隣接の `orchestration_rules.yaml`。
+# 制御プレーンと別ホストで動かす場合は init_kwargs `rules_path` で絶対パス上書き。
+DEFAULT_RULES_PATH = str(
+    Path(__file__).resolve().parent / "orchestration_rules.yaml"
+)
+
+# 過去 throughput / 連続性判定用
+_HISTORY_LEN = 30   # = 30 tick × 30s = 15 min 分
+
+
+def _utcnow_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _self_enqueue_next_tick(control_url: str, workload_slug: str, tick_id: int) -> None:
+    pk = f"tick-{tick_id}-{int(time.time())}"
+    req = urllib.request.Request(
+        f"{control_url}/api/v1/workloads/{workload_slug}/tasks",
+        data=json.dumps({"pk": pk}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+    except Exception as e:
+        log.warning("supervisor self-enqueue failed: %s", e)
+
+
+def setup(**kwargs) -> dict[str, Any]:
+    state = {
+        "control_url": (kwargs.get("control_url") or DEFAULT_CONTROL_URL).rstrip("/"),
+        "rules_path": kwargs.get("rules_path") or DEFAULT_RULES_PATH,
+        "interval_s": int(kwargs.get("interval_s") or 30),
+        "metrics_minutes": int(kwargs.get("metrics_minutes") or 10),
+        "throughput_window_min": int(kwargs.get("throughput_window_min") or 10),
+        "apply_mode": bool(int(kwargs.get("apply_mode") or 0)),
+        "max_priority": int(kwargs.get("max_priority") or 200),
+        "workload_slug": kwargs.get("workload_slug") or "pipeline-supervisor",
+        "counter": 0,
+        "hostname": os.uname().nodename,
+        # streak カウンタ: (rule_id, target_id) → 連続ヒット回数
+        "streak": defaultdict(int),
+        # cooldown: (rule_id, target_id) → 残り tick
+        "cooldown": defaultdict(int),
+        # LLM advisor: 最後にコールした時刻 (monotonic 秒)。 0 = 未コール。
+        "llm_last_call_ts": 0.0,
+        # LLM 適用済 action の cooldown (= action key → 残り tick)
+        "llm_action_cooldown": defaultdict(int),
+    }
+    log.info("supervisor: control=%s rules=%s apply_mode=%s",
+             state["control_url"], state["rules_path"], state["apply_mode"])
+    try:
+        _self_enqueue_next_tick(state["control_url"], state["workload_slug"], 1)
+    except Exception as e:
+        log.warning("supervisor: bootstrap enqueue failed: %s", e)
+    return state
+
+
+# ---------------- 評価コンテキスト構築 ---------------- #
+
+def _http_get_json(url: str, timeout: float = 10.0) -> Any:
+    r = requests.get(url, timeout=timeout, headers={"Accept": "application/json"})
+    r.raise_for_status()
+    return r.json()
+
+
+def _host_stats(metrics: dict) -> list[dict[str, Any]]:
+    """worker metrics を host 単位で集約 (= util_avg / power_avg 等)."""
+    by_host: dict[str, list[dict]] = defaultdict(list)
+    workers = metrics.get("workers") or {}
+    for wid, gpus in workers.items():
+        # wid = "w_ai_gpu1_3_c0da" → host = "ai_gpu1" → normalize "ai-gpu1"
+        host = "unknown"
+        if wid.startswith("w_"):
+            parts = wid[2:].split("_")
+            if len(parts) >= 2:
+                host = parts[0] + "-" + parts[1]    # ai-gpu1
+        for gpu_id, pts in (gpus or {}).items():
+            for p in pts:
+                by_host[host].append(p)
+    out = []
+    for host, pts in by_host.items():
+        if not pts:
+            continue
+        utils = [p.get("util_pct") for p in pts if isinstance(p.get("util_pct"), (int, float))]
+        powers = [p.get("power_w") for p in pts if isinstance(p.get("power_w"), (int, float))]
+        mems = [p.get("mem_used_mb") for p in pts if isinstance(p.get("mem_used_mb"), (int, float))]
+        totals = [p.get("mem_total_mb") for p in pts if isinstance(p.get("mem_total_mb"), (int, float))]
+        temps = [p.get("temp_c") for p in pts if isinstance(p.get("temp_c"), (int, float))]
+        # VRAM 空き = 直近サンプル中の peak used を total から引く (= 一番厳しい瞬間で判定)。
+        # 同一 GPU を MPS で共有してる worker は全員が同じ used/total を報告するので
+        # max でも問題ない。 total が取れない (= 古い metrics row) なら未知扱い (= None)。
+        used_peak = max(mems) if mems else 0
+        total_peak = max(totals) if totals else 0
+        vram_free = max(0, int(total_peak - used_peak)) if total_peak > 0 else None
+        out.append({
+            "id": host,
+            "util_avg": round(sum(utils) / len(utils), 1) if utils else 0.0,
+            "util_max": round(max(utils), 1) if utils else 0.0,
+            "power_avg": round(sum(powers) / len(powers), 1) if powers else 0.0,
+            "mem_avg": round(sum(mems) / len(mems), 1) if mems else 0.0,
+            "mem_used_peak_mb": int(used_peak) if mems else None,
+            "mem_total_mb": int(total_peak) if totals else None,
+            "vram_free_mb": vram_free,
+            # GPU 温度 (= サーマルスロットル予兆判定用)
+            "temp_c_avg": round(sum(temps) / len(temps), 1) if temps else None,
+            "temp_c_max": round(max(temps), 1) if temps else None,
+            "sample_n": len(pts),
+        })
+    return sorted(out, key=lambda h: h["id"])
+
+
+# ---------------- worker filter helpers (= 自動切替) ---------------- #
+
+def _parse_host_from_wid(wid: str) -> str:
+    """worker_id `w_ai_gpu1_3_c0da` → host `ai-gpu1` (= _host_stats と同規約)。
+
+    インスタンス suffix (= `_3`) と末尾 random は捨て、 最初の 2 セグメントを
+    `-` で繋ぐ (= "ai-gpu1")。 形式が違う wid は wid 自身を返す (= no-op fallback)。
+    """
+    if not wid.startswith("w_"):
+        return wid
+    parts = wid[2:].split("_")
+    if len(parts) >= 2:
+        return parts[0] + "-" + parts[1]
+    return wid
+
+
+def _list_workers_on_host(control_url: str, host: str) -> list[dict[str, Any]]:
+    """指定 host (= _host_stats の id 形式: "ai-gpu1") に居る active worker を返す。
+
+    /api/v1/workers が返す worker.host は systemd instance suffix 付き
+    (= "ai-gpu1-6")。 supervisor 側の host id は suffix なし。 wid 由来で正規化照合。
+    """
+    try:
+        resp = _http_get_json(f"{control_url}/api/v1/workers", timeout=5)
+    except Exception as e:
+        log.warning("list workers failed: %s", e)
+        return []
+    out: list[dict[str, Any]] = []
+    for w in (resp.get("workers") or []):
+        wid = w.get("id") or ""
+        if w.get("state") != "active":
+            continue
+        if _parse_host_from_wid(wid) == host:
+            out.append(w)
+    return out
+
+
+def _post_worker_filter(control_url: str, worker_id: str,
+                       workloads: list[str] | None, updated_by: str,
+                       apply_mode: bool) -> dict[str, Any]:
+    """POST /api/v1/workers/{id}/filter で filter を上書き。 dry-run 時は計画のみ。"""
+    if not apply_mode:
+        return {"ok": True, "dry_run": True, "worker_id": worker_id,
+                "new_filter": workloads}
+    try:
+        r = requests.post(
+            f"{control_url}/api/v1/workers/{worker_id}/filter",
+            json={"workloads": workloads, "updated_by": updated_by},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return {"ok": True, "applied": True, "worker_id": worker_id,
+                "new_filter": workloads}
+    except Exception as e:
+        return {"ok": False, "error": f"POST failed: {e}", "worker_id": worker_id}
+
+
+def _workload_stats(control_url: str, wls: list[dict], runs: list[dict],
+                    window_min: int,
+                    workers: list[dict] | None = None) -> list[dict[str, Any]]:
+    """各 workload の backlog / throughput / drain_eta / dup_ratio + fail_ratio
+    + claimable_workers を集計."""
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cutoff = now - _dt.timedelta(minutes=window_min)
+
+    # runs を slug 別に success / fail で分類
+    succ_by_slug: dict[str, list[dict]] = defaultdict(list)
+    fail_by_slug: dict[str, list[dict]] = defaultdict(list)
+    for r in runs:
+        slug = r.get("workload_slug")
+        if not slug:
+            continue
+        fin = r.get("finished_at")
+        if not fin:
+            continue
+        try:
+            fdt = (fin if isinstance(fin, _dt.datetime)
+                   else _dt.datetime.fromisoformat(str(fin).replace("Z", "+00:00")))
+            if fdt.tzinfo is None:
+                fdt = fdt.replace(tzinfo=_dt.timezone.utc)
+        except Exception:
+            continue
+        if fdt < cutoff:
+            continue
+        if r.get("success"):
+            succ_by_slug[slug].append(r)
+        else:
+            fail_by_slug[slug].append(r)
+
+    # claimable_workers: 各 slug について、 active で filter が受ける worker 数を数える。
+    # filter=None (= 解除) は全 workload 受け入れの扱い。
+    # workers が None (= 旧 caller) なら 0 ではなく None で返して rule 評価対象から外す。
+    workers = workers or []
+    claimable_count: dict[str, int | None] = {}
+    for w in wls:
+        slug = w.get("slug")
+        if not slug:
+            continue
+        if not workers:
+            claimable_count[slug] = None
+            continue
+        n = 0
+        for worker in workers:
+            if worker.get("state") != "active":
+                continue
+            f = worker.get("workload_filter")
+            if f is None or slug in f:
+                n += 1
+        claimable_count[slug] = n
+
+    out = []
+    for w in wls:
+        slug = w.get("slug")
+        if not slug or not w.get("enabled"):
+            continue
+        # queue 取得
+        try:
+            q = _http_get_json(f"{control_url}/api/v1/workloads/{slug}/queue", timeout=5)
+        except Exception as e:
+            log.debug("queue fetch %s: %s", slug, e)
+            q = {"by_state": {}, "total": 0}
+        by = q.get("by_state") or {}
+        pending = int(by.get("pending") or 0)
+        claimed = int(by.get("claimed") or 0)
+        backlog = pending + claimed
+
+        # throughput
+        succ = succ_by_slug.get(slug) or []
+        throughput = round(len(succ) / max(1, window_min), 2)
+
+        # drain_eta
+        if throughput > 0:
+            drain_eta = round(backlog / throughput, 1)
+        else:
+            drain_eta = float("inf") if backlog > 0 else 0.0
+
+        # dup_ratio (= 直近 succ の output_json から推定)
+        dup_total = 0
+        ins_total = 0
+        for r in succ:
+            out_j = r.get("output_json") or {}
+            d = out_j.get("dup")
+            i = out_j.get("inserted")
+            if isinstance(d, (int, float)) and isinstance(i, (int, float)):
+                dup_total += int(d)
+                ins_total += int(i)
+        dup_ratio = (dup_total / (dup_total + ins_total)) if (dup_total + ins_total) > 0 else 0.0
+
+        # fail_ratio = window 内の fail / (succ+fail)。 succ=fail=0 なら None
+        # (= 未観測時に rule 条件 `lt: 0.5` が偽でも真でもならない安全側)。
+        fails = fail_by_slug.get(slug) or []
+        denom = len(succ) + len(fails)
+        fail_ratio = round(len(fails) / denom, 3) if denom > 0 else None
+        out.append({
+            "slug": slug,
+            "enabled": bool(w.get("enabled")),
+            # supervisor が patch/filter 変更で介入することを許可するか。
+            # False なら streak/cooldown は数えるが action は no-op。 既定 True。
+            "supervisor_enabled": bool(w.get("supervisor_enabled", True)),
+            "priority": int(w.get("priority") or 100),
+            "batch_size": int(w.get("batch_size") or 1),
+            "lease_secs": int(w.get("lease_secs") or 300),
+            "host_affinity": w.get("host_affinity") or [],
+            # workload 別の VRAM 観測値 (= LLM が GPU 配分判断に使える)
+            "observed_vram_mb_peak": w.get("observed_vram_mb_peak"),
+            "resources_vram_mb": (w.get("resources") or {}).get("vram_mb"),
+            "backlog": backlog,
+            "pending": pending,
+            "claimed": claimed,
+            "throughput_min": throughput,
+            "drain_eta_min": drain_eta,
+            "dup_ratio": round(dup_ratio, 3),
+            "fail_ratio": fail_ratio,
+            "succ_n": len(succ),
+            "fail_n": len(fails),
+            # filter で claim 可能な active worker 数 (= 0 なら誰も取りに行けない)
+            "claimable_workers": claimable_count.get(slug),
+        })
+    return out
+
+
+# ---------------- rule engine ---------------- #
+
+def _match_cond(value: Any, cond: dict[str, Any]) -> bool:
+    """{lt: x} {gt: x} {eq: x} {gte: x} {lte: x} の単純照合."""
+    if not isinstance(cond, dict):
+        return False
+    try:
+        for op, v in cond.items():
+            if op == "lt" and not (value < v):
+                return False
+            elif op == "gt" and not (value > v):
+                return False
+            elif op == "eq" and not (value == v):
+                return False
+            elif op == "gte" and not (value >= v):
+                return False
+            elif op == "lte" and not (value <= v):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _eval_rules(rules: list[dict], hosts: list[dict], workloads: list[dict],
+                state: dict) -> list[dict[str, Any]]:
+    """rules を評価し、 適用すべき action リストを返す。 streak / cooldown を更新。"""
+    actions: list[dict[str, Any]] = []
+
+    # rules の各 entry を host / workload それぞれに当てる
+    for rule in rules:
+        rid = rule.get("id", "?")
+        when = rule.get("when") or {}
+        req_streak = int(when.get("streak") or 1)
+        cooldown_ticks = int(rule.get("cooldown_ticks") or 0)
+
+        host_conds = {k: v for k, v in when.items()
+                      if k.startswith("host.")}
+        wl_conds = {k: v for k, v in when.items()
+                    if k.startswith("workload.")}
+        # host 系 rule
+        if host_conds:
+            for h in hosts:
+                hit = all(
+                    _match_cond(h.get(k.split(".", 1)[1]), c)
+                    for k, c in host_conds.items()
+                )
+                key = (rid, h["id"])
+                if hit:
+                    state["streak"][key] += 1
+                else:
+                    state["streak"][key] = 0
+                if (state["streak"][key] >= req_streak
+                        and state["cooldown"][key] == 0):
+                    a = dict(rule.get("action") or {})
+                    a["_rule_id"] = rid
+                    a["_target_kind"] = "host"
+                    a["_target_id"] = h["id"]
+                    a["_streak"] = state["streak"][key]
+                    actions.append(a)
+                    state["cooldown"][key] = cooldown_ticks
+
+        # workload 系 rule
+        if wl_conds:
+            for w in workloads:
+                hit = all(
+                    _match_cond(w.get(k.split(".", 1)[1]), c)
+                    for k, c in wl_conds.items()
+                )
+                key = (rid, w["slug"])
+                if hit:
+                    state["streak"][key] += 1
+                else:
+                    state["streak"][key] = 0
+                if (state["streak"][key] >= req_streak
+                        and state["cooldown"][key] == 0):
+                    a = dict(rule.get("action") or {})
+                    a["_rule_id"] = rid
+                    a["_target_kind"] = "workload"
+                    a["_target_id"] = w["slug"]
+                    a["_streak"] = state["streak"][key]
+                    actions.append(a)
+                    state["cooldown"][key] = cooldown_ticks
+
+    # cooldown decrement
+    for k, v in list(state["cooldown"].items()):
+        if v > 0:
+            state["cooldown"][k] = v - 1
+    return actions
+
+
+def _resolve_numeric(expr: Any, current: int | float) -> float | None:
+    """`+20` `-10` `*0.7` `100` などを current 基準で解決."""
+    if isinstance(expr, (int, float)):
+        return float(expr)
+    if not isinstance(expr, str):
+        return None
+    s = expr.strip()
+    try:
+        if s.startswith("+"):
+            return float(current) + float(s[1:])
+        if s.startswith("-"):
+            return float(current) - float(s[1:])
+        if s.startswith("*"):
+            return float(current) * float(s[1:])
+        if s.startswith("/"):
+            return float(current) / float(s[1:])
+        return float(s)
+    except Exception:
+        return None
+
+
+def _apply_workload_action(control_url: str, slug: str, patch: dict[str, Any],
+                           apply_mode: bool, max_priority: int) -> dict[str, Any]:
+    """workload の現状を GET → 差分パッチ → PUT する (= dry-run なら計画だけ)."""
+    try:
+        cur = _http_get_json(f"{control_url}/api/v1/workloads/{slug}", timeout=5)
+    except Exception as e:
+        return {"ok": False, "error": f"GET failed: {e}"}
+
+    # サーバ pydantic は extra="forbid" なので、 GET で返ってくる読み取り専用列を
+    # 全部削ぐ必要がある。 漏らすと 422 で **全 PUT が silent fail** する
+    # (= 2026-06-26 にこの漏れで supervisor の patch_workload が 22h 効いてなかった)。
+    _READONLY = {
+        "slug", "created_at", "updated_at", "created_by", "schema_version",
+        "queue_table",
+        "observed_state", "observed_at",
+        "observed_run_id", "observed_run_started_at", "observed_run_finished_at",
+        "observed_depth", "observed_age_secs", "observed_rate",
+        "observed_vram_mb_peak", "observed_vram_sample_count", "observed_vram_updated_at",
+    }
+    new_body = {k: v for k, v in cur.items() if k not in _READONLY}
+    changes: dict[str, Any] = {}
+
+    if "priority" in patch:
+        v = _resolve_numeric(patch["priority"], cur.get("priority") or 100)
+        if v is not None:
+            new_prio = max(0, min(int(max_priority), int(round(v))))
+            if new_prio != cur.get("priority"):
+                new_body["priority"] = new_prio
+                changes["priority"] = (cur.get("priority"), new_prio)
+    if "lease_secs" in patch:
+        v = _resolve_numeric(patch["lease_secs"], cur.get("lease_secs") or 300)
+        if v is not None:
+            new_lease = max(15, min(86400, int(round(v))))
+            if new_lease != cur.get("lease_secs"):
+                new_body["lease_secs"] = new_lease
+                changes["lease_secs"] = (cur.get("lease_secs"), new_lease)
+    if "host_affinity_add" in patch:
+        host = patch["host_affinity_add"]
+        if isinstance(host, str) and host:
+            ha = list(cur.get("host_affinity") or [])
+            if host not in ha:
+                ha.append(host)
+                new_body["host_affinity"] = ha
+                changes["host_affinity"] = (cur.get("host_affinity"), ha)
+    if "enabled" in patch:
+        new_body["enabled"] = bool(patch["enabled"])
+        if new_body["enabled"] != cur.get("enabled"):
+            changes["enabled"] = (cur.get("enabled"), new_body["enabled"])
+
+    if not changes:
+        return {"ok": True, "noop": True, "slug": slug}
+
+    if not apply_mode:
+        return {"ok": True, "dry_run": True, "slug": slug, "changes": changes}
+
+    try:
+        r = requests.put(
+            f"{control_url}/api/v1/workloads/{slug}",
+            json=new_body, timeout=10,
+        )
+        r.raise_for_status()
+        return {"ok": True, "applied": True, "slug": slug, "changes": changes}
+    except Exception as e:
+        return {"ok": False, "error": f"PUT failed: {e}", "changes": changes}
+
+
+def _load_rules(path: str) -> list[dict[str, Any]]:
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        log.warning("PyYAML missing; rules disabled")
+        return []
+    p = Path(path)
+    if not p.exists():
+        log.debug("rules file not found: %s", path)
+        return []
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        log.warning("rules parse failed: %s", e)
+        return []
+    return list(data.get("rules") or [])
+
+
+# ---------------- main process ---------------- #
+
+def process(task, ctx, state):
+    state["counter"] += 1
+    started = time.time()
+    out: dict[str, Any] = {"tick": state["counter"], "host": state["hostname"]}
+    control_url = state["control_url"]
+
+    # 1. 各データ取得
+    try:
+        metrics = _http_get_json(
+            f"{control_url}/api/v1/workers/metrics?minutes={state['metrics_minutes']}"
+        )
+    except Exception as e:
+        metrics = {"workers": {}}
+        out["metrics_error"] = str(e)[:120]
+    try:
+        wls_resp = _http_get_json(f"{control_url}/api/v1/workloads")
+        wls = wls_resp.get("workloads") or []
+    except Exception as e:
+        wls = []
+        out["workloads_error"] = str(e)[:120]
+    try:
+        runs_resp = _http_get_json(
+            f"{control_url}/api/v1/runs?limit=500"
+        )
+        runs = runs_resp.get("runs") or []
+    except Exception as e:
+        runs = []
+        out["runs_error"] = str(e)[:120]
+    # workers list (= claimable_workers 集計と全 active 数把握用)
+    try:
+        workers_resp = _http_get_json(f"{control_url}/api/v1/workers")
+        wks = workers_resp.get("workers") or []
+    except Exception as e:
+        wks = []
+        out["workers_error"] = str(e)[:120]
+
+    # 2. 集約
+    hosts = _host_stats(metrics)
+    workloads = _workload_stats(
+        control_url, wls, runs, state["throughput_window_min"], workers=wks,
+    )
+    out["host_count"] = len(hosts)
+    out["wl_count"] = len(workloads)
+
+    # 3. rule engine
+    rules = _load_rules(state["rules_path"])
+    out["rules_loaded"] = len(rules)
+    actions = _eval_rules(rules, hosts, workloads, state)
+
+    # 4. action 実行
+    # supervisor_enabled=False の workload を覚えておく (= 介入禁止リスト)
+    disabled_slugs = {w["slug"] for w in workloads if not w.get("supervisor_enabled", True)}
+    results: list[dict[str, Any]] = []
+    for a in actions:
+        rid = a.get("_rule_id")
+        kind = a.get("_target_kind")
+        target = a.get("_target_id")
+
+        # opt-out: 当該 workload が supervisor_enabled=False の場合は
+        # action を skip (log のみ)。 host-side rule で workload を targets する
+        # 場合 (= add_workload_to_host_workers 等) も同様にチェック。
+        target_slug: str | None = None
+        if kind == "workload":
+            target_slug = target
+        elif kind == "host":
+            for key in ("add_workload_to_host_workers",
+                        "remove_workload_from_host_workers",
+                        "add_host_affinity"):
+                cfg = a.get(key)
+                if isinstance(cfg, dict):
+                    target_slug = cfg.get("workload") or cfg.get("slug")
+                    if target_slug:
+                        break
+        if target_slug and target_slug in disabled_slugs:
+            log.info("[%s] skip %s (= supervisor_enabled=false)", rid, target_slug)
+            results.append({"rule": rid, "target": target, "ok": True,
+                            "skipped": True, "reason": f"{target_slug} supervisor_enabled=false"})
+            continue
+
+        # log action は常に出力
+        if "log" in a and isinstance(a["log"], dict):
+            msg = a["log"].get("message", "")
+            try:
+                msg = msg.format(slug=target, host=target)
+            except Exception:
+                pass
+            log.info("[%s] %s", rid, msg)
+            results.append({"rule": rid, "log": msg, "target": target})
+            continue
+
+        # patch_workload
+        if kind == "workload" and "patch_workload" in a:
+            r = _apply_workload_action(
+                control_url, target, a["patch_workload"],
+                state["apply_mode"], state["max_priority"],
+            )
+            r["rule"] = rid
+            r["target"] = target
+            results.append(r)
+            if r.get("changes"):
+                log.info("[%s] %s %s → %s",
+                         rid, target,
+                         "dry" if r.get("dry_run") else "APPLIED",
+                         r["changes"])
+
+        # add_host_affinity (= host-side rule + workload に host を追加)
+        if kind == "host" and "add_host_affinity" in a:
+            cfg = a["add_host_affinity"]
+            slug = cfg.get("slug")
+            host = target
+            if slug and host:
+                r = _apply_workload_action(
+                    control_url, slug, {"host_affinity_add": host},
+                    state["apply_mode"], state["max_priority"],
+                )
+                r["rule"] = rid
+                r["target"] = f"{slug} += {host}"
+                results.append(r)
+                if r.get("changes"):
+                    log.info("[%s] add affinity %s ← %s (%s)",
+                             rid, slug, host,
+                             "dry" if r.get("dry_run") else "APPLIED")
+
+        # ---------- 自動切替 actions (= worker filter SoT 直接操作) ----------
+        # add_workload_to_host_workers: 指定 host の全 worker の filter に
+        # 指定 workload を「足す」 (= 重複は無視)。 元 filter が None (= no filter)
+        # ならその worker は対象外 (= もう全 workload 受けてるので追加不要)。
+        if kind == "host" and "add_workload_to_host_workers" in a:
+            cfg = a["add_workload_to_host_workers"]
+            wl_to_add = cfg.get("workload")
+            host = target
+            if wl_to_add and host:
+                workers = _list_workers_on_host(control_url, host)
+                changed = 0
+                for w in workers:
+                    cur_filter = w.get("workload_filter")
+                    if cur_filter is None:
+                        continue  # no filter = 既に全 workload 対象
+                    if wl_to_add in cur_filter:
+                        continue
+                    new_filter = sorted(set(cur_filter) | {wl_to_add})
+                    rp = _post_worker_filter(
+                        control_url, w["id"], new_filter,
+                        updated_by=f"supervisor:{rid}",
+                        apply_mode=state["apply_mode"],
+                    )
+                    rp["rule"] = rid
+                    rp["target"] = f"{host}/{w['id']}: +{wl_to_add}"
+                    results.append(rp)
+                    if rp.get("ok"):
+                        changed += 1
+                log.info("[%s] add %s on %s: %d worker(s) updated (%s)",
+                         rid, wl_to_add, host, changed,
+                         "dry" if not state["apply_mode"] else "APPLIED")
+
+        # remove_workload_from_host_workers: 指定 host の全 worker の filter から
+        # 指定 workload を外す。 filter が None (= 全受) の worker は「明示の filter」
+        # を作って引き算する (= 他 workload を列挙 → 当該を除外)。 ただし「列挙元」 を
+        # 知らないと filter を作れないので、 オプション `set_to` で「外した後の filter」 を
+        # 直接指定可能 (= 望ましい運用)。 `set_to` 未指定時は現 filter が list の worker のみ操作。
+        if kind == "host" and "remove_workload_from_host_workers" in a:
+            cfg = a["remove_workload_from_host_workers"]
+            wl_to_remove = cfg.get("workload")
+            set_to_override = cfg.get("set_to")    # 任意: 明示の新 filter
+            host = target
+            if wl_to_remove and host:
+                workers = _list_workers_on_host(control_url, host)
+                changed = 0
+                for w in workers:
+                    cur_filter = w.get("workload_filter")
+                    if set_to_override is not None:
+                        new_filter = list(set_to_override)
+                    elif cur_filter is None:
+                        # 「no filter」 = 全受の worker は方針が決まらないので skip
+                        # (= rule で `set_to: [...]` を指定すれば操作可能)
+                        continue
+                    elif wl_to_remove not in cur_filter:
+                        continue
+                    else:
+                        new_filter = sorted(set(cur_filter) - {wl_to_remove})
+                    rp = _post_worker_filter(
+                        control_url, w["id"], new_filter,
+                        updated_by=f"supervisor:{rid}",
+                        apply_mode=state["apply_mode"],
+                    )
+                    rp["rule"] = rid
+                    rp["target"] = f"{host}/{w['id']}: -{wl_to_remove}"
+                    results.append(rp)
+                    if rp.get("ok"):
+                        changed += 1
+                log.info("[%s] remove %s on %s: %d worker(s) updated (%s)",
+                         rid, wl_to_remove, host, changed,
+                         "dry" if not state["apply_mode"] else "APPLIED")
+
+        # set_worker_filter: host 内の worker 全員を「指定 list 完全に置換」。
+        # 強い手なので最後の砦的 rule で使う (= 例: 緊急 shedding)。
+        if kind == "host" and "set_worker_filter" in a:
+            cfg = a["set_worker_filter"]
+            new_filter = cfg.get("workloads")   # None or []=解除、 list=固定
+            host = target
+            workers = _list_workers_on_host(control_url, host)
+            for w in workers:
+                # 同値なら no-op (= server 側も same check するが round-trip 削減)
+                cur = w.get("workload_filter")
+                if cur == new_filter:
+                    continue
+                rp = _post_worker_filter(
+                    control_url, w["id"], new_filter,
+                    updated_by=f"supervisor:{rid}",
+                    apply_mode=state["apply_mode"],
+                )
+                rp["rule"] = rid
+                rp["target"] = f"{host}/{w['id']}: ={new_filter}"
+                results.append(rp)
+            log.info("[%s] set filter on %s = %s (%d worker(s), %s)",
+                     rid, host, new_filter, len(workers),
+                     "dry" if not state["apply_mode"] else "APPLIED")
+
+    out["actions"] = len(actions)
+    out["results"] = results
+    out["dispatch_secs"] = round(time.time() - started, 2)
+    out["apply_mode"] = state["apply_mode"]
+
+    # ---------- 5. LLM advisor (= 設定で enabled なら N min 毎) ----------
+    try:
+        llm_out = _maybe_run_llm_advisor(state, hosts, workloads, wks, results)
+        if llm_out is not None:
+            out["llm"] = llm_out
+    except Exception as e:
+        log.warning("LLM advisor pass failed: %s", e, exc_info=False)
+        out["llm"] = {"error": str(e)[:200]}
+
+    # 6. sleep + 次 tick
+    sleep_s = max(1, state["interval_s"] - int(out["dispatch_secs"]))
+    time.sleep(sleep_s)
+    _self_enqueue_next_tick(control_url, state["workload_slug"], state["counter"] + 1)
+    out["next_tick_scheduled"] = True
+    return out
+
+
+# ---------------- LLM advisor 統合 ---------------- #
+
+def _fetch_llm_config(control_url: str) -> dict[str, Any] | None:
+    """control plane の /api/v1/settings から LLM 設定を取得し dict 化。
+    settings endpoint は secret を mask するので、 ここでは内部で
+    `?include_secret=1` 的な公開 API は無い → supervisor は workload と同じ host
+    で動く前提で server-side repository を直接読みたいが、 plugin は別プロセスなので
+    API 経由でしか取れない。 だが api_key 生値が必要なので、 ローカルファイル
+    (= /etc/pipeline/llm.json) からも読めるようにする。"""
+    import os
+    # 優先順位 1: 環境変数 (= systemd EnvironmentFile で渡す方式)
+    env_endpoint = os.environ.get("PIPELINE_LLM_ENDPOINT")
+    env_key = os.environ.get("PIPELINE_LLM_API_KEY")
+    env_model = os.environ.get("PIPELINE_LLM_MODEL")
+    if env_endpoint and env_key:
+        return {
+            "enabled": bool(int(os.environ.get("PIPELINE_LLM_ENABLED", "0"))),
+            "apply_mode": bool(int(os.environ.get("PIPELINE_LLM_APPLY_MODE", "0"))),
+            "endpoint": env_endpoint,
+            "api_key": env_key,
+            "model": env_model or "deepseek-chat",
+            "interval_min": int(os.environ.get("PIPELINE_LLM_INTERVAL_MIN", "15")),
+            "max_actions_per_cycle": int(os.environ.get("PIPELINE_LLM_MAX_ACTIONS", "5")),
+            "confidence_threshold": float(os.environ.get("PIPELINE_LLM_MIN_CONFIDENCE", "0.7")),
+            "timeout_s": int(os.environ.get("PIPELINE_LLM_TIMEOUT_S", "60")),
+            "_source": "env",
+        }
+    # 優先順位 2: control plane API (= UI から設定された)
+    # /api/v1/settings/_llm_raw を呼ぶ専用 endpoint を別途 server-side で追加。
+    try:
+        r = requests.get(f"{control_url}/api/v1/_internal/llm_config", timeout=5)
+        if r.status_code == 200:
+            cfg = r.json()
+            cfg["_source"] = "api"
+            return cfg
+    except Exception:
+        pass
+    return None
+
+
+def _maybe_run_llm_advisor(
+    state: dict[str, Any],
+    hosts: list[dict[str, Any]],
+    workloads: list[dict[str, Any]],
+    workers: list[dict[str, Any]],
+    recent_actions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """LLM advisor: N min 間隔で 1 回コール、 提案を action 適用。 設定無効/不在なら no-op。"""
+    cfg = _fetch_llm_config(state["control_url"])
+    if not cfg or not cfg.get("enabled"):
+        return None
+    # 間隔チェック
+    now = time.monotonic()
+    interval_s = max(60, int(cfg.get("interval_min", 15)) * 60)
+    last = float(state.get("llm_last_call_ts") or 0)
+    if last and (now - last) < interval_s:
+        return {"skipped": "interval_not_reached",
+                "next_in_s": int(interval_s - (now - last))}
+    state["llm_last_call_ts"] = now
+
+    # 遅延 import (= server プロセスだけが requirements 持ってる)
+    try:
+        from . import llm_advisor
+    except Exception:
+        import importlib.util as _u
+        spec = _u.spec_from_file_location(
+            "_pl_llm_advisor",
+            str(_PathHelper.llm_advisor_path()),
+        )
+        llm_advisor = _u.module_from_spec(spec); spec.loader.exec_module(llm_advisor)  # type: ignore
+
+    snapshot = llm_advisor.build_state_snapshot(
+        control_url=state["control_url"],
+        hosts=hosts, workloads=workloads, workers=workers,
+        recent_actions=recent_actions,
+    )
+    max_actions = max(1, int(cfg.get("max_actions_per_cycle", 5)))
+    result = llm_advisor.call_llm(
+        endpoint=cfg["endpoint"],
+        api_key=cfg["api_key"],
+        model=cfg.get("model") or "deepseek-chat",
+        snapshot=snapshot,
+        max_actions=max_actions,
+        timeout_s=int(cfg.get("timeout_s", 60)),
+    )
+
+    # 監査 record (= control plane 経由で llm_calls table へ書く)
+    record_id = _record_llm_call(state["control_url"], cfg, result, applied=0)
+
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error"),
+                "duration_ms": result.get("duration_ms"),
+                "log_id": record_id}
+
+    # 安全ガード適用
+    actions = result.get("actions") or []
+    confidence = float(result.get("confidence") or 0)
+    threshold = float(cfg.get("confidence_threshold", 0.7))
+    applied = 0
+    apply_results: list[dict[str, Any]] = []
+    disabled_slugs = {w["slug"] for w in workloads
+                       if not w.get("supervisor_enabled", True)}
+    if cfg.get("apply_mode") and confidence >= threshold:
+        for a in actions[:max_actions]:
+            res = _apply_llm_action(state, a, disabled_slugs)
+            apply_results.append(res)
+            if res.get("applied"):
+                applied += 1
+
+    # 監査 record を applied 数で更新 (= 同 id を上書き)
+    if record_id:
+        _update_llm_call_applied(state["control_url"], record_id, applied)
+
+    return {
+        "ok": True,
+        "analysis": (result.get("analysis") or "")[:500],
+        "confidence": confidence,
+        "actions_proposed": len(actions),
+        "actions_applied": applied,
+        "duration_ms": result.get("duration_ms"),
+        "usage": result.get("usage"),
+        "log_id": record_id,
+        "apply_results": apply_results,
+        "apply_mode": cfg.get("apply_mode"),
+        "dry_run_reason": (
+            None if cfg.get("apply_mode") and confidence >= threshold
+            else f"apply_mode={cfg.get('apply_mode')} confidence={confidence} threshold={threshold}"
+        ),
+    }
+
+
+def _apply_llm_action(state: dict[str, Any], action: dict[str, Any],
+                       disabled_slugs: set[str]) -> dict[str, Any]:
+    """LLM が提案した 1 action を適用。 disabled_slugs と type 検証。"""
+    typ = action.get("type")
+    control_url = state["control_url"]
+    if typ == "patch_workload":
+        slug = action.get("slug")
+        if not slug or slug in disabled_slugs:
+            return {"applied": False, "reason": "slug missing or supervisor_enabled=false",
+                    "action": action}
+        patch: dict[str, Any] = {}
+        if "priority" in action and action["priority"] is not None:
+            patch["priority"] = int(action["priority"])
+        if "batch_size" in action and action["batch_size"] is not None:
+            patch["batch_size"] = int(action["batch_size"])
+        if "lease_secs" in action and action["lease_secs"] is not None:
+            patch["lease_secs"] = int(action["lease_secs"])
+        if not patch:
+            return {"applied": False, "reason": "no recognized fields", "action": action}
+        r = _apply_workload_action(
+            control_url, slug, patch, apply_mode=True,
+            max_priority=state.get("max_priority", 200),
+        )
+        return {"applied": bool(r.get("ok") and r.get("changes")), "result": r,
+                "action": action}
+    if typ == "set_worker_filter":
+        wid = action.get("worker_id")
+        if not wid:
+            return {"applied": False, "reason": "worker_id missing", "action": action}
+        wl = action.get("workloads")
+        if wl is not None and not isinstance(wl, list):
+            return {"applied": False, "reason": "workloads must be list or null",
+                    "action": action}
+        # mode: LLM が "add"/"remove"/"replace" を指定可。 未指定なら "replace"
+        # (= 既存 API 互換)。 LLM プロンプトは "add" を推奨。
+        mode = action.get("mode") or "replace"
+        if mode not in ("replace", "add", "remove"):
+            return {"applied": False,
+                    "reason": f"invalid mode: {mode}", "action": action}
+        try:
+            r = requests.post(
+                f"{control_url}/api/v1/workers/{wid}/filter",
+                json={"workloads": wl, "mode": mode, "updated_by": "llm-advisor"},
+                timeout=10,
+            )
+            if r.status_code >= 400:
+                return {"applied": False, "reason": f"HTTP {r.status_code}: {r.text[:200]}",
+                        "action": action}
+            return {"applied": True, "action": action}
+        except Exception as e:
+            return {"applied": False, "reason": str(e)[:200], "action": action}
+    return {"applied": False, "reason": f"unknown action type: {typ}",
+            "action": action}
+
+
+def _record_llm_call(control_url: str, cfg: dict[str, Any],
+                      result: dict[str, Any], applied: int) -> int:
+    """LLM コール結果を control plane の llm_calls table に書く。"""
+    try:
+        usage = result.get("usage") or {}
+        body = {
+            "provider": cfg.get("_source", "unknown"),
+            "model": cfg.get("model") or "",
+            "prompt_messages": result.get("prompt_messages") or [],
+            "response_text": result.get("response_text"),
+            "analysis": result.get("analysis"),
+            "actions": result.get("actions") or [],
+            "actions_applied": int(applied),
+            "success": bool(result.get("ok")),
+            "error": result.get("error"),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "duration_ms": int(result.get("duration_ms") or 0),
+        }
+        r = requests.post(
+            f"{control_url}/api/v1/_internal/llm_call_record",
+            json=body, timeout=5,
+        )
+        if r.status_code < 400:
+            return int((r.json() or {}).get("id") or 0)
+    except Exception:
+        log.warning("llm call record failed", exc_info=False)
+    return 0
+
+
+def _update_llm_call_applied(control_url: str, record_id: int, applied: int) -> None:
+    try:
+        requests.patch(
+            f"{control_url}/api/v1/_internal/llm_call_record/{record_id}",
+            json={"actions_applied": int(applied)}, timeout=5,
+        )
+    except Exception:
+        pass
+
+
+class _PathHelper:
+    @staticmethod
+    def llm_advisor_path():
+        from pathlib import Path
+        return Path(__file__).parent / "llm_advisor.py"
+
+
+def teardown(state) -> None:
+    log.info("supervisor: done %d ticks", state.get("counter", 0))
