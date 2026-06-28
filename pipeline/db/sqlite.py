@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from pipeline.db.base import Connection, Cursor, Database
-from pipeline.db.schema import ALL_DDL, workload_queue_ddl
+from pipeline.db.schema import ALL_DDL, WORKER_METRICS_ALTERS, WORKERS_ALTERS, WORKLOADS_ALTERS, workload_queue_ddl
 
 
 class SqliteCursor(Cursor):
@@ -76,6 +76,15 @@ class SqliteDatabase(Database):
                 stmt = stmt.strip()
                 if stmt:
                     self._conn.execute(stmt)
+        self._conn.commit()
+        # 後から追加された列 (= 既存 DB に対する idempotent ALTER)
+        for stmt in WORKER_METRICS_ALTERS + WORKLOADS_ALTERS + WORKERS_ALTERS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                # "duplicate column name" は無視 (= 既に追加済)
+                if "duplicate column" not in str(e).lower():
+                    raise
         self._conn.commit()
         self._migrate_queue_table_naming()
         self._drop_legacy_plugins_table()

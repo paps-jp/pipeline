@@ -35,12 +35,52 @@ CREATE TABLE IF NOT EXISTS workloads (
     observed_age_secs    INTEGER NOT NULL DEFAULT 0,
     observed_rate        REAL    NOT NULL DEFAULT 0,
 
+    -- worker self-report で集めた peak VRAM (= install-multi-worker 自動 N 算定の元値)
+    observed_vram_mb_peak     INTEGER,
+    observed_vram_sample_count INTEGER NOT NULL DEFAULT 0,
+    observed_vram_updated_at  TEXT,
+
     created_by           TEXT,
     created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     schema_version       INTEGER NOT NULL DEFAULT 1
 );
 """
+
+WORKLOADS_ALTERS = [
+    "ALTER TABLE workloads ADD COLUMN observed_vram_mb_peak INTEGER",
+    "ALTER TABLE workloads ADD COLUMN observed_vram_sample_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE workloads ADD COLUMN observed_vram_updated_at TEXT",
+    # supervisor (= 自動オーケストレーター) がこの workload に介入することを許可するか。
+    # 1 = 任せる (= 既定)、 0 = オペレータが手で握る (= supervisor の action はスキップ)。
+    "ALTER TABLE workloads ADD COLUMN supervisor_enabled INTEGER NOT NULL DEFAULT 1",
+    # 同一 host 上で同時実行できる worker 数の上限。 NULL = 無制限 (= 既定)。
+    # 用途: image-embed のように cuBLAS init で VRAM をでかく確保する plugin で、
+    # 同じ GPU を多重起動して CUBLAS_STATUS_ALLOC_FAILED で setup 死亡を防ぐ。
+    "ALTER TABLE workloads ADD COLUMN max_concurrent_per_host INTEGER",
+    # CPU/GPU 分類フラグ (2026-06-28)。 静的配置設計 + UI 表示用。
+    # NULL/0 = CPU only (= web/IO bound)、 1 = GPU heavy (= ONNX/CUDA)。
+    # operator が worker.workload_filter を配置するときの判断材料。
+    "ALTER TABLE workloads ADD COLUMN requires_gpu INTEGER NOT NULL DEFAULT 0",
+    # VRAM 観測の充実 (2026-06-28)。 peak は OOM 防止の絶対線、 avg/p95 は
+    # 実態に近い配置設計用の数字。 worker daemon が周期的に POST し、 hub 側で
+    # sliding window で集計。 NULL = 未計測。
+    "ALTER TABLE workloads ADD COLUMN observed_vram_mb_avg INTEGER",
+    "ALTER TABLE workloads ADD COLUMN observed_vram_mb_p95 INTEGER",
+]
+
+# workers テーブルへの後付け列 (= 既存 DB を壊さず adopt)
+# - workload_filter: 自動切替の SoT。 worker daemon が control plane を poll して
+#   反映する。 NULL/空 = env (PIPELINE_WORKLOAD_FILTER) にフォールバック。
+WORKERS_ALTERS = [
+    "ALTER TABLE workers ADD COLUMN workload_filter TEXT",        # JSON list[str] or NULL
+    "ALTER TABLE workers ADD COLUMN filter_updated_at TEXT",
+    "ALTER TABLE workers ADD COLUMN filter_updated_by TEXT",      # supervisor / operator など
+    # systemd の PIPELINE_WORKLOAD_FILTER env (= worker daemon が register 時に申告)。
+    # NULL = env 未設定 (= 全 workload claim 可)。 LLM advisor が dual filter を作る
+    # ときに「env 由来の slug を奪わない」 ための基盤。
+    "ALTER TABLE workers ADD COLUMN env_filter TEXT",             # JSON list[str] or NULL
+]
 
 
 # --- workers (接続中の worker レジストリ) -------------------------------
@@ -146,6 +186,42 @@ CREATE INDEX IF NOT EXISTS plugins_idx_slug ON plugins (slug, created_at DESC);
 """
 
 
+# --- settings (システム設定の key-value 永続化、 LLM 接続情報等) -----------
+SETTINGS_DDL = """
+CREATE TABLE IF NOT EXISTS settings (
+    key             TEXT PRIMARY KEY,
+    value           TEXT,
+    description     TEXT,
+    is_secret       INTEGER NOT NULL DEFAULT 0,   -- 1 なら API 経由 GET で mask する
+    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by      TEXT
+);
+"""
+
+
+# --- llm_calls (LLM advisor の入出力監査ログ) -----------------------------
+LLM_CALLS_DDL = """
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    called_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    prompt_tokens   INTEGER,
+    completion_tokens INTEGER,
+    total_tokens    INTEGER,
+    duration_ms     INTEGER,
+    success         INTEGER NOT NULL,
+    error           TEXT,
+    prompt_json     TEXT,           -- 送信した messages(問題追跡用、 size 大)
+    response_text   TEXT,           -- 生 response
+    actions_json    TEXT,           -- parse 後の action list
+    actions_applied INTEGER,
+    analysis        TEXT            -- LLM 分析テキスト (= UI 表示用)
+);
+CREATE INDEX IF NOT EXISTS llm_calls_idx_called ON llm_calls (called_at DESC);
+"""
+
+
 # --- audit_log -----------------------------------------------------------
 AUDIT_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -246,16 +322,80 @@ CREATE INDEX IF NOT EXISTS worker_admin_cmds_idx_pending
 # --- worker_metrics (= GPU 温度等の時系列。 reaper で 24h 前を delete) ---
 WORKER_METRICS_DDL = """
 CREATE TABLE IF NOT EXISTS worker_metrics (
-    worker_id    TEXT NOT NULL,
-    gpu_idx      INTEGER NOT NULL,
-    ts           TEXT NOT NULL,
-    temp_c       REAL,
-    util_pct     REAL,
-    mem_used_mb  INTEGER,
+    worker_id     TEXT NOT NULL,
+    gpu_idx       INTEGER NOT NULL,
+    ts            TEXT NOT NULL,
+    temp_c        REAL,
+    util_pct      REAL,
+    mem_used_mb   INTEGER,
+    mem_util_pct  REAL,
+    mem_total_mb  INTEGER,
+    power_w       REAL,
+    sm_clock_mhz  INTEGER,
+    mem_clock_mhz INTEGER,
     PRIMARY KEY (worker_id, gpu_idx, ts)
 );
 CREATE INDEX IF NOT EXISTS worker_metrics_idx_ts
     ON worker_metrics (ts);
+"""
+
+# 既存 DB に対する idempotent な ALTER (= 後から追加された列)
+WORKER_METRICS_ALTERS = [
+    "ALTER TABLE worker_metrics ADD COLUMN mem_util_pct  REAL",
+    "ALTER TABLE worker_metrics ADD COLUMN mem_total_mb  INTEGER",
+    "ALTER TABLE worker_metrics ADD COLUMN power_w       REAL",
+    "ALTER TABLE worker_metrics ADD COLUMN sm_clock_mhz  INTEGER",
+    "ALTER TABLE worker_metrics ADD COLUMN mem_clock_mhz INTEGER",
+]
+
+
+# --- plugin_runtime (= プラグインがライブ UI 用に置く一時データ) --------
+# プラグインが自分の状態 (動画スクショ・進捗・最新顔写真 ID 等) を
+# 一時的に置くキー値ストア。 control plane が iframe UI 用に配信する。
+# reaper で TTL 経過分を delete。
+PLUGIN_RUNTIME_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS plugin_runtime_state (
+    slug         TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    value_json   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (slug, key)
+);
+CREATE INDEX IF NOT EXISTS plugin_runtime_state_idx_updated
+    ON plugin_runtime_state (updated_at);
+"""
+
+PLUGIN_RUNTIME_BLOB_DDL = """
+CREATE TABLE IF NOT EXISTS plugin_runtime_blob (
+    slug         TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    data         BLOB NOT NULL,
+    size_bytes   INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (slug, key)
+);
+CREATE INDEX IF NOT EXISTS plugin_runtime_blob_idx_updated
+    ON plugin_runtime_blob (updated_at);
+"""
+
+
+# --- vram_observations (= per-workload raw sample for avg/p95 集計、 2026-06-28) ---
+# 既存 record_vram_observation は peak のみ更新するが、 配置設計には avg/p95 が必要。
+# raw sample を 1h 保持して周期 task で workloads.observed_vram_mb_avg/p95 を計算。
+# 古い行は reaper で削除 (60min より古い)。
+VRAM_OBSERVATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS vram_observations (
+    slug        TEXT NOT NULL,
+    worker_id   TEXT NOT NULL,
+    ts          TEXT NOT NULL,
+    used_mb     INTEGER NOT NULL,
+    PRIMARY KEY (slug, worker_id, ts)
+);
+CREATE INDEX IF NOT EXISTS vram_observations_idx_slug_ts
+    ON vram_observations (slug, ts);
+CREATE INDEX IF NOT EXISTS vram_observations_idx_ts
+    ON vram_observations (ts);
 """
 
 
@@ -273,6 +413,11 @@ ALL_DDL = [
     DEPLOY_PATHS_DDL,
     WORKER_ADMIN_CMDS_DDL,
     WORKER_METRICS_DDL,
+    PLUGIN_RUNTIME_STATE_DDL,
+    PLUGIN_RUNTIME_BLOB_DDL,
+    SETTINGS_DDL,
+    LLM_CALLS_DDL,
+    VRAM_OBSERVATIONS_DDL,
 ]
 
 

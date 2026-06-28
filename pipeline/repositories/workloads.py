@@ -33,6 +33,10 @@ def _row_to_workload(row: dict[str, Any]) -> Workload:
     # SQLite boolean は 0/1
     if isinstance(parsed.get("enabled"), int):
         parsed["enabled"] = bool(parsed["enabled"])
+    if isinstance(parsed.get("supervisor_enabled"), int):
+        parsed["supervisor_enabled"] = bool(parsed["supervisor_enabled"])
+    if isinstance(parsed.get("requires_gpu"), int):
+        parsed["requires_gpu"] = bool(parsed["requires_gpu"])
     return Workload(**parsed)
 
 
@@ -92,6 +96,9 @@ class WorkloadRepository:
             "host_affinity": json.dumps(payload.host_affinity),
             "on_success": json.dumps(payload.on_success) if payload.on_success else None,
             "on_failure": json.dumps(payload.on_failure) if payload.on_failure else None,
+            "supervisor_enabled": 1 if payload.supervisor_enabled else 0,
+            "max_concurrent_per_host": payload.max_concurrent_per_host,
+            "requires_gpu": 1 if payload.requires_gpu else 0,
             "created_by": created_by,
             "created_at": now,
             "updated_at": now,
@@ -102,12 +109,14 @@ class WorkloadRepository:
             executor_type, executor_config, success_criteria,
             priority, weight, batch_size, lease_secs, max_attempts,
             resources, host_affinity, on_success, on_failure,
+            supervisor_enabled, max_concurrent_per_host, requires_gpu,
             created_by, created_at, updated_at
         ) VALUES (
             :slug, :name, :description, :enabled, :queue_table,
             :executor_type, :executor_config, :success_criteria,
             :priority, :weight, :batch_size, :lease_secs, :max_attempts,
             :resources, :host_affinity, :on_success, :on_failure,
+            :supervisor_enabled, :max_concurrent_per_host, :requires_gpu,
             :created_by, :created_at, :updated_at
         )
         """
@@ -141,6 +150,9 @@ class WorkloadRepository:
             "host_affinity": json.dumps(payload.host_affinity),
             "on_success": json.dumps(payload.on_success) if payload.on_success else None,
             "on_failure": json.dumps(payload.on_failure) if payload.on_failure else None,
+            "supervisor_enabled": 1 if payload.supervisor_enabled else 0,
+            "max_concurrent_per_host": payload.max_concurrent_per_host,
+            "requires_gpu": 1 if payload.requires_gpu else 0,
             "updated_at": now,
         }
         sql = """
@@ -160,6 +172,9 @@ class WorkloadRepository:
             host_affinity = :host_affinity,
             on_success = :on_success,
             on_failure = :on_failure,
+            supervisor_enabled = :supervisor_enabled,
+            max_concurrent_per_host = :max_concurrent_per_host,
+            requires_gpu = :requires_gpu,
             updated_at = :updated_at
         WHERE slug = :slug
         """
@@ -175,6 +190,125 @@ class WorkloadRepository:
                 {"en": 1 if enabled else 0, "ts": _utcnow(), "slug": slug},
             )
         return self.get(slug)
+
+    def set_supervisor_enabled(self, slug: str, enabled: bool) -> Workload:
+        """supervisor の自動介入を許可するか個別 toggle。"""
+        self.get(slug)  # raises if not found
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE workloads SET supervisor_enabled = :en, updated_at = :ts "
+                "WHERE slug = :slug",
+                {"en": 1 if enabled else 0, "ts": _utcnow(), "slug": slug},
+            )
+        return self.get(slug)
+
+    def record_vram_observation(
+        self, slug: str, used_mb: int, worker_id: str | None = None,
+    ) -> Workload | None:
+        """worker からの VRAM 観測値を peak に反映 + raw sample を保存。
+
+        peak: max(prev * 0.95, incoming) で平滑化 (= 急増は即時、減少はゆるく)。
+        raw: vram_observations 表に (slug, worker_id, ts, used_mb) で INSERT。
+             配置設計 (= avg/p95) 用、 reaper で 1h より古いものは削除。
+        slug 未登録 (= 削除済) なら None。
+        """
+        if used_mb is None or used_mb < 0:
+            return None
+        try:
+            current = self.get(slug)
+        except WorkloadNotFound:
+            return None
+        prev = current.observed_vram_mb_peak or 0
+        new_peak = max(int(prev * 0.95), int(used_mb))
+        ts = _utcnow()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """UPDATE workloads SET
+                       observed_vram_mb_peak = :peak,
+                       observed_vram_sample_count = observed_vram_sample_count + 1,
+                       observed_vram_updated_at = :ts
+                   WHERE slug = :slug""",
+                {"peak": new_peak, "ts": ts, "slug": slug},
+            )
+            # raw sample 保存 (= avg/p95 集計の元データ)。 worker_id 未指定でも保存する
+            # (= "unknown" worker として記録)、 PK 衝突は ts の microsecond で実質回避。
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO vram_observations
+                           (slug, worker_id, ts, used_mb)
+                       VALUES (:slug, :wid, :ts, :mb)""",
+                    {
+                        "slug": slug,
+                        "wid": worker_id or "unknown",
+                        "ts": ts,
+                        "mb": int(used_mb),
+                    },
+                )
+            except Exception:
+                # raw 保存失敗で peak 更新を壊さないように吸収
+                pass
+        return self.get(slug)
+
+    def aggregate_vram_avg_p95(self, window_minutes: int = 60) -> int:
+        """vram_observations から workload ごとの直近 N 分の avg/p95 を計算して
+        workloads.observed_vram_mb_avg/p95 を一括 UPDATE。 返り値 = 更新 workload 数。
+
+        p95 は SQLite に組込みが無いので Python 側で計算 (= small dataset 前提、
+        1h で 4-12k 行程度想定)。
+        """
+        import datetime as _dt
+        cutoff = (_dt.datetime.now(_dt.timezone.utc)
+                  - _dt.timedelta(minutes=window_minutes)).isoformat()
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "SELECT slug, used_mb FROM vram_observations WHERE ts >= :c",
+                {"c": cutoff},
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return 0
+        # group by slug
+        from collections import defaultdict
+        samples: dict[str, list[int]] = defaultdict(list)
+        for r in rows:
+            s = r["slug"] if hasattr(r, "keys") else r[0]
+            mb = r["used_mb"] if hasattr(r, "keys") else r[1]
+            try:
+                samples[s].append(int(mb))
+            except Exception:
+                continue
+        updated = 0
+        ts = _utcnow()
+        with self.db.transaction() as conn:
+            for slug, vals in samples.items():
+                vals.sort()
+                avg = int(sum(vals) / len(vals))
+                p95_idx = max(0, int(len(vals) * 0.95) - 1)
+                p95 = vals[p95_idx]
+                try:
+                    conn.execute(
+                        """UPDATE workloads SET
+                               observed_vram_mb_avg = :a,
+                               observed_vram_mb_p95 = :p,
+                               observed_vram_updated_at = :ts
+                           WHERE slug = :s""",
+                        {"a": avg, "p": p95, "ts": ts, "s": slug},
+                    )
+                    updated += 1
+                except Exception:
+                    continue
+        return updated
+
+    def prune_vram_observations(self, retain_minutes: int = 60) -> int:
+        """古い vram_observations を削除。 返り値 = 削除行数。"""
+        import datetime as _dt
+        cutoff = (_dt.datetime.now(_dt.timezone.utc)
+                  - _dt.timedelta(minutes=retain_minutes)).isoformat()
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM vram_observations WHERE ts < :c", {"c": cutoff}
+            )
+            return cur.rowcount or 0
 
     # ---------- DELETE ----------
 

@@ -49,6 +49,25 @@ class WorkloadBase(BaseModel):
     on_success: dict[str, Any] | None = None
     on_failure: dict[str, Any] | None = None
 
+    # supervisor (= 自動オーケストレーター) が patch_workload / filter 変更系の
+    # action をこの workload に対して実行することを許可するか。 既定 True (= 任せる)。
+    # オペレータが手で値を握りたい局面(= 例: paprika-job-submit を最大化テスト中)で
+    # False にすると、 supervisor は streak/cooldown は数えるが action は no-op に。
+    supervisor_enabled: bool = True
+
+    # 同一 host 上で同時に実行できる worker 数の上限。 None = 無制限 (= 既定)。
+    # 用途: image-embed のように cuBLAS init で大きく VRAM を確保する plugin で、
+    # 同一 GPU を多重起動して CUBLAS_STATUS_ALLOC_FAILED で setup 死亡するのを防ぐ。
+    # workloads_for_worker が claim 候補から外す形で適用 (= best-effort)。
+    max_concurrent_per_host: int | None = Field(default=None, ge=1, le=100)
+
+    # GPU heavy か CPU only か (2026-06-28、 静的配置設計用)。
+    # True = ONNX/CUDA を使う、 GPU host に置く。
+    # False (=既定) = web/IO bound、 CPU host で十分。
+    # operator が workload_filter を作るときに「この worker (GPU host) には
+    # requires_gpu=True のものだけ」 と判断するために使う。 ランタイム判定はしない。
+    requires_gpu: bool = False
+
     @field_validator("host_affinity", mode="before")
     @classmethod
     def _coerce_host_affinity(cls, v: Any) -> list[str]:
@@ -93,6 +112,14 @@ class Workload(WorkloadBase):
     observed_depth: int = 0
     observed_age_secs: int = 0
     observed_rate: float = 0.0
+    # worker self-report VRAM peak (install-multi-worker.sh が自動 N 算定に使う)
+    observed_vram_mb_peak: int | None = None
+    # avg/p95 は周期サンプリングの移動集計 (= 配置設計の実態値)。 peak だけだと
+    # 並列度を過小設計してしまう (= 1 度の peak で 全 worker 分を予約してしまう)。
+    observed_vram_mb_avg: int | None = None
+    observed_vram_mb_p95: int | None = None
+    observed_vram_sample_count: int = 0
+    observed_vram_updated_at: datetime | None = None
     created_by: str | None = None
     created_at: datetime
     updated_at: datetime
