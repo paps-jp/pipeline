@@ -11,6 +11,8 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
+  IconAdjustmentsHorizontal,
+  IconBook2,
   IconDashboard,
   IconLanguage,
   IconList,
@@ -18,24 +20,26 @@ import {
   IconPuzzle,
   IconRocket,
   IconScript,
+  IconSettings,
+  IconSitemap,
   IconSun,
   IconUsersGroup,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { NavLink as RouterNavLink, Route, Routes } from "react-router-dom";
+import { Link as RouterLink, NavLink as RouterNavLink, Route, Routes } from "react-router-dom";
 
 import { api } from "@/api/client";
 import { PageTransition } from "@/components/PageTransition";
 import Dashboard from "./pages/Dashboard";
 import Deploy from "./pages/Deploy";
+import Flow from "./pages/Flow";
+import OrchestrationControl from "./pages/OrchestrationControl";
 import PluginPanel from "./pages/PluginPanel";
+import Settings from "./pages/Settings";
 import ServiceLog from "./pages/ServiceLog";
 import Workers from "./pages/Workers";
 import Workloads from "./pages/Workloads";
-
-const HEADER_LABEL_COLOR = "rgba(255,255,255,0.65)";
-const HEADER_VALUE_COLOR = "rgba(255,255,255,0.95)";
 
 function HeaderStatus() {
   const { t } = useTranslation();
@@ -48,21 +52,15 @@ function HeaderStatus() {
     ? new Date(statusQ.data.now).toLocaleString()
     : "—";
 
+  // テーマ対応: Mantine の標準色トークンを使うことで light/dark で自動反転
+  // (= 旧 hard-coded white は light テーマで白背景に白文字になり見えなかった)。
   return (
     <Group gap="lg" wrap="nowrap" style={{ overflowX: "auto" }}>
       <Group gap={6} wrap="nowrap">
-        <Text size="xs" style={{ color: HEADER_LABEL_COLOR }}>
-          {t("header.control_plane")}
-        </Text>
-        <Text size="xs" fw={700} style={{ color: HEADER_VALUE_COLOR }}>
-          {statusQ.data?.mode ?? "—"}
-        </Text>
-      </Group>
-      <Group gap={6} wrap="nowrap">
-        <Text size="xs" style={{ color: HEADER_LABEL_COLOR }}>
+        <Text size="xs" c="dimmed">
           {t("header.last_update")}
         </Text>
-        <Text size="xs" style={{ color: HEADER_VALUE_COLOR, fontFamily: "ui-monospace, monospace" }}>
+        <Text size="xs" style={{ fontFamily: "ui-monospace, monospace" }}>
           {lastUpdate}
         </Text>
       </Group>
@@ -126,6 +124,18 @@ export default function App() {
               hiddenFrom="sm"
               size="sm"
             />
+            <RouterLink
+              to="/"
+              aria-label="Home"
+              style={{ display: "inline-flex", lineHeight: 0 }}
+            >
+              <img
+                src="/logo.png"
+                alt="pipeline-oss logo"
+                height={36}
+                style={{ display: "block", filter: "drop-shadow(0 2px 4px rgba(110,125,255,0.25))" }}
+              />
+            </RouterLink>
             <Title
               order={3}
               style={{
@@ -144,6 +154,19 @@ export default function App() {
             <HeaderStatus />
           </Group>
           <Group gap="xs">
+            <Tooltip label={t("header.manual", "マニュアル (新しいタブで開く)")}>
+              <ActionIcon
+                variant="subtle"
+                color="indigo"
+                component="a"
+                href="https://paps-jp.github.io/pipeline/"
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="Manual"
+              >
+                <IconBook2 size={18} />
+              </ActionIcon>
+            </Tooltip>
             <Tooltip label={t("header.toggle_lang")}>
               <ActionIcon
                 variant="subtle"
@@ -177,6 +200,18 @@ export default function App() {
           end
         />
         <NavLink
+          label={t("nav.flow", "フロー図")}
+          leftSection={<IconSitemap size={18} />}
+          component={RouterNavLink}
+          to="/flow"
+        />
+        <NavLink
+          label={t("nav.orchestration", "流量制御")}
+          leftSection={<IconAdjustmentsHorizontal size={18} />}
+          component={RouterNavLink}
+          to="/orchestration"
+        />
+        <NavLink
           label={t("nav.workloads")}
           leftSection={<IconList size={18} />}
           component={RouterNavLink}
@@ -199,6 +234,12 @@ export default function App() {
           leftSection={<IconRocket size={18} />}
           component={RouterNavLink}
           to="/deploy"
+        />
+        <NavLink
+          label={t("nav.settings", "設定")}
+          leftSection={<IconSettings size={18} />}
+          component={RouterNavLink}
+          to="/settings"
         />
         {uiPlugins.length > 0 && (
           <Text size="xs" c="dimmed" px="sm" mt="md" mb={4}>
@@ -226,12 +267,15 @@ export default function App() {
         <Routes>
           <Route element={<PageTransition />}>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/flow" element={<Flow />} />
+            <Route path="/orchestration" element={<OrchestrationControl />} />
             <Route path="/workloads" element={<Workloads />} />
             <Route path="/workloads/:slug" element={<Workloads />} />
             <Route path="/workloads/:slug/runs" element={<Workloads />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/logs" element={<ServiceLog />} />
             <Route path="/deploy" element={<Deploy />} />
+            <Route path="/settings" element={<Settings />} />
             <Route path="/plugins/:slug" element={<PluginPanel />} />
           </Route>
         </Routes>

@@ -177,6 +177,7 @@ export default function Workloads() {
               <Table.Th>{t("workloads.priority")}</Table.Th>
               <Table.Th>{t("workloads.weight")}</Table.Th>
               <Table.Th>{t("workloads.batch")}</Table.Th>
+              <Table.Th>VRAM (declared / observed)</Table.Th>
               <Table.Th aria-label="actions" />
             </Table.Tr>
           </Table.Thead>
@@ -213,6 +214,34 @@ export default function Workloads() {
                 <Table.Td>{w.priority}</Table.Td>
                 <Table.Td>{w.weight.toFixed(2)}</Table.Td>
                 <Table.Td>{w.batch_size}</Table.Td>
+                <Table.Td>
+                  {(() => {
+                    const declared = (w.resources as Record<string, unknown> | undefined)?.vram_mb;
+                    const declaredNum = typeof declared === "number" ? declared : Number(declared);
+                    const observed = w.observed_vram_mb_peak;
+                    const samples = w.observed_vram_sample_count ?? 0;
+                    const fmt = (mb: number | null | undefined) =>
+                      mb && mb > 0 ? `${(mb / 1024).toFixed(2)} GB` : "—";
+                    // 観測値が宣言値を超えてたら警告色 (= OOM リスク)、 観測 << 宣言 なら情報色 (= 過大宣言)
+                    const drift =
+                      observed && declaredNum
+                        ? observed / declaredNum
+                        : null;
+                    const color =
+                      drift === null ? "dimmed" : drift > 1.0 ? "red" : drift < 0.6 ? "blue" : "dimmed";
+                    return (
+                      <Stack gap={0}>
+                        <Text size="xs" c="dimmed">
+                          decl {fmt(Number.isFinite(declaredNum) ? declaredNum : null)}
+                        </Text>
+                        <Text size="xs" c={color} fw={observed ? 600 : 400}>
+                          obs {fmt(observed)}
+                          {samples > 0 ? ` (n=${samples})` : ""}
+                        </Text>
+                      </Stack>
+                    );
+                  })()}
+                </Table.Td>
                 <Table.Td>
                   <Group gap={4} wrap="nowrap" justify="flex-end">
                     <ActionIcon
