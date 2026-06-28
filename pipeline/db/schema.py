@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS workloads (
     observed_vram_sample_count INTEGER NOT NULL DEFAULT 0,
     observed_vram_updated_at  TEXT,
 
+    -- 業務 queue の格納先 backend (Phase 2-α 2026-06-29)。
+    -- 'sqlite' (= 既定、 control plane と同居) / 'mariadb' (= secondary_db)。
+    -- worker/control が workload 毎にこの値で QueueRepository の backend を切替。
+    queue_backend        TEXT NOT NULL DEFAULT 'sqlite',
+
     created_by           TEXT,
     created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -67,6 +72,9 @@ WORKLOADS_ALTERS = [
     # sliding window で集計。 NULL = 未計測。
     "ALTER TABLE workloads ADD COLUMN observed_vram_mb_avg INTEGER",
     "ALTER TABLE workloads ADD COLUMN observed_vram_mb_p95 INTEGER",
+    # 業務 queue 移行 (Phase 2-α 2026-06-29)。 queue の格納先 backend。
+    # 'sqlite' (= 既定) / 'mariadb' (= secondary_db)。 workload 毎に切替。
+    "ALTER TABLE workloads ADD COLUMN queue_backend TEXT NOT NULL DEFAULT 'sqlite'",
 ]
 
 # workers テーブルへの後付け列 (= 既存 DB を壊さず adopt)
