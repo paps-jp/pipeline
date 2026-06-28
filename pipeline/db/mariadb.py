@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import threading
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
@@ -72,6 +73,36 @@ def _convert_dialect(sql: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# param 変換: SQLite は datetime を ISO8601 文字列 ("...T...+00:00") で保存するが、
+#   MariaDB の DATETIME は 'YYYY-MM-DD HH:MM:SS.ffffff' (T/タイムゾーン不可) 。
+#   QueueRepository は UTC 前提なので tz を落として wall-clock を保持する。
+#   exact-match claim (WHERE claimed_at=:now) を成立させるため、 対象列は
+#   DATETIME(6) にしてマイクロ秒を保持する (= ensure_workload_queue / ALTER 側)。
+# ---------------------------------------------------------------------------
+_ISO_DT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)?$"
+)
+
+
+def _coerce_param(v: Any) -> Any:
+    """ISO8601 datetime 文字列を MariaDB DATETIME 形式に変換。 それ以外は素通し。"""
+    if isinstance(v, str) and _ISO_DT_RE.match(v):
+        try:
+            return datetime.fromisoformat(v).strftime("%Y-%m-%d %H:%M:%S.%f")
+        except ValueError:
+            return v
+    return v
+
+
+def _coerce_params(params: Any) -> Any:
+    if isinstance(params, dict):
+        return {k: _coerce_param(v) for k, v in params.items()}
+    if isinstance(params, (list, tuple)):
+        return type(params)(_coerce_param(v) for v in params)
+    return params
+
+
+# ---------------------------------------------------------------------------
 # Cursor / Connection / Database 実装
 # ---------------------------------------------------------------------------
 
@@ -99,14 +130,14 @@ class MariadbConnection(Connection):
         sql_converted = _convert_dialect(sql)
         cur = self._conn.cursor(DictCursor)
         # tuple params も dict params も両対応 (= sqlite.py と同型)
-        cur.execute(sql_converted, params or None)
+        cur.execute(sql_converted, _coerce_params(params) or None)
         return MariadbCursor(cur)
 
     def executemany(self, sql: str, seq_params: list[tuple]) -> None:
         sql_converted = _convert_dialect(sql)
         cur = self._conn.cursor()
         try:
-            cur.executemany(sql_converted, seq_params)
+            cur.executemany(sql_converted, [_coerce_params(p) for p in seq_params])
         finally:
             cur.close()
 
