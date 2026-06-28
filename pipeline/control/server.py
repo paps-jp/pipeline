@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from pipeline import __version__
-from pipeline.api import admin_cmds, admin_deploy, dashboard, plugin_runtime, plugins_local, service_logs, system, workers, workloads
+from pipeline.api import admin_cmds, admin_deploy, dashboard, flow, plugin_runtime, plugins_local, service_logs, settings as settings_api, system, workers, workloads
 from pipeline.config import Settings
 from pipeline.db import get_db
 from pipeline.worker.drain import Worker
@@ -130,13 +130,39 @@ def create_app(settings: Settings) -> FastAPI:
         selfloop_watchdog = SelfLoopWatchdog(db)
         selfloop_watchdog.start()
 
+        # VRAM aggregator: vram_observations から workloads.observed_vram_mb_avg/p95
+        # を 60s 周期で再計算 + 60min より古い raw を prune (= 配置設計用データ)
+        from pipeline.repositories.workloads import WorkloadRepository as _WR
+        _vram_stop = _asyncio.Event()
+        async def _vram_aggregator_loop() -> None:
+            wlrepo = _WR(db)
+            while not _vram_stop.is_set():
+                try:
+                    updated = wlrepo.aggregate_vram_avg_p95(window_minutes=60)
+                    pruned = wlrepo.prune_vram_observations(retain_minutes=60)
+                    if updated or pruned:
+                        log.info("vram aggregator: updated=%d pruned=%d",
+                                 updated, pruned)
+                except Exception:
+                    log.exception("vram aggregator failed")
+                try:
+                    await _asyncio.wait_for(_vram_stop.wait(), timeout=60)
+                except _asyncio.TimeoutError:
+                    pass
+        vram_agg_task = _asyncio.create_task(_vram_aggregator_loop())
+
         try:
             yield
         finally:
             log.info("pipeline shutting down")
             _reaper_stop.set()
+            _vram_stop.set()
             try:
                 await _asyncio.wait_for(reaper_task, timeout=3)
+            except Exception:
+                pass
+            try:
+                await _asyncio.wait_for(vram_agg_task, timeout=3)
             except Exception:
                 pass
             try:
@@ -175,7 +201,9 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(admin_cmds.router)
     app.include_router(admin_cmds.admin_router)
     app.include_router(dashboard.router)
+    app.include_router(flow.router)
     app.include_router(plugin_runtime.router)
+    app.include_router(settings_api.router)
     # MinIO プロキシ (= プラグイン UI が顔サムネ等を <img> で見るため)
     from pipeline.api import minio_proxy as _mp
     app.include_router(_mp.router)
@@ -185,9 +213,23 @@ def create_app(settings: Settings) -> FastAPI:
         app.mount("/assets", StaticFiles(directory=_WEB_STATIC_DIR / "assets"),
                   name="assets")
 
+        # root 直下に置いた static (logo.png / favicon.ico 等) を返す
+        # spa_fallback より先に判定する。 ディレクトリ traversal は
+        # ".." を含む path で防ぐ (= FastAPI が path param に許可しても
+        # resolve 後に _WEB_STATIC_DIR 外なら 404)。
+        from fastapi.responses import FileResponse
+
         @app.get("/", include_in_schema=False)
         @app.get("/{path:path}", include_in_schema=False)
-        def spa_fallback(path: str = "") -> HTMLResponse:
+        def spa_fallback(path: str = "") -> "HTMLResponse | FileResponse":
+            if path and "/" not in path and ".." not in path:
+                candidate = (_WEB_STATIC_DIR / path).resolve()
+                try:
+                    candidate.relative_to(_WEB_STATIC_DIR.resolve())
+                except ValueError:
+                    candidate = None
+                if candidate and candidate.is_file():
+                    return FileResponse(candidate)
             index = _WEB_STATIC_DIR / "index.html"
             if index.exists():
                 return HTMLResponse(index.read_text(encoding="utf-8"))
