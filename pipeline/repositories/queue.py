@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -78,6 +79,21 @@ class QueueRepository:
         if self._backend_map.get(queue_table) == "secondary" and self.secondary_db is not None:
             return self.secondary_db
         return self.db
+
+    def wire_from_workloads(self, workloads: Iterable[Any]) -> None:
+        """各 workload.queue_backend を見て backend を一括配線。
+
+        'mariadb' → secondary、 それ以外 (= 'sqlite' / 想定外値) → primary。
+        secondary_db=None なら set_backend が secondary を無視するので、
+        全 workload が primary 動作のまま (= 後方互換)。 起動時と workload reload で呼ぶ。
+
+        各 workload は ``slug`` ではなく ``queue_table`` 名で配線する (= QueueRepository
+        の API が queue_table 単位のため)。 queue_backend 属性が無いオブジェクトは
+        'sqlite' 扱い (= primary)。
+        """
+        for w in workloads:
+            backend = "secondary" if getattr(w, "queue_backend", "sqlite") == "mariadb" else "primary"
+            self.set_backend(w.queue_table, backend)
 
     def enqueue(self, queue_table: str, pk: str, extra: dict[str, Any] | None = None) -> bool:
         """重複 pk は INSERT OR IGNORE で黙ってスキップ。1 件挿入できたら True。"""
