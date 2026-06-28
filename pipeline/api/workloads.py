@@ -69,6 +69,18 @@ class QueueStats(BaseModel):
     total: int
 
 
+class VramObservationRequest(BaseModel):
+    """worker が報告する自分のプロセス VRAM 占有値 (= nvidia-smi の compute-apps used_memory)。"""
+    worker_id: str | None = None
+    used_mb: int = Field(ge=0, le=200_000, description="自プロセスの GPU VRAM 占有 (MB)")
+
+
+class VramObservationResponse(BaseModel):
+    accepted: bool
+    observed_vram_mb_peak: int | None = None
+    observed_vram_sample_count: int = 0
+
+
 def _repo(request: Request) -> WorkloadRepository:
     return WorkloadRepository(request.app.state.db)
 
@@ -135,6 +147,19 @@ def patch_enabled(slug: str, body: EnableRequest, request: Request) -> Workload:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
+@router.patch("/{slug}/supervisor_enabled", response_model=Workload)
+def patch_supervisor_enabled(slug: str, body: EnableRequest, request: Request) -> Workload:
+    """supervisor (= 自動オーケストレーター) によるこの workload への介入を
+    許可するか個別 toggle。 False のとき: supervisor はルール条件は評価するが、
+    patch_workload / filter 変更系の action は no-op (log のみ)。 オペレータが
+    手で priority/batch_size 等を握りたい場面用 (= max throughput テスト等)。
+    """
+    try:
+        return _repo(request).set_supervisor_enabled(slug, body.enabled)
+    except WorkloadNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
 @router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_workload(slug: str, request: Request) -> None:
     try:
@@ -174,6 +199,30 @@ def get_queue_stats(slug: str, request: Request) -> QueueStats:
     w = _get_or_404(request, slug)
     by_state = _queue_repo(request).count_by_state(w.queue_table)
     return QueueStats(by_state=by_state, total=sum(by_state.values()))
+
+
+@router.post(
+    "/{slug}/vram_observation",
+    response_model=VramObservationResponse,
+    status_code=status.HTTP_200_OK,
+)
+def post_vram_observation(
+    slug: str, body: VramObservationRequest, request: Request
+) -> VramObservationResponse:
+    """worker が自プロセスの VRAM 占有を報告 → workload 行の peak を更新。
+    install-multi-worker.sh の自動 N 算定が次回起動時にこの値を読む。
+    """
+    w = _get_or_404(request, slug)
+    updated = _repo(request).record_vram_observation(
+        w.slug, body.used_mb, worker_id=body.worker_id,
+    )
+    if updated is None:
+        return VramObservationResponse(accepted=False)
+    return VramObservationResponse(
+        accepted=True,
+        observed_vram_mb_peak=updated.observed_vram_mb_peak,
+        observed_vram_sample_count=updated.observed_vram_sample_count,
+    )
 
 
 @router.get("/{slug}/runs", response_model=RunsListResponse)

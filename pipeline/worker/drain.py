@@ -198,8 +198,18 @@ class Worker:
         workloads = self._workloads.list_all()
         any_work = False
         seen_slugs: set[str] = set()
+        # PIPELINE_WORKLOAD_FILTER env で「自 process はこの slug 群しか claim しない」
+        # を強制 (CSV)。 空 = 全 workload 対象 (= 既存互換)。
+        # 目的: torch 系 workload を別 process に分離 = 同 process での preempt 切替に
+        # よる torch.compiler._cache.CacheArtifactFactory.register の二重登録
+        # (= "Artifact of type=precompile already registered in mega-cache" assert) を回避。
+        _filter_env = os.environ.get("PIPELINE_WORKLOAD_FILTER", "").strip()
+        _allowed = {s.strip() for s in _filter_env.split(",") if s.strip()}
         for w in workloads:
             seen_slugs.add(w.slug)
+            if _allowed and w.slug not in _allowed:
+                self._evict_if_cached(w.slug)
+                continue
             if not w.enabled:
                 # disable された workload の executor を解放
                 self._evict_if_cached(w.slug)
@@ -258,6 +268,13 @@ class Worker:
 
     async def _execute_one(self, w: Any, executor: Any, t: ClaimedTask) -> None:
         started = _utcnow_iso()
+        run_id = self._runs.start(
+            workload_slug=w.slug,
+            pk=t.pk,
+            worker_id=self.worker_id,
+            attempt=t.attempt,
+            started_at=started,
+        )
         # task workdir (一時ディレクトリ)
         workdir = Path(tempfile.mkdtemp(prefix=f"pipeline-{w.slug}-"))
         deadline = datetime.now(timezone.utc) + timedelta(seconds=int(w.lease_secs))
@@ -290,12 +307,8 @@ class Worker:
                 w.queue_table, t.pk, max_attempts=w.max_attempts, error=(result.error or result.stderr or "non-zero exit")[:4000],
             )
 
-        self._runs.record(
-            workload_slug=w.slug,
-            pk=t.pk,
-            worker_id=self.worker_id,
-            attempt=t.attempt,
-            started_at=started,
+        self._runs.finish(
+            run_id,
             success=is_success,
             exit_code=result.exit_code,
             duration_ms=result.duration_ms,

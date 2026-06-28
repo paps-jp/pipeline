@@ -98,6 +98,52 @@ def _measure_self_vram_mb(pid: int) -> int | None:
     return total if found else None
 
 
+def _measure_gpu_capacity_mb() -> int | None:
+    """この host の GPU 全体 (= 全 GPU 合算) の物理 VRAM 容量 (MB) を nvidia-smi で取得。
+    register 時に 1 回呼ぶ。 GPU 無し / コマンド無し時は None。
+
+    用途: control plane の `workloads_for_worker` が host あたり VRAM 予算 (= 各
+    workload の `observed_vram_mb_peak` 合計を capacity * 0.85 以内に収める) で
+    claim 候補をフィルタするため、 worker が host capacity を申告する。
+    """
+    try:
+        p = _subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4,
+        )
+        if p.returncode != 0:
+            return None
+    except (FileNotFoundError, _subprocess.TimeoutExpired, Exception):
+        return None
+    total = 0
+    for line in p.stdout.strip().splitlines():
+        try:
+            total += int(line.strip())
+        except Exception:
+            continue
+    return total if total > 0 else None
+
+
+def _host_cpu_pct() -> float | None:
+    """ホスト全体の CPU 利用率を /proc/loadavg + nproc から概算。
+    psutil 不要 (= 標準 lib のみ)。 load1 / cores * 100 で 0-100% にクリップ。
+    Linux 以外 / ファイル無しの場合は None。
+    """
+    try:
+        with open("/proc/loadavg") as f:
+            load1 = float(f.read().split()[0])
+        try:
+            cores = int(os.sched_getaffinity(0).__len__())  # type: ignore[attr-defined]
+        except Exception:
+            cores = os.cpu_count() or 1
+        if cores <= 0:
+            return None
+        return min(100.0, round(load1 / cores * 100.0, 1))
+    except Exception:
+        return None
+
+
 def _nvidia_smi_gpus() -> list[dict[str, Any]]:
     """nvidia-smi で GPU 温度/使用率/メモリ/電力等を取得。 GPU 無し / コマンド無し時は空 list。"""
     try:
@@ -126,6 +172,13 @@ def _nvidia_smi_gpus() -> list[dict[str, Any]]:
         v = _f(s)
         return int(v) if v is not None else None
 
+    # MPS (Multi-Process Service) 起動下では driver の `utilization.gpu` /
+    # `utilization.memory` カウンタが常に 0 を返す (= nvidia-smi pmon も同様)。
+    # 結果として GPU が 400W で稼働中でも UI チャートが平坦に 0 で出てしまう。
+    # 暫定対処: util_pct=0 だが power_w > 30W のときは power/TDP 比で util を
+    # 推定する (= 視覚的に活動が分かる状態に)。 TDP は env で host 毎に上書き可。
+    _tdp_w = float(os.environ.get("PIPELINE_GPU_TDP_W") or 350)
+
     out: list[dict[str, Any]] = []
     for line in p.stdout.strip().splitlines():
         parts = [s.strip() for s in line.split(",")]
@@ -135,14 +188,30 @@ def _nvidia_smi_gpus() -> list[dict[str, Any]]:
             idx = int(parts[0])
         except (ValueError, IndexError):
             continue
+        util_raw = _f(parts[2]) if len(parts) > 2 else None
+        mem_util_raw = _f(parts[3]) if len(parts) > 3 else None
+        power_w = _f(parts[6]) if len(parts) > 6 else None
+
+        # power-derived util (= MPS 配下の workaround)
+        util_pct = util_raw
+        if (util_pct is None or util_pct == 0.0) and power_w is not None and power_w > 30.0:
+            util_pct = round(min(100.0, max(0.0, power_w / _tdp_w * 100.0)), 1)
+
+        # mem_util_pct も同様に 0 になる → mem_used/mem_total の占有率で代替
+        mem_used = _i(parts[4]) if len(parts) > 4 else None
+        mem_total = _i(parts[5]) if len(parts) > 5 else None
+        mem_util_pct = mem_util_raw
+        if (mem_util_pct is None or mem_util_pct == 0.0) and mem_used and mem_total:
+            mem_util_pct = round(mem_used / mem_total * 100.0, 1)
+
         row: dict[str, Any] = {
             "gpu_idx": idx,
             "temp_c": _f(parts[1]) if len(parts) > 1 else None,
-            "util_pct": _f(parts[2]) if len(parts) > 2 else None,
-            "mem_util_pct": _f(parts[3]) if len(parts) > 3 else None,
-            "mem_used_mb": _i(parts[4]) if len(parts) > 4 else None,
-            "mem_total_mb": _i(parts[5]) if len(parts) > 5 else None,
-            "power_w": _f(parts[6]) if len(parts) > 6 else None,
+            "util_pct": util_pct,
+            "mem_util_pct": mem_util_pct,
+            "mem_used_mb": mem_used,
+            "mem_total_mb": mem_total,
+            "power_w": power_w,
             "sm_clock_mhz": _i(parts[7]) if len(parts) > 7 else None,
             "mem_clock_mhz": _i(parts[8]) if len(parts) > 8 else None,
         }
@@ -210,6 +279,15 @@ class ControlClient:
         r = await self._client.get(f"{self.base}/api/v1/workers/{worker_id}/workloads")
         r.raise_for_status()
         return r.json().get("workloads", [])
+
+    async def get_config(self, worker_id: str) -> dict[str, Any]:
+        """control plane の worker 設定 (= workload_filter 等) を取得。
+        worker daemon が 30s 毎に poll する。"""
+        r = await self._client.get(
+            f"{self.base}/api/v1/workers/{worker_id}/config", timeout=10.0,
+        )
+        r.raise_for_status()
+        return r.json()
 
     async def peek_higher_pending(self, worker_id: str, priority: int) -> bool:
         """Lv2 preemption: priority > `priority` の workload に pending あるか。"""
@@ -343,17 +421,64 @@ class WorkerDaemon:
         # workload ごとの自プロセス VRAM 占有 peak と、 直近 report 時刻 (rate limit 用)
         self._vram_peaks: dict[str, int] = {}
         self._vram_last_report: dict[str, float] = {}
+        # GPU サーマルスロットル状態 (hysteresis)
+        # - 温度 ≥ hot → throttled=True (= GPU 必要な workload は claim 拒否)
+        # - 温度 ≤ cool → throttled=False (= 受付再開)
+        # CPU-only workload (resources.vram_mb=0) は throttled でも継続受付。
+        # 環境変数で閾値設定可: PAPRIKA_GPU_HOT_C / PAPRIKA_GPU_COOL_C
+        self._gpu_throttle = False
+        self._gpu_temp_c: float | None = None
+        self._gpu_hot_c = float(os.environ.get("PAPRIKA_GPU_HOT_C", "70"))
+        self._gpu_cool_c = float(os.environ.get("PAPRIKA_GPU_COOL_C", "50"))
+        # ---------------- starvation prevention (= ハード floor) ----------------
+        # 自 instance が複数 workload を兼任してる時、 特定 workload (= 60s lease の
+        # paprika-job-submit 等) が monopoly して他の workload (= video-dispatcher 等)
+        # の claim が永遠に来ない事故を防ぐ。 PIPELINE_STARVATION_FLOOR_S 秒以上
+        # claim していない workload は priority に関係なく iteration を先頭にする。
+        # 0 で機能オフ。 既定 60 秒。
+        self._last_claim_at: dict[str, float] = {}
+        self._starvation_floor_s = float(
+            os.environ.get("PIPELINE_STARVATION_FLOOR_S", "60")
+        )
+        # ---------------- workload filter (= 自動切替 SoT) ----------------
+        # SoT は control plane の workers.workload_filter (= None なら env fallback)。
+        # _filter_reload_loop が 30s 毎に poll して更新、 _drain_once が読む。
+        # 起動時は env でブート (= 旧挙動互換)、 control plane から下りてきたら上書き。
+        env_filter = os.environ.get("PIPELINE_WORKLOAD_FILTER", "").strip()
+        env_allowed: set[str] | None = None
+        if env_filter:
+            env_allowed = {s.strip() for s in env_filter.split(",") if s.strip()}
+        # None = no filter (= 全 workload claim 可)。 set() (= 空) は「何も claim しない」 ではなく、
+        # 「明示的に env fallback も無い解除状態」 として None と同じ扱いにする。
+        self._filter: set[str] | None = env_allowed
+        self._filter_source: str = "env" if env_allowed else "none"
+        self._filter_reload_interval_s = float(
+            os.environ.get("PIPELINE_WORKER_FILTER_RELOAD_S", "30")
+        )
 
     async def run(self) -> int:
         """blocking entry — register → loops → deregister."""
         self._install_signals()
+        # env 由来の filter (= systemd PIPELINE_WORKLOAD_FILTER) を register に申告。
+        # server 側は env_filter 列に保存し、 DB filter=null の時の base としてマージ
+        # 操作(POST /workers/{id}/filter mode=add)で「env を奪わない」 動作の根拠にする。
+        env_filter_list: list[str] | None = (
+            sorted(self._filter) if self._filter else None
+        )
+        # GPU 容量を register 時に申告。 control plane の VRAM 予算チェックの基準。
+        # 失敗 (CPU host / nvidia-smi 無し) は申告省略 (= 既存 fail-open で skip される)。
+        gpu_capacity_mb = _measure_gpu_capacity_mb()
+        resources: dict[str, Any] = {}
+        if gpu_capacity_mb is not None and gpu_capacity_mb > 0:
+            resources["gpu_vram_mb"] = gpu_capacity_mb
         try:
             registered = await self._client.register({
                 "host": self.hostname,
                 "pid": os.getpid(),
                 "tags": [],
-                "resources": {},
+                "resources": resources,
                 "worker_id": self.worker_id_hint,
+                "env_filter": env_filter_list,
             })
         except Exception:
             log.exception("register failed; cannot start worker")
@@ -368,6 +493,7 @@ class WorkerDaemon:
                 self._drain_loop(),
                 self._admin_loop(),
                 self._self_update_loop(),
+                self._filter_reload_loop(),
             )
         except asyncio.CancelledError:
             pass
@@ -414,6 +540,73 @@ class WorkerDaemon:
                 # 1 秒待って systemd に明示の exit code で死ぬ
                 await asyncio.sleep(1)
                 os._exit(42)
+
+    async def _filter_reload_loop(self) -> None:
+        """control plane の worker config を 30s 毎に poll し、 filter 変更を反映。
+
+        - workload_filter が None (= 解除) なら env fallback → なければ全 workload 対象。
+        - 変更時は executor cache 全 evict (= 旧 workload プロセスが残る torch state を破棄)。
+        - 同値なら no-op。 worker daemon 起動直後は env で boot されているので、
+          control plane が空のまま (= 過去に POST されてない) なら何も触らない。
+        """
+        log.info(
+            "filter reload watch: poll every %.1fs (boot filter = %s, source=%s)",
+            self._filter_reload_interval_s,
+            sorted(self._filter) if self._filter else "(none)",
+            self._filter_source,
+        )
+        # 起動直後の race を避けるため、 最初の 5s は様子見 (= register → first heartbeat 後)
+        try:
+            await asyncio.wait_for(self._stop_evt.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+        env_filter = os.environ.get("PIPELINE_WORKLOAD_FILTER", "").strip()
+        env_allowed: set[str] | None = (
+            {s.strip() for s in env_filter.split(",") if s.strip()} if env_filter else None
+        )
+        while not self._stop_evt.is_set():
+            try:
+                cfg = await self._client.get_config(self.worker_id)
+            except Exception:
+                log.warning("filter reload: get_config failed; retry next tick", exc_info=False)
+                cfg = None
+            if cfg is not None:
+                remote = cfg.get("workload_filter")
+                new_allowed: set[str] | None
+                new_source: str
+                if remote is None:
+                    # control plane では「解除」 → env fallback (= 旧挙動を維持)
+                    new_allowed = env_allowed
+                    new_source = "env" if env_allowed else "none"
+                else:
+                    cleaned = {str(s).strip() for s in (remote or []) if str(s).strip()}
+                    if cleaned:
+                        new_allowed = cleaned
+                        new_source = f"control-plane@{cfg.get('filter_updated_at') or '?'}"
+                    else:
+                        # 明示の空 list → env fallback
+                        new_allowed = env_allowed
+                        new_source = "env" if env_allowed else "none"
+                if new_allowed != self._filter:
+                    log.warning(
+                        "workload filter changed: %s → %s (source=%s)",
+                        sorted(self._filter) if self._filter else "(none)",
+                        sorted(new_allowed) if new_allowed else "(none)",
+                        new_source,
+                    )
+                    self._filter = new_allowed
+                    self._filter_source = new_source
+                    # cache 全 evict → 次回 _drain_once で新 filter に従い build し直す。
+                    # 既に inflight な executor.run() は最後まで走ってから cache が消える。
+                    for slug in list(self._executor_cache):
+                        self._evict_if_cached(slug)
+            try:
+                await asyncio.wait_for(
+                    self._stop_evt.wait(),
+                    timeout=self._filter_reload_interval_s,
+                )
+            except asyncio.TimeoutError:
+                pass
 
     async def _admin_loop(self) -> None:
         """control plane から admin コマンド (= shell exec, fetch_archive 等) を long poll で受信."""
@@ -468,6 +661,13 @@ class WorkerDaemon:
                 gpu = _nvidia_smi_gpus()
                 if gpu:
                     payload["gpu_metrics"] = gpu
+                cpu = _host_cpu_pct()
+                if cpu is not None:
+                    payload["host_cpu_pct"] = cpu
+                # サーマルスロットル状態 (= UI に出す)
+                payload["gpu_throttle"] = bool(self._gpu_throttle)
+                if self._gpu_temp_c is not None:
+                    payload["gpu_temp_c"] = float(self._gpu_temp_c)
                 await self._client.heartbeat(self.worker_id, payload)
             except Exception:
                 log.warning("heartbeat failed (will retry)", exc_info=False)
@@ -489,21 +689,82 @@ class WorkerDaemon:
                 except asyncio.TimeoutError:
                     pass
 
+    def _update_thermal(self) -> None:
+        """nvidia-smi で自 GPU 温度を取得し、 hysteresis で throttle を切替。"""
+        gpus = _nvidia_smi_gpus()
+        if not gpus:
+            self._gpu_temp_c = None
+            return
+        # 自プロセスが使う GPU は CUDA_VISIBLE_DEVICES で 0 番に見えるので、
+        # nvidia-smi の最初の row を採用 (= 単一 GPU host 前提)
+        try:
+            t = float(gpus[0].get("temp_c") or 0.0)
+        except Exception:
+            return
+        self._gpu_temp_c = t
+        if not self._gpu_throttle and t >= self._gpu_hot_c:
+            self._gpu_throttle = True
+            log.warning("GPU thermal throttle ON (temp=%.1fC ≥ %.1fC): "
+                        "refusing GPU-only workloads until cooled to %.1fC",
+                        t, self._gpu_hot_c, self._gpu_cool_c)
+        elif self._gpu_throttle and t <= self._gpu_cool_c:
+            self._gpu_throttle = False
+            log.info("GPU thermal throttle OFF (temp=%.1fC ≤ %.1fC): resuming",
+                     t, self._gpu_cool_c)
+
+    @staticmethod
+    def _workload_needs_gpu(w: dict[str, Any]) -> bool:
+        """resources.vram_mb > 0 を GPU 必要と判定。"""
+        try:
+            vram = int(((w.get("resources") or {}).get("vram_mb")) or 0)
+        except Exception:
+            vram = 0
+        return vram > 0
+
     async def _drain_once(self) -> bool:
         try:
             workloads = await self._client.list_workloads(self.worker_id)
         except Exception:
             log.exception("list_workloads failed; sleeping")
             return False
+        # サーマルチェック (= 1 drain cycle で 1 回、 nvidia-smi 高々 1 回)
+        self._update_thermal()
         any_work = False
         seen_slugs: set[str] = set()
+        skipped_gpu_throttle = 0
+        # workload filter = control plane の workers.workload_filter が SoT。
+        # _filter_reload_loop が更新する self._filter を読むだけ (= live reload)。
+        # None = no filter (= 全 workload 対象)。
+        _allowed = self._filter or set()
+        # ---------------- starvation floor: 古い workload を先頭に押し上げ ----------------
+        # last_claim_at が floor 秒以上前 (or 未経験) の workload を「飢餓」 と判定し
+        # priority より先に iterate する。 同じ「飢餓 / 非飢餓」 内では元の priority 順を維持。
+        if self._starvation_floor_s > 0:
+            now_mono = time.monotonic()
+            floor = self._starvation_floor_s
+            def _starve_key(idx_w):
+                idx, w = idx_w
+                last = self._last_claim_at.get(w["slug"], 0.0)
+                starved = (now_mono - last) > floor
+                # starved=True を先頭に (= sort key で False=0, True=1 を逆転 → -starved)。
+                # 同 starved 内では元の priority 順を保つ (= 安定 sort なので idx を tie-break)。
+                return (0 if starved else 1, idx)
+            workloads = [w for _, w in sorted(enumerate(workloads), key=_starve_key)]
         for w in workloads:
             seen_slugs.add(w["slug"])
+            if _allowed and w["slug"] not in _allowed:
+                continue
             if w["executor_type"] not in {"shell", "python_module"}:
+                continue
+            # サーマルスロットル中 = GPU workload を claim しない (CPU only は通す)
+            if self._gpu_throttle and self._workload_needs_gpu(w):
+                skipped_gpu_throttle += 1
                 continue
             tasks = await self._client.claim(self.worker_id, w["slug"], w["batch_size"])
             if not tasks:
                 continue
+            # starvation 計測用 (= 実際に claim できた瞬間を「触った」 と記録)
+            self._last_claim_at[w["slug"]] = time.monotonic()
             any_work = True
             try:
                 executor, just_built = self._get_or_build_executor_observe(w)

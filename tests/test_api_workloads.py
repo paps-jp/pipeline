@@ -97,3 +97,53 @@ def test_invalid_slug_rejected(client: TestClient) -> None:
         bad = _sample(slug="Bad Slug!")
         r = client.post("/api/v1/workloads", json=bad)
         assert r.status_code == 422
+
+
+def test_vram_observation_peak_smoothing(client: TestClient) -> None:
+    """worker self-report の VRAM 観測値が peak に平滑化保存される。
+    上昇は即時、 下降は前回 peak の 95% を最低ラインに徐々に追従。
+    """
+    with client:
+        client.post("/api/v1/workloads", json=_sample())
+        slug = "image-resize"
+        # 1) 1 回目: 2000 MB → peak=2000
+        r = client.post(f"/api/v1/workloads/{slug}/vram_observation",
+                        json={"used_mb": 2000, "worker_id": "w_test_1"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["accepted"] is True
+        assert body["observed_vram_mb_peak"] == 2000
+        assert body["observed_vram_sample_count"] == 1
+        # 2) 上昇: 3500 MB → peak=3500 (即時)
+        r = client.post(f"/api/v1/workloads/{slug}/vram_observation",
+                        json={"used_mb": 3500, "worker_id": "w_test_1"})
+        assert r.json()["observed_vram_mb_peak"] == 3500
+        # 3) 下降: 1000 MB → max(3500*0.95, 1000) = 3325 (ゆるく降下)
+        r = client.post(f"/api/v1/workloads/{slug}/vram_observation",
+                        json={"used_mb": 1000, "worker_id": "w_test_1"})
+        assert r.json()["observed_vram_mb_peak"] == 3325
+        # 4) workload GET で永続化を確認
+        w = client.get(f"/api/v1/workloads/{slug}").json()
+        assert w["observed_vram_mb_peak"] == 3325
+        assert w["observed_vram_sample_count"] == 3
+        assert w["observed_vram_updated_at"] is not None
+
+
+def test_vram_observation_unknown_slug_404(client: TestClient) -> None:
+    with client:
+        r = client.post("/api/v1/workloads/no-such/vram_observation",
+                        json={"used_mb": 1000})
+        assert r.status_code == 404
+
+
+def test_vram_observation_validates_used_mb(client: TestClient) -> None:
+    with client:
+        client.post("/api/v1/workloads", json=_sample())
+        # 負値 reject
+        r = client.post("/api/v1/workloads/image-resize/vram_observation",
+                        json={"used_mb": -5})
+        assert r.status_code == 422
+        # 上限超過 reject
+        r = client.post("/api/v1/workloads/image-resize/vram_observation",
+                        json={"used_mb": 999_999})
+        assert r.status_code == 422

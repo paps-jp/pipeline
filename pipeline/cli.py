@@ -111,7 +111,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_worker(args: argparse.Namespace) -> int:
     import asyncio
 
-    from pipeline.worker.daemon import run_worker_cli
+    from pipeline.worker.service import run_worker_cli
 
     return asyncio.run(run_worker_cli(args))
 

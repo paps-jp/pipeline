@@ -19,9 +19,12 @@ def _utcnow_iso() -> str:
 
 
 def _new_worker_id(host: str) -> str:
-    """host + 短いランダムを組み合わせて識別子に。"""
-    safe_host = "".join(c if c.isalnum() else "_" for c in host)[:24]
-    return f"w_{safe_host}_{secrets.token_hex(2)}"
+    """host だけを識別子に。 同一 host に同時 2 worker は systemd instance suffix
+    (= "ai-gpu1-3" 等の hostname に番号入り) で既に区別済なので、 ランダム suffix は
+    冗長で UI/ログを読みにくくする (2026-06-28 operator 要望で短縮)。
+    """
+    safe_host = "".join(c if c.isalnum() else "_" for c in host)[:32]
+    return f"w_{safe_host}"
 
 
 class WorkerNotFound(LookupError):
@@ -40,12 +43,18 @@ class WorkerRepository:
         tags: list[str] | None = None,
         resources: dict[str, Any] | None = None,
         worker_id: str | None = None,
+        env_filter: list[str] | None = None,
     ) -> dict[str, Any]:
         """新規 worker を登録 (or 既存 worker_id なら updated)。
         worker_id 未指定なら deterministic な ID を生成。
+        env_filter は worker daemon の systemd env (PIPELINE_WORKLOAD_FILTER) で、
+        DB filter が null の時の fallback として使われる。 None = env 未設定 (= 全 workload claim 可)。
         """
         wid = worker_id or _new_worker_id(host)
         now = _utcnow_iso()
+        # env_filter を JSON エンコード (= None なら NULL)
+        env_filter_json = (json.dumps(sorted(set(env_filter)))
+                           if env_filter else None)
         with self.db.transaction() as conn:
             cur = conn.execute(
                 "SELECT id FROM workers WHERE id = :id", {"id": wid}
@@ -56,10 +65,10 @@ class WorkerRepository:
                     """
                     INSERT INTO workers (
                         id, host, pid, tags, resources,
-                        state, started_at, last_seen_at
+                        state, started_at, last_seen_at, env_filter
                     ) VALUES (
                         :id, :host, :pid, :tags, :resources,
-                        :state, :now, :now
+                        :state, :now, :now, :ef
                     )
                     """,
                     {
@@ -70,6 +79,7 @@ class WorkerRepository:
                         "resources": json.dumps(resources or {}),
                         "state": "active",
                         "now": now,
+                        "ef": env_filter_json,
                     },
                 )
             else:
@@ -79,7 +89,8 @@ class WorkerRepository:
                         host = :host, pid = :pid,
                         tags = :tags, resources = :resources,
                         state = 'active', last_seen_at = :now,
-                        started_at = COALESCE(started_at, :now)
+                        started_at = COALESCE(started_at, :now),
+                        env_filter = :ef
                     WHERE id = :id
                     """,
                     {
@@ -89,6 +100,7 @@ class WorkerRepository:
                         "tags": json.dumps(tags or []),
                         "resources": json.dumps(resources or {}),
                         "now": now,
+                        "ef": env_filter_json,
                     },
                 )
         return self.get(wid)
@@ -192,6 +204,84 @@ class WorkerRepository:
             )
             return [self._row(r) for r in cur.fetchall()]
 
+    # ---------------- workload filter (= 自動切替 SoT) ----------------
+
+    def set_filter(
+        self,
+        worker_id: str,
+        *,
+        filter_list: list[str] | None,
+        mode: str = "replace",
+        updated_by: str | None = None,
+    ) -> dict[str, Any]:
+        """worker の workload_filter を変更。
+
+        mode:
+          - "replace" (default): filter_list で完全上書き。 None で「解除 (= env fallback)」。
+          - "add":     filter_list の各 slug を現在の filter に **追加**。
+                       現 filter=None (= env fallback) なら **env_filter を base**
+                       にした上で union する (= 元担当を奪わず安全に追加)。
+          - "remove":  filter_list の各 slug を現在の filter から **除去**。
+                       現 filter=None (= env fallback) なら env_filter を base に
+                       した上で差分。 結果が env_filter と同じなら null に戻す
+                       (= キレイに env fallback に戻す)。
+
+        worker が居なければ WorkerNotFound。
+        無効な mode は ValueError。
+        """
+        if mode not in ("replace", "add", "remove"):
+            raise ValueError(f"invalid mode: {mode}")
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "SELECT workload_filter, env_filter FROM workers WHERE id = :id",
+                {"id": worker_id},
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise WorkerNotFound(worker_id)
+            cur_db = row["workload_filter"]
+            cur_env = row["env_filter"]
+            try:
+                cur_set = set(json.loads(cur_db)) if cur_db else None
+            except Exception:
+                cur_set = None
+            try:
+                env_set = set(json.loads(cur_env)) if cur_env else set()
+            except Exception:
+                env_set = set()
+            req = {str(s).strip() for s in (filter_list or []) if str(s).strip()}
+
+            if mode == "replace":
+                if filter_list is None:
+                    new_json: str | None = None
+                else:
+                    new_json = json.dumps(sorted(req))
+            elif mode == "add":
+                # 現 filter=None なら env_filter を base、 そうでなければ現 filter を base
+                base = cur_set if cur_set is not None else env_set
+                merged = sorted(base | req)
+                new_json = json.dumps(merged)
+            else:  # remove
+                base = cur_set if cur_set is not None else env_set
+                after = sorted(base - req)
+                # env_filter と同じなら null に戻して env fallback の意味を保つ
+                if env_set and set(after) == env_set:
+                    new_json = None
+                else:
+                    new_json = json.dumps(after)
+
+            prev = cur_db
+            if (prev or None) == (new_json or None):
+                return self.get(worker_id)
+            conn.execute(
+                "UPDATE workers SET workload_filter = :wf, "
+                "filter_updated_at = :now, filter_updated_by = :by "
+                "WHERE id = :id",
+                {"id": worker_id, "wf": new_json, "now": _utcnow_iso(),
+                 "by": (updated_by or "operator")[:64]},
+            )
+        return self.get(worker_id)
+
     @staticmethod
     def _row(r: dict[str, Any]) -> dict[str, Any]:
         out = dict(r)
@@ -202,4 +292,22 @@ class WorkerRepository:
                     out[c] = json.loads(v)
                 except Exception:
                     out[c] = []
+        # workload_filter は JSON list[str] (= None なら "no filter")
+        wf = out.get("workload_filter")
+        if isinstance(wf, str) and wf:
+            try:
+                out["workload_filter"] = json.loads(wf)
+            except Exception:
+                out["workload_filter"] = None
+        elif wf in (None, ""):
+            out["workload_filter"] = None
+        # env_filter (= systemd PIPELINE_WORKLOAD_FILTER で固定された fallback)
+        ef = out.get("env_filter")
+        if isinstance(ef, str) and ef:
+            try:
+                out["env_filter"] = json.loads(ef)
+            except Exception:
+                out["env_filter"] = None
+        elif ef in (None, ""):
+            out["env_filter"] = None
         return out
