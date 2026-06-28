@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>plugin live monitor</title>
+<style>
+  :root {
+    --bg: transparent;
+    --card: #161931;
+    --border: rgba(110,125,255,0.18);
+    --fg: #e6e8f5;
+    --muted: rgba(230,232,245,0.55);
+    --accent: #818cf8;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: transparent;
+      --card: #ffffff;
+      --border: rgba(110,125,255,0.22);
+      --fg: #1f2233;
+      --muted: rgba(31,34,51,0.55);
+      --accent: #4338ca;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); }
+  body {
+    margin: 0; padding: 12px;
+    font-family: -apple-system, "Segoe UI", "Hiragino Sans", sans-serif;
+    color: var(--fg);
+  }
+  .statusbar {
+    display: flex; align-items: center; gap: 8px;
+    color: var(--muted); font-size: 0.85rem;
+    margin-bottom: 10px;
+  }
+  .badge {
+    display: inline-block; padding: 2px 8px;
+    border-radius: 999px; font-size: 0.75rem;
+    background: rgba(129,140,248,0.15); color: var(--accent);
+  }
+  .status-dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; background: #888;
+  }
+  .status-dot.live { background: #22c55e; animation: pulse 2s infinite; }
+  .status-dot.idle { background: #888; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+  .updated-at { margin-left: auto; font-family: ui-monospace, monospace; }
+
+  .tabs {
+    display: flex; gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+  }
+  .tab {
+    background: transparent; border: 0;
+    color: var(--muted); padding: 8px 14px;
+    cursor: pointer; font-size: 0.9rem; font-weight: 500;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+    font-family: inherit;
+  }
+  .tab:hover { color: var(--fg); }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  .worker-grid {
+    display: flex; flex-wrap: wrap; gap: 12px;
+  }
+  .worker-tile {
+    width: 360px;
+    border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+    background: rgba(0,0,0,0.15);
+    transition: opacity 0.3s;
+  }
+  .worker-tile-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 10px;
+    background: rgba(129,140,248,0.08);
+    border-bottom: 1px solid var(--border);
+    font-size: 0.78rem;
+  }
+  .worker-tile-name {
+    font-family: ui-monospace, monospace;
+    color: var(--accent); font-weight: 600;
+  }
+  .worker-tile-status {
+    display: flex; align-items: center; gap: 4px; color: var(--muted);
+  }
+  .worker-tile-frame {
+    width: 360px; height: 240px; background: #000;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .worker-tile-frame img { width: 100%; height: 100%; object-fit: contain; }
+  .worker-tile-frame .no-image {
+    color: var(--muted); font-size: 0.85rem;
+  }
+  .worker-tile-label {
+    padding: 8px 10px; font-size: 0.8rem;
+    color: var(--fg);
+    border-top: 1px solid var(--border);
+  }
+  .worker-tile-meta {
+    padding: 6px 10px;
+    font-size: 0.72rem; color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: 4px 10px;
+    border-top: 1px solid var(--border);
+  }
+  .worker-tile-meta strong {
+    color: var(--fg); font-weight: 600;
+    font-family: ui-monospace, monospace;
+  }
+
+  .recent { list-style: none; padding: 0; margin: 0; font-size: 0.85rem; }
+  .recent li {
+    padding: 10px; border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 8px;
+    display: grid; grid-template-columns: 1fr auto; gap: 6px 8px;
+    background: rgba(0,0,0,0.05);
+  }
+  .recent li.live {
+    border-color: var(--accent);
+    background: rgba(129,140,248,0.06);
+    box-shadow: 0 0 0 1px rgba(129,140,248,0.18);
+  }
+  .recent .row1 {
+    display: flex; justify-content: space-between; align-items: center;
+    grid-column: 1 / -1; gap: 8px;
+  }
+  .recent .pk { font-family: ui-monospace, monospace; color: var(--accent); }
+  .recent .label { color: var(--fg); }
+  .recent .info { color: var(--muted); white-space: nowrap; font-size: 0.78rem; }
+  .recent .live-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 0.7rem; color: var(--accent); font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.03em;
+  }
+  .recent .page-url {
+    grid-column: 1 / -1; font-size: 0.75rem;
+    color: var(--muted); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .recent .page-url a {
+    color: var(--accent); text-decoration: none;
+  }
+  .recent .page-url a:hover { text-decoration: underline; }
+  .recent-thumbs {
+    grid-column: 1 / -1;
+    display: flex; gap: 6px; overflow-x: auto; padding-top: 4px;
+  }
+  .recent-thumb {
+    flex: 0 0 auto; width: 64px; height: 64px;
+    border-radius: 4px; background: #000; overflow: hidden;
+  }
+  .recent-thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .recent-thumb.large { width: 96px; height: 96px; }
+  .recent-thumb.xlarge { width: 160px; height: 160px; }
+  .recent-thumbs .empty {
+    color: var(--muted); font-size: 0.75rem; padding: 6px 0;
+  }
+  .empty-state {
+    color: var(--muted); text-align: center;
+    padding: 32px; font-size: 0.9rem;
+  }
+  /* image モード: タブを隠す */
+  body.image-mode .tabs { display: none; }
+  body.image-mode #tab-live { display: none !important; }
+  body.image-mode #tab-recent { display: block !important; }
+</style>
+</head>
+<body>
+
+<div class="statusbar">
+  <span class="status-dot idle" id="status-dot"></span>
+  <span id="status-text">接続中…</span>
+  <span class="badge" id="worker-count">— workers</span>
+  <span class="updated-at" id="updated-at">—</span>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="live">稼働中ワーカー</button>
+  <button class="tab" data-tab="recent">最近の処理</button>
+</div>
+
+<div class="tab-content active" id="tab-live">
+  <div class="worker-grid" id="worker-grid">
+    <div class="empty-state">処理待機中</div>
+  </div>
+</div>
+
+<div class="tab-content" id="tab-recent">
+  <ul class="recent" id="recent-list">
+    <li><span class="info">読み込み中…</span></li>
+  </ul>
+</div>
+
+<script>
+const SLUG = (() => {
+  const m = location.pathname.match(/\/api\/v1\/plugins\/([^/]+)\/web\//);
+  return m ? m[1] : "";
+})();
+const POLL_MS = 5000;
+const MODE = new URLSearchParams(location.search).get("mode") || "video";
+if (MODE === "image") {
+  document.body.classList.add("image-mode");
+  // 「最近処理した」タブを「最近の処理」にラベル変更
+  const t = document.querySelector('.tab[data-tab="recent"]');
+  if (t) t.textContent = "最近の処理";
+}
+
+const renderState = {
+  tiles: new Map(),
+  recent: new Map(),
+};
+
+function fmtRel(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  const s = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (s < 5) return "たった今";
+  if (s < 60) return s + "s 前";
+  if (s < 3600) return Math.floor(s / 60) + "m 前";
+  return Math.floor(s / 3600) + "h 前";
+}
+
+function setStatus(live, text) {
+  const dot = document.getElementById("status-dot");
+  dot.classList.toggle("live", live);
+  dot.classList.toggle("idle", !live);
+  document.getElementById("status-text").textContent = text;
+}
+
+function preloadAndSwap(imgEl, url) {
+  const tmp = new Image();
+  tmp.onload = () => { imgEl.src = url; };
+  tmp.onerror = () => {};
+  tmp.src = url;
+}
+
+async function fetchState() {
+  const r = await fetch(`/api/v1/plugins/${SLUG}/state`, { cache: "no-store" });
+  if (!r.ok) throw new Error("state HTTP " + r.status);
+  return await r.json();
+}
+
+document.querySelectorAll(".tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+  });
+});
+
+function buildTile(wid) {
+  const el = document.createElement("div");
+  el.className = "worker-tile";
+  el.dataset.wid = wid;
+  el.innerHTML = `
+    <div class="worker-tile-header">
+      <span class="worker-tile-name"></span>
+      <span class="worker-tile-status">
+        <span class="status-dot idle"></span>
+        <span class="status-text"></span>
+      </span>
+    </div>
+    <div class="worker-tile-frame">
+      <span class="no-image">画像なし</span>
+    </div>
+    <div class="worker-tile-label"></div>
+    <div class="worker-tile-meta"></div>
+  `;
+  el.querySelector(".worker-tile-name").textContent = wid;
+  return {
+    el,
+    frameEl: el.querySelector(".worker-tile-frame"),
+    imgEl: null,
+    dotEl: el.querySelector(".status-dot"),
+    statusTextEl: el.querySelector(".worker-tile-header .status-text"),
+    labelEl: el.querySelector(".worker-tile-label"),
+    metaEl: el.querySelector(".worker-tile-meta"),
+    lastFrameUpdatedAt: "",
+  };
+}
+
+function renderMeta(metaEl, meta) {
+  if (!meta || typeof meta !== "object") {
+    metaEl.innerHTML = ""; return;
+  }
+  const parts = [];
+  for (const [k, v] of Object.entries(meta)) {
+    if (v == null || v === "") continue;
+    const val = typeof v === "number" ? (Number.isInteger(v) ? v : v.toFixed(2)) : String(v);
+    parts.push(`<span>${k} <strong>${val}</strong></span>`);
+  }
+  metaEl.innerHTML = parts.join("");
+}
+
+function renderPreviews(items) {
+  const STALE_HIDE_MS = 60_000;
+  const STALE_DIM_MS = 20_000;
+  const workers = {};
+  const now = Date.now();
+  for (const [k, v] of Object.entries(items)) {
+    const m = k.match(/^worker\/(.+)\/current$/);
+    if (!m) continue;
+    const ageMs = now - new Date(v.updated_at).getTime();
+    if (ageMs > STALE_HIDE_MS) continue;
+    workers[m[1]] = v;
+  }
+  const ids = Object.keys(workers);
+  document.getElementById("worker-count").textContent =
+    ids.length > 0 ? `${ids.length} active` : "idle";
+
+  const grid = document.getElementById("worker-grid");
+  const placeholder = grid.querySelector(".empty-state");
+  if (placeholder) placeholder.remove();
+
+  if (ids.length === 0) {
+    for (const t of renderState.tiles.values()) t.el.remove();
+    renderState.tiles.clear();
+    if (!grid.querySelector(".empty-state")) {
+      const ph = document.createElement("div");
+      ph.className = "empty-state";
+      ph.textContent = "処理待機中";
+      grid.appendChild(ph);
+    }
+    setStatus(false, "アイドル");
+    return;
+  }
+
+  ids.sort((a, b) =>
+    workers[b].updated_at.localeCompare(workers[a].updated_at)
+  );
+
+  for (const [wid, tile] of renderState.tiles.entries()) {
+    if (!workers[wid]) { tile.el.remove(); renderState.tiles.delete(wid); }
+  }
+
+  let anyLive = false;
+  ids.forEach((wid, idx) => {
+    let tile = renderState.tiles.get(wid);
+    if (!tile) {
+      tile = buildTile(wid);
+      renderState.tiles.set(wid, tile);
+    }
+    if (grid.children[idx] !== tile.el) grid.insertBefore(tile.el, grid.children[idx] || null);
+
+    const entry = workers[wid];
+    const v = entry.value || {};
+    const ageMs = Date.now() - new Date(entry.updated_at).getTime();
+    const live = ageMs < 15000;
+    const dim = ageMs > STALE_DIM_MS;
+    if (live) anyLive = true;
+    tile.el.style.opacity = dim ? "0.45" : "1";
+
+    // 画像差分更新
+    if (v.image_blob_key && entry.updated_at !== tile.lastFrameUpdatedAt) {
+      const url = `/api/v1/plugins/${SLUG}/blob/${v.image_blob_key}?t=${encodeURIComponent(entry.updated_at)}`;
+      if (!tile.imgEl) {
+        tile.frameEl.innerHTML = '<img alt="" />';
+        tile.imgEl = tile.frameEl.querySelector("img");
+        tile.imgEl.src = url;
+      } else {
+        preloadAndSwap(tile.imgEl, url);
+      }
+      tile.lastFrameUpdatedAt = entry.updated_at;
+    } else if (!v.image_blob_key && tile.imgEl) {
+      tile.frameEl.innerHTML = '<span class="no-image">画像なし</span>';
+      tile.imgEl = null;
+      tile.lastFrameUpdatedAt = "";
+    }
+
+    tile.dotEl.classList.toggle("live", live);
+    tile.dotEl.classList.toggle("idle", !live);
+    tile.statusTextEl.textContent = live ? "ライブ" : "stale";
+    tile.labelEl.textContent = v.label || v.pk || "—";
+    renderMeta(tile.metaEl, v.meta);
+  });
+  setStatus(anyLive, anyLive ? `ライブ (${ids.length} workers)` : "全 stale");
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function recentItemHtml(r, opts = {}) {
+  const { isLive = false } = opts;
+  const v = r.value || {};
+  const status = isLive ? "進行中" : (v.status || "?");
+  const dur = v.duration_s != null ? `${v.duration_s.toFixed(1)}s` : "";
+  const metaStr = v.meta && typeof v.meta === "object"
+    ? Object.entries(v.meta)
+        .filter(([, val]) => val != null && val !== "")
+        .slice(0, 4)
+        .map(([k, val]) => `${escapeHtml(k)}=${escapeHtml(val)}`)
+        .join(" · ")
+    : "";
+  // サムネ: image モードの大プレビュー / 通常モードでは thumbs
+  let thumbs = "";
+  if (MODE === "image") {
+    // image_urls (外部直 URL の配列) があれば全部サムネで並べる
+    if (Array.isArray(v.image_urls) && v.image_urls.length > 0) {
+      thumbs = v.image_urls.slice(0, 300).map(u =>
+        `<div class="recent-thumb"><img src="${escapeHtml(u)}" loading="lazy" referrerpolicy="no-referrer" alt="" onerror="this.style.opacity=0.2" /></div>`
+      ).join("");
+    } else {
+      // 画像系: メイン画像 1 枚を大きく表示 (image_blob_key 優先, fallback で thumb_keys[0])
+      const key = v.image_blob_key || (Array.isArray(v.thumb_keys) && v.thumb_keys[0]);
+      if (key) {
+        thumbs = `<div class="recent-thumb xlarge"><img src="/api/v1/plugins/${SLUG}/blob/${key}" loading="lazy" alt="" /></div>`;
+      } else {
+        thumbs = '<div class="empty">画像なし</div>';
+      }
+    }
+  } else if (Array.isArray(v.thumb_keys) && v.thumb_keys.length > 0) {
+    thumbs = v.thumb_keys.slice(0, 8).map(k =>
+      `<div class="recent-thumb"><img src="/api/v1/plugins/${SLUG}/blob/${k}" loading="lazy" alt="" /></div>`
+    ).join("");
+  } else if (v.image_blob_key) {
+    thumbs = `<div class="recent-thumb large"><img src="/api/v1/plugins/${SLUG}/blob/${v.image_blob_key}" loading="lazy" alt="" /></div>`;
+  } else {
+    thumbs = '<div class="empty">画像なし</div>';
+  }
+  // page_url (任意): 表示は短縮、リンクはそのまま
+  let pageUrlHtml = "";
+  if (v.page_url) {
+    const u = String(v.page_url);
+    const display = u.length > 80 ? u.slice(0, 60) + "…" + u.slice(-15) : u;
+    pageUrlHtml = `<div class="page-url"><a href="${escapeHtml(u)}" target="_blank" rel="noopener">${escapeHtml(display)}</a></div>`;
+  }
+  const label = v.label || v.pk || r.key;
+  const liveBadge = isLive
+    ? `<span class="live-badge"><span class="status-dot live"></span>LIVE</span>`
+    : "";
+  return `
+    <li data-key="${escapeHtml(r.key)}" class="${isLive ? "live" : ""}">
+      <div class="row1">
+        <span class="pk">${escapeHtml(v.pk || r.key)}</span>
+        <span class="info">${liveBadge}${status} · ${escapeHtml(dur)} · ${escapeHtml(fmtRel(r.updated_at))}</span>
+      </div>
+      <span class="label">${escapeHtml(label)}${metaStr ? " — " + metaStr : ""}</span>
+      ${pageUrlHtml}
+      <div class="recent-thumbs">${thumbs}</div>
+    </li>
+  `;
+}
+
+function renderRecent(items) {
+  const list = document.getElementById("recent-list");
+  const STALE_HIDE_MS = 60_000;
+  const now = Date.now();
+
+  // image モード: worker/*/current を「進行中」エントリとして統合する
+  const liveEntries = [];
+  if (MODE === "image") {
+    for (const [k, v] of Object.entries(items)) {
+      const m = k.match(/^worker\/(.+)\/current$/);
+      if (!m) continue;
+      const ageMs = now - new Date(v.updated_at).getTime();
+      if (ageMs > STALE_HIDE_MS) continue;
+      liveEntries.push({
+        key: `live:${m[1]}`,
+        value: v.value,
+        updated_at: v.updated_at,
+        isLive: true,
+      });
+    }
+    liveEntries.sort((a, b) =>
+      b.updated_at.localeCompare(a.updated_at)
+    );
+  }
+
+  const recent = [];
+  for (const [k, v] of Object.entries(items)) {
+    const m = k.match(/^recent\/(.+)$/);
+    if (m) recent.push({ key: m[1], value: v.value, updated_at: v.updated_at, isLive: false });
+  }
+  recent.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+
+  const combined = [...liveEntries, ...recent.slice(0, 20)];
+
+  if (combined.length === 0) {
+    if (list.dataset.empty !== "1") {
+      list.innerHTML = '<li><span class="info">まだ履歴がありません</span></li>';
+      list.dataset.empty = "1";
+      renderState.recent.clear();
+    }
+    return;
+  }
+  list.dataset.empty = "0";
+
+  const wanted = new Set(combined.map(r => r.key));
+  for (const [key, li] of renderState.recent.entries()) {
+    if (!wanted.has(key)) { li.remove(); renderState.recent.delete(key); }
+  }
+  if (list.children.length === 1 && !list.children[0].dataset.key) {
+    list.innerHTML = "";
+  }
+
+  combined.forEach((r, i) => {
+    let li = renderState.recent.get(r.key);
+    const stamp = r.updated_at;
+    if (li && li.dataset.stamp === stamp) {
+      if (list.children[i] !== li) list.insertBefore(li, list.children[i] || null);
+      return;
+    }
+    const tmp = document.createElement("div");
+    tmp.innerHTML = recentItemHtml(r, { isLive: r.isLive });
+    const newLi = tmp.firstElementChild;
+    newLi.dataset.stamp = stamp;
+    if (li) {
+      // 既存の li に画像があれば、新しい li の img.src を裏読みで差し替えて
+      // 完全な innerHTML 置換を避ける (= チカチカ防止)
+      const oldImg = li.querySelector(".recent-thumb img");
+      const newImg = newLi.querySelector(".recent-thumb img");
+      if (r.isLive && oldImg && newImg && oldImg.src && newImg.src && oldImg.src !== newImg.src) {
+        const tmpImg = new Image();
+        const newSrc = newImg.src;
+        newImg.src = oldImg.src;
+        tmpImg.onload = () => { newImg.src = newSrc; };
+        tmpImg.src = newSrc;
+      }
+      list.replaceChild(newLi, li);
+    } else {
+      list.insertBefore(newLi, list.children[i] || null);
+    }
+    renderState.recent.set(r.key, newLi);
+  });
+}
+
+function updateLiveStatus(items) {
+  // image モードでも上部の active バッジ + ライブドット表示は必要
+  const STALE_HIDE_MS = 60_000;
+  const now = Date.now();
+  let active = 0, anyLive = false;
+  for (const [k, v] of Object.entries(items)) {
+    if (!k.match(/^worker\/(.+)\/current$/)) continue;
+    const ageMs = now - new Date(v.updated_at).getTime();
+    if (ageMs > STALE_HIDE_MS) continue;
+    active++;
+    if (ageMs < 15000) anyLive = true;
+  }
+  document.getElementById("worker-count").textContent =
+    active > 0 ? `${active} active` : "idle";
+  setStatus(anyLive, anyLive ? `ライブ (${active} workers)` : (active > 0 ? "全 stale" : "アイドル"));
+}
+
+async function tick() {
+  try {
+    const data = await fetchState();
+    const items = data.items || {};
+    if (MODE === "image") {
+      updateLiveStatus(items);
+    } else {
+      renderPreviews(items);
+    }
+    renderRecent(items);
+    document.getElementById("updated-at").textContent =
+      new Date().toLocaleTimeString();
+  } catch (e) {
+    setStatus(false, "接続失敗: " + e.message);
+  }
+}
+
+tick();
+setInterval(tick, POLL_MS);
+</script>
+
+</body>
+</html>

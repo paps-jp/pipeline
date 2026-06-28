@@ -1,0 +1,201 @@
+canvas:
+  width: 2200
+  height: 540
+  background: '#0f1120'
+nodes:
+- id: paprika-links-pull
+  kind: workload
+  x: 8
+  y: -226
+  label: URL 発見
+  icon: search
+  workload_slug: paprika-links-pull
+- id: crawl
+  kind: tank
+  x: 26
+  y: -416
+  label: crawl (URL 候補)
+  icon: link
+  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
+    AND TABLE_NAME='crawl'
+  capacity_warn: 500000000
+- id: paprika-job-submit
+  kind: workload
+  x: 311
+  y: -415
+  label: paprika 投入
+  icon: send
+  workload_slug: paprika-job-submit
+- id: paprika-hub
+  kind: external
+  x: 332
+  y: -216
+  label: paprika hub
+  icon: server
+  url: http://10.10.50.34:8000
+- id: paprika-image-pull
+  kind: workload
+  x: 596
+  y: -224
+  label: 画像 pull
+  icon: photo
+  workload_slug: paprika-image-pull
+- id: crawl_image
+  kind: tank
+  x: 616
+  y: -62
+  label: crawl_image
+  icon: photo
+  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
+    AND TABLE_NAME='crawl_image'
+  capacity_warn: 500000000
+- id: image-dispatcher
+  kind: workload
+  x: 596
+  y: 131
+  label: 画像 dispatch
+  icon: arrows-split
+  workload_slug: image-dispatcher
+- id: crawl_face_queue
+  kind: tank
+  x: 921
+  y: -413
+  label: face_queue
+  icon: list
+  metric_sql: SELECT COUNT(*) FROM crawl_face_queue WHERE state='pending'
+  capacity_warn: 50000
+- id: image-hash-extract
+  kind: workload
+  x: 902
+  y: -233
+  label: hash + detect
+  icon: scan
+  workload_slug: image-hash-extract
+- id: crawl_face
+  kind: tank
+  x: 924
+  y: -59
+  label: crawl_face
+  icon: face
+  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
+    AND TABLE_NAME='crawl_face'
+  capacity_warn: 500000000
+- id: image-embed
+  kind: workload
+  x: 1180
+  y: -396
+  label: embed 計算
+  icon: brain
+  workload_slug: image-embed
+- id: paprika-video-pull
+  kind: workload
+  x: 312
+  y: -60
+  label: 動画 pull
+  icon: video
+  workload_slug: paprika-video-pull
+- id: crawl_video
+  kind: tank
+  x: 332
+  y: 99
+  label: crawl_video pending
+  icon: video
+  metric_sql: SELECT COUNT(*) FROM crawl_video WHERE download_status='pending'
+  capacity_warn: 20000
+- id: video-dispatcher
+  kind: workload
+  x: 311
+  y: 275
+  label: 動画 dispatch
+  icon: arrows-split
+  workload_slug: video-dispatcher
+- id: video-face-extract
+  kind: workload
+  x: 902
+  y: 275
+  label: 動画→顔抽出
+  icon: faces
+  workload_slug: video-face-extract
+- id: embed-write
+  kind: workload
+  x: 1180
+  y: 96
+  label: embed 書込
+  icon: database-import
+  workload_slug: embed-write
+- id: crawl_embedding_write_queue
+  kind: tank
+  x: 1199
+  y: -158
+  label: embed_write_q
+  icon: database-import
+  metric_sql: SELECT COUNT(*) FROM crawl_embedding_write_queue WHERE state='pending'
+  capacity_warn: 20000
+- id: crawl_embedding_final
+  kind: tank
+  x: 1200
+  y: 265
+  label: crawl_embedding_index (final)
+  icon: database
+  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
+    AND TABLE_NAME='crawl_embedding_index'
+  capacity_warn: 500000000
+edges:
+- from: paprika-links-pull
+  to: crawl
+  label: URL/min
+  metric_field: inserted
+- from: crawl
+  to: paprika-job-submit
+- from: paprika-job-submit
+  to: paprika-hub
+  label: job/min
+  metric_field: submitted
+- from: paprika-hub
+  to: paprika-image-pull
+  dashed: true
+- from: paprika-hub
+  to: paprika-video-pull
+  dashed: true
+- from: paprika-hub
+  to: paprika-links-pull
+  dashed: true
+- from: paprika-image-pull
+  to: crawl_image
+  label: img/tick
+  metric_field: inserted
+- from: crawl_image
+  to: image-dispatcher
+- from: image-dispatcher
+  to: crawl_face_queue
+  label: enq
+  metric_field: hash_detect_enqueued
+- from: crawl_face_queue
+  to: image-hash-extract
+- from: image-hash-extract
+  to: crawl_face
+  label: face
+- from: crawl_face
+  to: image-embed
+- from: image-embed
+  to: crawl_embedding_write_queue
+  label: write_q
+- from: paprika-video-pull
+  to: crawl_video
+  label: video/tick
+  metric_field: inserted
+- from: crawl_video
+  to: video-dispatcher
+- from: video-dispatcher
+  to: video-face-extract
+  label: task
+  metric_field: enqueued
+- from: video-face-extract
+  to: crawl_face
+  label: face/run
+  metric_field: face_ids_inserted
+- from: crawl_embedding_write_queue
+  to: embed-write
+- from: embed-write
+  to: crawl_embedding_final
+  label: final
