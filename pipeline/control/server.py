@@ -77,6 +77,15 @@ def create_app(settings: Settings) -> FastAPI:
         db.ensure_schema()
         app.state.settings = settings
         app.state.db = db
+        # 業務 queue 用 secondary DB (= MariaDB)。 PIPELINE_SECONDARY_DB_URL 未設定なら
+        # None = SQLite-only (= 後方互換)。 workload.queue_backend='mariadb' の queue だけ
+        # QueueRepository.wire_from_workloads 経由でこちらに振り替わる。
+        secondary_db = None
+        _secondary_url = os.environ.get("PIPELINE_SECONDARY_DB_URL", "").strip()
+        if _secondary_url:
+            secondary_db = get_db(_secondary_url)
+            log.info("secondary queue DB enabled (scheme=%s)", _secondary_url.split(":", 1)[0])
+        app.state.secondary_db = secondary_db
         # control plane の log を service_logs に直接書く (= UI Pipeline タブで表示用)
         from pipeline.control.local_log_handler import attach_control_plane_logger
         attach_control_plane_logger(db, service="pipeline-oss-control")
@@ -88,7 +97,7 @@ def create_app(settings: Settings) -> FastAPI:
         worker = None
         if inproc_enabled:
             log.info("starting in-process worker (set PIPELINE_INPROC_WORKER=0 to disable)")
-            worker = Worker(db)
+            worker = Worker(db, secondary_db=secondary_db)
             await worker.start()
             app.state.worker = worker
         else:

@@ -74,7 +74,13 @@ def _repo(request: Request) -> WorkloadRepository:
 
 
 def _queue_repo(request: Request) -> QueueRepository:
-    return QueueRepository(request.app.state.db)
+    db = request.app.state.db
+    secondary = getattr(request.app.state, "secondary_db", None)
+    repo = QueueRepository(db, secondary)
+    if secondary is not None:
+        # workload.queue_backend='mariadb' の queue を secondary に振り替え
+        repo.wire_from_workloads(WorkloadRepository(db).list_all())
+    return repo
 
 
 def _runs_repo(request: Request) -> RunsRepository:

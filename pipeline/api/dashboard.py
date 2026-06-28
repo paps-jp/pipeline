@@ -79,7 +79,11 @@ def overview(request: Request) -> OverviewResponse:
     db = request.app.state.db
     runs_repo = RunsRepository(db)
     workloads_repo = WorkloadRepository(db)
-    queue_repo = QueueRepository(db)
+    secondary = getattr(request.app.state, "secondary_db", None)
+    queue_repo = QueueRepository(db, secondary)
+    if secondary is not None:
+        # mariadb backend の queue は depth/count も secondary から取る
+        queue_repo.wire_from_workloads(workloads_repo.list_all())
 
     # 1. running は recent から、 failures は別 query (= 高スループット workload で
     #    recent window が成功 run で埋まり failure が見えなくなるのを防ぐ)
