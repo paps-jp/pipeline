@@ -1,0 +1,27 @@
+[Unit]
+Description=Pipeline worker daemon (GPU read-only inference, instance %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www
+WorkingDirectory=/home/www
+# instance ごとに plugin cache を分けて衝突を避ける
+Environment=PIPELINE_PLUGIN_CACHE_DIR=/tmp/pipeline-c3-cache-%i
+# 同じ GPU を共有 (CUDA は process 別に context を持つ)
+Environment=CUDA_VISIBLE_DEVICES=0
+# instance 番号 → daemon が hostname suffix に使用 (= worker registry / state key を unique 化)
+Environment=PIPELINE_WORKER_INSTANCE=%i
+ExecStart=/home/www/face_search/bin/pipeline worker \
+    --control-url http://10.10.50.7:8001 \
+    --skip-pip-install \
+    --log-level INFO
+Restart=always
+RestartSec=10
+RestartForceExitStatus=42
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
