@@ -68,6 +68,12 @@ class WorkloadBase(BaseModel):
     # requires_gpu=True のものだけ」 と判断するために使う。 ランタイム判定はしない。
     requires_gpu: bool = False
 
+    # 業務 queue の格納先 backend (Phase 2-α 2026-06-29)。
+    # 'sqlite' (= 既定、 control plane と同居) / 'mariadb' (= secondary_db)。
+    # 想定外の値は wire 側で安全側 (= sqlite/primary) に倒すので、 read を壊さない
+    # よう型は str のまま緩く保つ (= Literal にしない)。
+    queue_backend: str = "sqlite"
+
     @field_validator("host_affinity", mode="before")
     @classmethod
     def _coerce_host_affinity(cls, v: Any) -> list[str]:
