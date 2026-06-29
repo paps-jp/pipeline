@@ -79,6 +79,30 @@ def setup(**kwargs) -> dict[str, Any]:
         "llm_last_call_ts": 0.0,
         # LLM 適用済 action の cooldown (= action key → 残り tick)
         "llm_action_cooldown": defaultdict(int),
+        # adaptive bin-packing balancer 設定 (= Phase 0 既定: dry-run)
+        "balancer_cfg": {
+            "enabled": bool(int(kwargs.get("balancer_enabled") or 0)),
+            "apply_mode": bool(int(kwargs.get("balancer_apply_mode") or 0)),
+            "vram_safety_frac": float(kwargs.get("balancer_vram_safety_frac") or 0.85),
+            "tasks_per_worker_hint": int(kwargs.get("balancer_tasks_per_worker_hint") or 100),
+            "min_workers_per_workload": int(kwargs.get("balancer_min_workers_per_workload") or 1),
+            "max_workers_per_workload": int(kwargs.get("balancer_max_workers_per_workload") or 6),
+            "min_dwell_s": float(kwargs.get("balancer_min_dwell_s") or 300),
+            "swap_margin": float(kwargs.get("balancer_swap_margin") or 1.3),
+            "max_swaps_per_cycle": int(kwargs.get("balancer_max_swaps_per_cycle") or 6),
+            "oom_window_min": int(kwargs.get("balancer_oom_window_min") or 10),
+            "oom_demote_threshold": int(kwargs.get("balancer_oom_demote_threshold") or 3),
+            "oom_cooldown_s": float(kwargs.get("balancer_oom_cooldown_s") or 1800),
+            "oom_cooldown_multiplier": float(kwargs.get("balancer_oom_cooldown_multiplier") or 2.0),
+            "cold_start_boost": float(kwargs.get("balancer_cold_start_boost") or 5.0),
+            "respect_updated_by_prefixes": (
+                kwargs.get("balancer_respect_updated_by_prefixes")
+                or ["operator", "claude"]
+            ),
+        },
+        # balancer 状態 (= flap 抑制と OOM cool-down)
+        "balancer_last_swap_mono": {},     # worker_id → monotonic 秒
+        "balancer_oom_cooldown": {},        # (host, slug) → expire monotonic 秒
     }
     log.info("supervisor: control=%s rules=%s apply_mode=%s",
              state["control_url"], state["rules_path"], state["apply_mode"])
@@ -519,6 +543,404 @@ def _load_rules(path: str) -> list[dict[str, Any]]:
     return list(data.get("rules") or [])
 
 
+# ---------------- adaptive bin-packing balancer ---------------- #
+# 「VRAM 85% を埋めながら tank pressure に応じて worker N と workload を流動配置」
+# する自動オーケストレーション。 既存 rule engine と並列に走る。
+# - Phase 0 既定: balancer_apply_mode=False (= log のみ)
+# - 安全側: operator 固定 / supervisor_enabled=False / max_swaps_per_cycle / hysteresis
+#   (min_dwell_s, swap_margin) で flap 抑制。 worker N 変更も別カウンタで上限。
+# - OOM 検知: runs.error が _OOM_RE にヒットしたら降格、 cool-down で復活試行。
+
+# OOM 文字列パターン (= service.py の _OOM_RE 準拠、 ここで再定義して plugin 単体で完結)
+import re as _re_balancer
+_BALANCER_OOM_RE = _re_balancer.compile(
+    r"(out of memory|OutOfMemoryError|cudaErrorMemoryAllocation|"
+    r"CUDA out of memory|HIP out of memory|memory allocation failed|"
+    r"cannot allocate.*\d+.*(MB|GiB|bytes))",
+    _re_balancer.I,
+)
+
+# class の降格チェイン (= OOM 時に重い → 軽い の順で fallback)
+_BALANCER_CLASS_CHAIN = ["heavy", "medium", "light", "cpu"]
+
+
+def _balancer_classify(w: dict[str, Any]) -> str:
+    """workload を VRAM 階級に分類。
+
+    heavy   = peak >= 2 GB (image-embed 等)
+    medium  = 0.3 <= peak < 2 GB (image-hash-extract 等)
+    light   = peak < 0.3 GB だが GPU 必要 (video-face-extract 等)
+    cpu     = requires_gpu=False / peak=0 (= 並列度の制約が VRAM じゃない)
+    """
+    peak = int(w.get("observed_vram_mb_peak") or 0)
+    vram = int(w.get("resources_vram_mb") or 0)
+    # peak は実測。 無い場合は宣言値 vram_mb を仮置き。 両方無ければ 0。
+    eff = peak or vram
+    if eff == 0:
+        return "cpu"
+    if eff >= 2048:
+        return "heavy"
+    if eff >= 300:
+        return "medium"
+    return "light"
+
+
+def _balancer_density(w: dict[str, Any], cold_start_boost: float = 5.0) -> float:
+    """workload の「1 MB あたりの片付ける価値」 (= pack 順序のスコア)。
+
+    pending=0 → 0 (空 tank は配置価値なし)。
+    rate=0 で pending > 0 → priority だけで cold-start boost (= deadlock 解放)。
+    通常 → (drain_eta_min × priority) / peak_vram_mb。
+    """
+    pending = int(w.get("pending") or 0)
+    if pending == 0:
+        return 0.0
+    peak = max(int(w.get("observed_vram_mb_peak") or w.get("resources_vram_mb") or 0), 1)
+    priority = max(int(w.get("priority") or 100), 1)
+    rate = float(w.get("throughput_min") or 0.0)
+    if rate <= 0.0:
+        # 未着手 backlog: priority だけで決める
+        return (priority * cold_start_boost) / peak
+    eta = pending / rate                          # 分
+    return (eta * (priority / 100.0)) / peak
+
+
+def _balancer_pick_lighter(slug: str, workloads: list[dict],
+                            classify_fn) -> str | None:
+    """slug の class を 1 段下げて、 pending あり最大の workload を選ぶ.
+    cpu まで降りて何も無ければ None。"""
+    target = next((w for w in workloads if w.get("slug") == slug), None)
+    if not target:
+        return None
+    cur_class = classify_fn(target)
+    if cur_class not in _BALANCER_CLASS_CHAIN:
+        return None
+    idx = _BALANCER_CLASS_CHAIN.index(cur_class)
+    if idx + 1 >= len(_BALANCER_CLASS_CHAIN):
+        return None
+    next_class = _BALANCER_CLASS_CHAIN[idx + 1]
+    cands = [w for w in workloads
+             if classify_fn(w) == next_class
+                and int(w.get("pending") or 0) > 0
+                and w.get("enabled")
+                and w.get("supervisor_enabled", True)]
+    if not cands:
+        return None
+    return max(cands, key=lambda w: int(w.get("pending") or 0)).get("slug")
+
+
+def _balancer_oom_events(runs: list[dict], window_min: int,
+                          wid_to_host: dict[str, str]) -> list[dict[str, Any]]:
+    """直近 window 分の runs から OOM 失敗を抽出。
+
+    error / stderr に _BALANCER_OOM_RE が当たれば 1 件。 1 cycle 内で
+    (host, slug) 別に集計して降格判定に使う。
+    """
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=window_min)
+    out: list[dict[str, Any]] = []
+    for r in runs:
+        if r.get("success") is not False:
+            continue
+        fin = r.get("finished_at") or r.get("started_at")
+        if not fin:
+            continue
+        try:
+            fdt = (fin if isinstance(fin, _dt.datetime)
+                    else _dt.datetime.fromisoformat(str(fin).replace("Z", "+00:00")))
+            if fdt.tzinfo is None:
+                fdt = fdt.replace(tzinfo=_dt.timezone.utc)
+        except Exception:
+            continue
+        if fdt < cutoff:
+            continue
+        blob = (r.get("error") or "") + " " + (r.get("stderr") or "")
+        if not _BALANCER_OOM_RE.search(blob):
+            continue
+        wid = r.get("worker_id") or ""
+        host = wid_to_host.get(wid) or _parse_host_from_wid(wid)
+        out.append({
+            "worker_id": wid,
+            "worker_host_family": host,
+            "workload_slug": r.get("workload_slug"),
+            "ts": fin,
+        })
+    return out
+
+
+def _balancer_pack_host(
+    host_family: str,
+    capacity_mb: int,
+    workloads: list[dict],
+    excluded_slugs: set[str],
+    cfg: dict[str, Any],
+) -> tuple[dict[str, int], int]:
+    """host 1 つの最適配分を greedy で算出.
+
+    返り値: (plan={slug: n}, used_mb)。
+    capacity_mb × vram_safety_frac を予算とし、 density 高い順に詰める。
+    excluded_slugs: cool-down 中 / supervisor_enabled=False で除外する slug。
+    """
+    budget = int(capacity_mb * float(cfg["vram_safety_frac"]))
+    used = 0
+    plan: dict[str, int] = {}
+    cand = [w for w in workloads
+            if w.get("enabled")
+            and w.get("supervisor_enabled", True)
+            and _balancer_classify(w) in ("heavy", "medium", "light")
+            and w.get("slug") not in excluded_slugs]
+    # host_affinity チェック (= workload が host limit を持ってればそれを尊重)
+    cand = [w for w in cand
+            if not w.get("host_affinity")
+                or host_family in (w.get("host_affinity") or [])]
+    cand.sort(key=lambda w: _balancer_density(w, float(cfg.get("cold_start_boost", 5.0))),
+              reverse=True)
+    for w in cand:
+        d = _balancer_density(w, float(cfg.get("cold_start_boost", 5.0)))
+        if d <= 0.0:
+            continue
+        peak = int(w.get("observed_vram_mb_peak") or w.get("resources_vram_mb") or 0)
+        if peak <= 0:
+            continue
+        room = (budget - used) // peak
+        if room <= 0:
+            break
+        tank_cap = max(1, int(w.get("pending") or 0) // int(cfg.get("tasks_per_worker_hint", 100)))
+        n = min(int(room), int(cfg.get("max_workers_per_workload", 6)), tank_cap)
+        if n <= 0:
+            continue
+        plan[w["slug"]] = n
+        used += n * peak
+    return plan, used
+
+
+def _balancer_run(state: dict[str, Any], hosts: list[dict],
+                   workloads: list[dict], workers: list[dict],
+                   runs: list[dict]) -> dict[str, Any]:
+    """1 cycle 分の balancer 評価本体。 dry-run でも必ず計画ログを出す。
+
+    apply_mode=True なら POST /workers/{id}/filter を実発行する (= worker 配分のみ)。
+    systemd instance 数の変更は別フラグ scale_apply で更に追加保護。
+    """
+    cfg = state["balancer_cfg"]
+    if not cfg.get("enabled"):
+        return {"skipped": "balancer disabled"}
+
+    # 1) signal 整形
+    # workers を host_family ごとに分類、 GPU lane (= gpu_vram_mb>0) のみ対象
+    wid_to_host = {w["id"]: _parse_host_from_wid(w["id"]) for w in workers}
+    eligible: dict[str, list[dict]] = defaultdict(list)
+    pinned_count = 0
+    for w in workers:
+        if w.get("state") != "active":
+            continue
+        if int((w.get("resources") or {}).get("gpu_vram_mb") or 0) <= 0:
+            continue
+        # operator/claude 固定 worker は触らない
+        upd_by = (w.get("filter_updated_by") or "")
+        if any(upd_by.startswith(p) for p in cfg["respect_updated_by_prefixes"]):
+            pinned_count += 1
+            continue
+        eligible[_parse_host_from_wid(w["id"])].append(w)
+
+    # 2) host capacity を確定。 _host_stats の mem_total_mb を優先、 無ければ worker
+    #    申告 (gpu_vram_mb) を採用。
+    host_caps: dict[str, int] = {}
+    for h in hosts:
+        cap = int(h.get("mem_total_mb") or 0)
+        if cap > 0:
+            host_caps[h["id"]] = cap
+    for fam, wlist in eligible.items():
+        if fam in host_caps:
+            continue
+        caps = [int((w.get("resources") or {}).get("gpu_vram_mb") or 0) for w in wlist]
+        if caps:
+            host_caps[fam] = max(caps)
+
+    # 3) OOM events 集計 (= host 単位)
+    oom_events = _balancer_oom_events(runs, int(cfg["oom_window_min"]), wid_to_host)
+    oom_by_host: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for e in oom_events:
+        oom_by_host[e["worker_host_family"]][e["workload_slug"]] += 1
+
+    # 4) cool-down の expire / extend 管理
+    now_mono = time.monotonic()
+    cooldown = state["balancer_oom_cooldown"]   # (host, slug) → expire_mono
+    for key, exp in list(cooldown.items()):
+        if exp <= now_mono:
+            del cooldown[key]
+    # 新規 OOM を cool-down 登録 (既存があれば multiplier で延長)
+    new_demote_marks: list[dict[str, Any]] = []
+    for host_fam, slug_counts in oom_by_host.items():
+        for slug, cnt in slug_counts.items():
+            if cnt < int(cfg["oom_demote_threshold"]):
+                continue
+            key = (host_fam, slug)
+            base = float(cfg["oom_cooldown_s"])
+            if key in cooldown:
+                base *= float(cfg.get("oom_cooldown_multiplier", 2.0))
+            cooldown[key] = now_mono + base
+            new_demote_marks.append({
+                "host": host_fam, "slug": slug,
+                "oom_count": cnt, "cooldown_s": int(base),
+            })
+
+    # 5) 各 host の plan を計算
+    plans: dict[str, dict[str, int]] = {}
+    used_per_host: dict[str, int] = {}
+    for fam, wlist in eligible.items():
+        cap = host_caps.get(fam, 0)
+        if cap <= 0:
+            continue
+        # cool-down 中の (host, slug) を除外
+        excluded = {slug for (h, slug), _ in cooldown.items() if h == fam}
+        plan, used = _balancer_pack_host(fam, cap, workloads, excluded, cfg)
+        plans[fam] = plan
+        used_per_host[fam] = used
+
+    # 6) target_n と現状から swap 計画 (= worker filter の書換)
+    swaps: list[dict[str, Any]] = []
+    cur_assign_log: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    last_swap = state["balancer_last_swap_mono"]
+    swap_margin = float(cfg["swap_margin"])
+    min_dwell_s = float(cfg["min_dwell_s"])
+    max_swaps = int(cfg["max_swaps_per_cycle"])
+
+    def _density_lookup(slug: str) -> float:
+        for w in workloads:
+            if w.get("slug") == slug:
+                return _balancer_density(w, float(cfg.get("cold_start_boost", 5.0)))
+        return 0.0
+
+    for fam, wlist in eligible.items():
+        plan = plans.get(fam, {})
+        # 各 worker の現在 filter (= 単一 slug filter のみ識別、 複数 / 全許可は __any__)
+        slot_of: dict[str, str] = {}        # worker_id → "slug" or "__any__"
+        for w in wlist:
+            f = w.get("workload_filter") or w.get("env_filter") or []
+            if isinstance(f, list) and len(f) == 1:
+                slot_of[w["id"]] = f[0]
+                cur_assign_log[fam][f[0]] += 1
+            else:
+                slot_of[w["id"]] = "__any__"
+                cur_assign_log[fam]["__any__"] += 1
+
+        # plan に書かれていない slug を持つ worker を「余剰候補」 リスト化
+        surplus_workers: list[dict] = []
+        for w in wlist:
+            cur_slug = slot_of[w["id"]]
+            if cur_slug == "__any__":
+                surplus_workers.append(w)
+            elif cur_slug not in plan:
+                surplus_workers.append(w)
+            elif sum(1 for ww in wlist
+                      if slot_of[ww["id"]] == cur_slug) > plan[cur_slug]:
+                surplus_workers.append(w)
+
+        # plan に足りない slug を埋める
+        for plan_slug, target_n in plan.items():
+            cur_n = sum(1 for ww in wlist if slot_of[ww["id"]] == plan_slug)
+            need = target_n - cur_n
+            if need <= 0:
+                continue
+            new_score = _density_lookup(plan_slug)
+            # 余剰 worker から hysteresis 通る人を順番に取る
+            for victim in list(surplus_workers):
+                if need <= 0:
+                    break
+                if len(swaps) >= max_swaps:
+                    break
+                # dwell チェック
+                last = last_swap.get(victim["id"], 0.0)
+                if last > 0 and (now_mono - last) < min_dwell_s:
+                    continue
+                # swap_margin チェック (= 現 score の swap_margin 倍を新 score が超える)
+                cur_slug = slot_of[victim["id"]]
+                cur_score = 0.0 if cur_slug == "__any__" else _density_lookup(cur_slug)
+                if cur_score > 0 and new_score < cur_score * swap_margin:
+                    continue
+                # VRAM 二重チェックは server 側 _host_vram_budget に任せる
+                swaps.append({
+                    "host": fam,
+                    "worker_id": victim["id"],
+                    "from": cur_slug,
+                    "to": plan_slug,
+                    "cur_score": round(cur_score, 2),
+                    "new_score": round(new_score, 2),
+                    "reason": f"pack target n[{plan_slug}]={target_n}",
+                })
+                surplus_workers.remove(victim)
+                slot_of[victim["id"]] = plan_slug
+                need -= 1
+            if len(swaps) >= max_swaps:
+                break
+        if len(swaps) >= max_swaps:
+            break
+
+    # 7) apply
+    applied = 0
+    apply_mode = bool(cfg.get("apply_mode"))
+    for s in swaps:
+        if not apply_mode:
+            continue
+        rp = _post_worker_filter(
+            state["control_url"], s["worker_id"], [s["to"]],
+            updated_by="supervisor:tank-balancer",
+            apply_mode=True,
+        )
+        if rp.get("ok"):
+            applied += 1
+            last_swap[s["worker_id"]] = now_mono
+
+    # 8) report
+    cap_total = sum(host_caps.values())
+    used_total = sum(used_per_host.values())
+    util = round(used_total / max(cap_total, 1) * 100.0, 1)
+    report = {
+        "enabled": True,
+        "apply_mode": apply_mode,
+        "pinned_workers": pinned_count,
+        "hosts": [
+            {
+                "host": fam,
+                "capacity_mb": host_caps.get(fam, 0),
+                "target_used_mb": used_per_host.get(fam, 0),
+                "target_util_pct": round(used_per_host.get(fam, 0) / max(host_caps.get(fam, 1), 1) * 100.0, 1),
+                "plan": plans.get(fam, {}),
+                "current": dict(cur_assign_log.get(fam, {})),
+            }
+            for fam in sorted(eligible.keys())
+        ],
+        "oom_events_n": len(oom_events),
+        "oom_demote_marks": new_demote_marks,
+        "cooldown_active": [
+            {"host": h, "slug": s, "remaining_s": int(exp - now_mono)}
+            for (h, s), exp in cooldown.items()
+        ],
+        "swaps_planned": len(swaps),
+        "swaps_applied": applied,
+        "swap_details": swaps,
+        "vram_target_util_pct": util,
+    }
+    # 簡潔 1 行サマリ (= journalctl で grep しやすい形)
+    summary_line = (
+        f"[balancer] mode={'APPLY' if apply_mode else 'DRY'} "
+        f"hosts={len(report['hosts'])} pinned={pinned_count} "
+        f"vram_target={util}% swaps={len(swaps)} oom={len(oom_events)} "
+        f"cooldowns={len(cooldown)}"
+    )
+    log.info(summary_line)
+    if swaps:
+        for s in swaps[:10]:
+            log.info("[balancer] swap host=%s wid=%s %s→%s score=%.1f→%.1f (%s)",
+                     s["host"], s["worker_id"], s["from"], s["to"],
+                     s["cur_score"], s["new_score"], s["reason"])
+    if new_demote_marks:
+        for m in new_demote_marks:
+            log.warning("[balancer] OOM demote mark: host=%s slug=%s count=%d cooldown=%ds",
+                         m["host"], m["slug"], m["oom_count"], m["cooldown_s"])
+    return report
+
+
 # ---------------- main process ---------------- #
 
 def process(task, ctx, state):
@@ -743,6 +1165,15 @@ def process(task, ctx, state):
     out["results"] = results
     out["dispatch_secs"] = round(time.time() - started, 2)
     out["apply_mode"] = state["apply_mode"]
+
+    # ---------- 4.5. adaptive bin-packing balancer ----------
+    # 既存 rule 評価とは独立に走る。 enabled=False なら no-op (skip 記録のみ)。
+    try:
+        bal = _balancer_run(state, hosts, workloads, wks, runs)
+        out["balancer"] = bal
+    except Exception as e:
+        log.warning("balancer pass failed: %s", e, exc_info=True)
+        out["balancer"] = {"error": str(e)[:200]}
 
     # ---------- 5. LLM advisor (= 設定で enabled なら N min 毎) ----------
     try:

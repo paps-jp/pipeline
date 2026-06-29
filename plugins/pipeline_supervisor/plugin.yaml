@@ -57,6 +57,67 @@ init_kwargs:
     min: 100
     max: 1000
 
+  # ---------------- adaptive bin-packing balancer ---------------- #
+  # tank pressure + VRAM 85% packing + OOM 降格を自動で行う。 既存 rule と並列稼働。
+  - key: balancer_enabled
+    type: int
+    default: 0
+    label: balancer ON/OFF (1=on, 0=off)
+    help: ON にすると VRAM 85% を目標に worker filter を tank pressure で自動再配分
+    min: 0
+    max: 1
+  - key: balancer_apply_mode
+    type: int
+    default: 0
+    label: balancer 実適用 (1=POST 発行, 0=dry-run log のみ)
+    min: 0
+    max: 1
+  - key: balancer_vram_safety_frac
+    type: str
+    default: "0.85"
+    label: VRAM 利用目標率 (0.0-1.0)
+    help: host capacity の何 % まで詰めるか
+  - key: balancer_max_workers_per_workload
+    type: int
+    default: 6
+    label: 1 workload あたりの最大 worker 数 / host
+    min: 1
+    max: 64
+  - key: balancer_max_swaps_per_cycle
+    type: int
+    default: 6
+    label: 1 cycle で動かす worker 数の上限 (= 急変動防止)
+    min: 1
+    max: 32
+  - key: balancer_min_dwell_s
+    type: int
+    default: 300
+    label: swap 後の固定時間 (秒、 短すぎると flap)
+    min: 30
+    max: 3600
+  - key: balancer_swap_margin
+    type: str
+    default: "1.3"
+    label: swap 発動の score 倍率 (= 新スコア ≥ 現 × margin で発動)
+  - key: balancer_oom_window_min
+    type: int
+    default: 10
+    label: OOM 検知 window (分)
+    min: 1
+    max: 60
+  - key: balancer_oom_demote_threshold
+    type: int
+    default: 3
+    label: window 内 OOM 件数で降格判定
+    min: 1
+    max: 100
+  - key: balancer_oom_cooldown_s
+    type: int
+    default: 1800
+    label: 降格後の cool-down (秒)
+    min: 60
+    max: 86400
+
 hidden_kwargs:
   - workload_slug
   - control_url
