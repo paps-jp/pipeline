@@ -430,6 +430,11 @@ class WorkerDaemon:
         self._gpu_temp_c: float | None = None
         self._gpu_hot_c = float(os.environ.get("PAPRIKA_GPU_HOT_C", "70"))
         self._gpu_cool_c = float(os.environ.get("PAPRIKA_GPU_COOL_C", "50"))
+        # GPU 非搭載レーン判定: CUDA_VISIBLE_DEVICES が空 or "-1" の worker (= cpu@ instance)
+        # は requires_gpu workload を claim しない。 server 側は物理 GPU を申告してしまい
+        # cpu/gpu を区別できないため、 worker 自身の CVD が唯一の確実な signal。
+        _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        self._has_gpu = _cvd not in ("", "-1")
         # ---------------- starvation prevention (= ハード floor) ----------------
         # 自 instance が複数 workload を兼任してる時、 特定 workload (= 60s lease の
         # paprika-job-submit 等) が monopoly して他の workload (= video-dispatcher 等)
@@ -456,30 +461,64 @@ class WorkerDaemon:
             os.environ.get("PIPELINE_WORKER_FILTER_RELOAD_S", "30")
         )
 
-    async def run(self) -> int:
-        """blocking entry — register → loops → deregister."""
-        self._install_signals()
-        # env 由来の filter (= systemd PIPELINE_WORKLOAD_FILTER) を register に申告。
-        # server 側は env_filter 列に保存し、 DB filter=null の時の base としてマージ
-        # 操作(POST /workers/{id}/filter mode=add)で「env を奪わない」 動作の根拠にする。
+    def _build_register_payload(self) -> dict[str, Any]:
+        """register / 再 register 共通の payload。 hostname と env_filter は不変だが
+        GPU 容量は再計測する (= 再 register は瞬時には起きないので素直に再測)。"""
         env_filter_list: list[str] | None = (
             sorted(self._filter) if self._filter else None
         )
-        # GPU 容量を register 時に申告。 control plane の VRAM 予算チェックの基準。
-        # 失敗 (CPU host / nvidia-smi 無し) は申告省略 (= 既存 fail-open で skip される)。
         gpu_capacity_mb = _measure_gpu_capacity_mb()
         resources: dict[str, Any] = {}
         if gpu_capacity_mb is not None and gpu_capacity_mb > 0:
             resources["gpu_vram_mb"] = gpu_capacity_mb
+        return {
+            "host": self.hostname,
+            "pid": os.getpid(),
+            "tags": [],
+            "resources": resources,
+            "worker_id": self.worker_id_hint,
+            "env_filter": env_filter_list,
+        }
+
+    @staticmethod
+    def _is_worker_404(exc: BaseException) -> bool:
+        """control plane が「この worker_id 知らない」 を返した = workers レコードが
+        消えている (prune_stale で削除 / DB 移行 / 手動 delete)。 daemon 側で再
+        register が必要。"""
+        return (
+            isinstance(exc, httpx.HTTPStatusError)
+            and exc.response is not None
+            and exc.response.status_code == 404
+        )
+
+    async def _reregister_self(self, source: str) -> bool:
+        """workers テーブルから自分が消えていたら再 register して復活する。
+        成功時 True、 失敗 (network/HTTP error) は False で次サイクル再挑戦。
+        """
+        log.warning("worker %s missing on control plane (%s 404); re-registering",
+                    self.worker_id, source)
         try:
-            registered = await self._client.register({
-                "host": self.hostname,
-                "pid": os.getpid(),
-                "tags": [],
-                "resources": resources,
-                "worker_id": self.worker_id_hint,
-                "env_filter": env_filter_list,
-            })
+            rec = await self._client.register(self._build_register_payload())
+        except Exception:
+            log.exception("re-register failed; will retry next cycle")
+            return False
+        new_id = rec.get("id") or self.worker_id
+        if new_id != self.worker_id:
+            log.warning("re-register returned different id: %s -> %s",
+                        self.worker_id, new_id)
+            self.worker_id = new_id
+        log.info("worker re-registered: id=%s host=%s", self.worker_id, self.hostname)
+        return True
+
+    async def run(self) -> int:
+        """blocking entry — register → loops → deregister."""
+        self._install_signals()
+        try:
+            # env 由来の filter (= systemd PIPELINE_WORKLOAD_FILTER) を register に申告。
+            # server 側は env_filter 列に保存し、 DB filter=null の時の base としてマージ
+            # 操作(POST /workers/{id}/filter mode=add)で「env を奪わない」 動作の根拠にする。
+            # GPU 容量も register 時に申告 (= 失敗 / CPU host / nvidia-smi 無しは省略)。
+            registered = await self._client.register(self._build_register_payload())
         except Exception:
             log.exception("register failed; cannot start worker")
             await self._client.aclose()
@@ -669,6 +708,15 @@ class WorkerDaemon:
                 if self._gpu_temp_c is not None:
                     payload["gpu_temp_c"] = float(self._gpu_temp_c)
                 await self._client.heartbeat(self.worker_id, payload)
+            except httpx.HTTPStatusError as e:
+                # 404 = workers テーブルから消えている。 再 register で復活させる。
+                # 消えた間の delta は次サイクルで送り直すため self._pending_* に戻す。
+                if self._is_worker_404(e):
+                    self._pending_rows += rd
+                    self._pending_errs += ed
+                    await self._reregister_self("heartbeat")
+                else:
+                    log.warning("heartbeat failed (will retry)", exc_info=False)
             except Exception:
                 log.warning("heartbeat failed (will retry)", exc_info=False)
             try:
@@ -714,7 +762,7 @@ class WorkerDaemon:
 
     @staticmethod
     def _workload_needs_gpu(w: dict[str, Any]) -> bool:
-        """resources.vram_mb > 0 を GPU 必要と判定。"""
+        """resources.vram_mb > 0 を GPU 必要と判定 (= サーマルスロットル用)。"""
         try:
             vram = int(((w.get("resources") or {}).get("vram_mb")) or 0)
         except Exception:
@@ -724,6 +772,13 @@ class WorkerDaemon:
     async def _drain_once(self) -> bool:
         try:
             workloads = await self._client.list_workloads(self.worker_id)
+        except httpx.HTTPStatusError as e:
+            if self._is_worker_404(e):
+                # 404 = workers レコード消滅。 再 register して次サイクルでやり直す。
+                await self._reregister_self("list_workloads")
+                return False
+            log.exception("list_workloads failed; sleeping")
+            return False
         except Exception:
             log.exception("list_workloads failed; sleeping")
             return False
@@ -759,6 +814,12 @@ class WorkerDaemon:
             # サーマルスロットル中 = GPU workload を claim しない (CPU only は通す)
             if self._gpu_throttle and self._workload_needs_gpu(w):
                 skipped_gpu_throttle += 1
+                continue
+            # GPU 非搭載レーン (cpu@ instance = CUDA_VISIBLE_DEVICES=-1) は requires_gpu
+            # workload を claim しない (= GPU 無しで executor build が失敗するのを防ぐ)。
+            # vram_mb ではなく requires_gpu で判定: dispatcher は vram_mb>0 だが
+            # requires_gpu=0 (= CPU workload) なので vram_mb 判定だと誤スキップする。
+            if not self._has_gpu and w.get("requires_gpu"):
                 continue
             tasks = await self._client.claim(self.worker_id, w["slug"], w["batch_size"])
             if not tasks:
