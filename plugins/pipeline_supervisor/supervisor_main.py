@@ -596,12 +596,19 @@ def _balancer_classify(w: dict[str, Any]) -> str:
 def _balancer_density(w: dict[str, Any], cold_start_boost: float = 5.0) -> float:
     """workload の「1 MB あたりの片付ける価値」 (= pack 順序のスコア)。
 
-    pending=0 → 0 (空 tank は配置価値なし)。
-    rate=0 で pending > 0 → priority だけで cold-start boost (= deadlock 解放)。
+    backlog (= pending + claimed) で判定。 pending だけ見ると batch_size=100 の
+    workload で claimed=100 / pending=0 のスナップショットを取ったとき density=0
+    に転落して配置候補から外れる (= 1 cycle で取りこぼし → 別 cycle で復帰の flap
+    の元になる)。 claimed も「処理中=しばらく VRAM を要求する」 ので密度に含める。
+
+    backlog=0 → 0 (空 tank は配置価値なし)。
+    rate=0 で backlog > 0 → priority だけで cold-start boost (= deadlock 解放)。
     通常 → (drain_eta_min × priority) / peak_vram_mb。
     """
     pending = int(w.get("pending") or 0)
-    if pending == 0:
+    claimed = int(w.get("claimed") or 0)
+    backlog = pending + claimed
+    if backlog == 0:
         return 0.0
     peak = max(int(w.get("observed_vram_mb_peak") or w.get("resources_vram_mb") or 0), 1)
     priority = max(int(w.get("priority") or 100), 1)
@@ -609,7 +616,7 @@ def _balancer_density(w: dict[str, Any], cold_start_boost: float = 5.0) -> float
     if rate <= 0.0:
         # 未着手 backlog: priority だけで決める
         return (priority * cold_start_boost) / peak
-    eta = pending / rate                          # 分
+    eta = backlog / rate                          # 分
     return (eta * (priority / 100.0)) / peak
 
 
@@ -712,7 +719,9 @@ def _balancer_pack_host(
         room = (budget - used) // peak
         if room <= 0:
             break
-        tank_cap = max(1, int(w.get("pending") or 0) // int(cfg.get("tasks_per_worker_hint", 100)))
+        # tank_cap も backlog ベース (= claimed in-flight 分も「これから処理する量」 として加算)
+        backlog = int(w.get("pending") or 0) + int(w.get("claimed") or 0)
+        tank_cap = max(1, backlog // int(cfg.get("tasks_per_worker_hint", 100)))
         n = min(int(room), int(cfg.get("max_workers_per_workload", 6)), tank_cap)
         if n <= 0:
             continue
