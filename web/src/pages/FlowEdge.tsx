@@ -21,6 +21,7 @@ import { useMantineColorScheme } from "@mantine/core";
 type EdgeData = {
   rate?: number | null;
   dashed?: boolean;
+  bidirectional?: boolean;
   label?: string | null;
   sourceLane?: number;
   targetLane?: number;
@@ -174,6 +175,27 @@ export function ParticleEdge(props: EdgeProps) {
               repeatCount="indefinite"
               begin={`${(duration / particleCount) * i}s`}
               path={edgePath}
+              rotate="auto"
+            />
+          </circle>
+        ))}
+      {isActive && d.bidirectional &&
+        Array.from({ length: particleCount }).map((_, i) => (
+          <circle
+            key={`rev-${i}`}
+            r={Math.max(2, fluidWidth / 2.2)}
+            fill={isLight ? "#ffffff" : "#ecfeff"}
+            opacity={isLight ? 0.85 : 0.95}
+            style={{ filter: `drop-shadow(0 0 4px ${fluidColor}${isLight ? "88" : "cc"})` }}
+          >
+            <animateMotion
+              dur={`${duration}s`}
+              repeatCount="indefinite"
+              begin={`${(duration / particleCount) * i + duration / (particleCount * 2)}s`}
+              path={edgePath}
+              keyPoints="1;0"
+              keyTimes="0;1"
+              calcMode="linear"
               rotate="auto"
             />
           </circle>
