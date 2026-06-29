@@ -1235,19 +1235,21 @@ export default function Flow() {
           i - (list.length - 1) / 2;
       });
     }
-    // 双方向ペア (A->B と B->A の両方が存在) は同一線上で完全に重なって 1 本に
-    // 見えるので、 決定的に逆向きの lane を足して 2 本の平行配管に分離する。
-    const _pairKey = (s: string, t: string) => `${s} ${t}`;
-    const _present = new Set(built.map((e) => _pairKey(e.source, e.target)));
+    // 双方向ペア (A->B と B->A) は 1 本のパイプに統合 (data.bidirectional)、
+    // 粒子を両方向に流して双方向を表現する。 2 本に分けて lane オフセットすると
+    // source/target の handle 向きが違う集合点でねじれるため、 1 本化が安定。
+    const _drop = new Set<string>();
     for (const e of built) {
-      if (_present.has(_pairKey(e.target, e.source))) {
-        const _dir = e.source < e.target ? 1 : -1;
-        const _d = e.data as Record<string, unknown>;
-        _d.sourceLane = (_d.sourceLane as number) + _dir;
-        _d.targetLane = (_d.targetLane as number) + _dir;
+      if (_drop.has(e.id)) continue;
+      const rev = built.find(
+        (x) => x.source === e.target && x.target === e.source && x.id !== e.id,
+      );
+      if (rev) {
+        (e.data as Record<string, unknown>).bidirectional = true;
+        _drop.add(rev.id);
       }
     }
-    return built;
+    return built.filter((e) => !_drop.has(e.id));
   }, [snapQ.data, nodes]);
 
   // edges から activeHandlesMap (= node id → 使用 handle id set) を組み、
