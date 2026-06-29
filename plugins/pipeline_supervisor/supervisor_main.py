@@ -571,7 +571,15 @@ def _balancer_classify(w: dict[str, Any]) -> str:
     medium  = 0.3 <= peak < 2 GB (image-hash-extract 等)
     light   = peak < 0.3 GB だが GPU 必要 (video-face-extract 等)
     cpu     = requires_gpu=False / peak=0 (= 並列度の制約が VRAM じゃない)
+
+    重要: `requires_gpu` を最優先で判定。 CPU plugin (paprika-image-pull,
+    image-dispatcher 等) は Python プロセスメモリ占有で observed_vram_mb_peak が
+    >0 に立つことがあるが、 実 GPU 計算はしないので heavy/medium に誤分類すると
+    GPU instance を CPU 仕事に流用してしまう (= VRAM 詰まらず instance 浪費)。
+    requires_gpu=False は無条件で cpu 階級。
     """
+    if not w.get("requires_gpu"):
+        return "cpu"
     peak = int(w.get("observed_vram_mb_peak") or 0)
     vram = int(w.get("resources_vram_mb") or 0)
     # peak は実測。 無い場合は宣言値 vram_mb を仮置き。 両方無ければ 0。
