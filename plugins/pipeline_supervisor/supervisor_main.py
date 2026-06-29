@@ -323,6 +323,9 @@ def _workload_stats(control_url: str, wls: list[dict], runs: list[dict],
         out.append({
             "slug": slug,
             "enabled": bool(w.get("enabled")),
+            # GPU 必須かどうか (= balancer の classify が階級判定に使う)。
+            # workload model の bool 列。 dispatcher 系は False、 embed 系は True。
+            "requires_gpu": bool(w.get("requires_gpu")),
             # supervisor が patch/filter 変更で介入することを許可するか。
             # False なら streak/cooldown は数えるが action は no-op。 既定 True。
             "supervisor_enabled": bool(w.get("supervisor_enabled", True)),
