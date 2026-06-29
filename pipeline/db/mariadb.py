@@ -20,7 +20,8 @@ from __future__ import annotations
 import re
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Iterator
 from urllib.parse import unquote, urlparse
 
@@ -106,15 +107,36 @@ def _coerce_params(params: Any) -> Any:
 # Cursor / Connection / Database 実装
 # ---------------------------------------------------------------------------
 
+def _norm_value(v: Any) -> Any:
+    """MariaDB が返す型を SQLite 互換 (= 文字列/数値) に正規化。
+
+    - DATETIME/DATE → ISO8601 文字列 (SQLite は TEXT で保存するため、 pipeline-oss は
+      enqueued_at 等を str 前提で扱う。 これを返さないと ClaimedTaskOut 等で
+      pydantic ValidationError(string_type) になる)。
+    - Decimal (= COUNT/SUM の戻り) → int (整数) or float。
+    """
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, Decimal):
+        return int(v) if v == v.to_integral_value() else float(v)
+    return v
+
+
+def _norm_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {k: _norm_value(v) for k, v in row.items()}
+
+
 class MariadbCursor(Cursor):
     def __init__(self, cur) -> None:
         self._cur = cur
 
     def fetchone(self) -> dict[str, Any] | None:
-        return self._cur.fetchone()
+        return _norm_row(self._cur.fetchone())
 
     def fetchall(self) -> list[dict[str, Any]]:
-        return list(self._cur.fetchall())
+        return [_norm_row(r) for r in self._cur.fetchall()]
 
     @property
     def rowcount(self) -> int:
