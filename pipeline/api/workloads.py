@@ -218,11 +218,12 @@ def peek_queue(
     slug: str,
     request: Request,
     limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
     state: str | None = Query(None, description="絞り込む state (pending/claimed/failed)"),
 ) -> QueuePeekResponse:
-    """queue の中身を覗く (admin / dispatcher 用)。state 指定で絞り込み可。"""
+    """queue の中身を覗く (admin / dispatcher 用)。state 指定で絞り込み可。offset でページネーション可。"""
     w = _get_or_404(request, slug)
-    items = _queue_repo(request).peek(w.queue_table, limit=limit)
+    items = _queue_repo(request).peek(w.queue_table, limit=limit, offset=offset)
     if state:
         items = [it for it in items if it.get("state") == state]
     return QueuePeekResponse(items=items)

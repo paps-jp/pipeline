@@ -260,8 +260,8 @@ class QueueRepository:
             rows = cur.fetchall()
         return {r["state"]: int(r["c"]) for r in rows}
 
-    def peek(self, queue_table: str, limit: int = 20) -> list[dict[str, Any]]:
-        """admin 用: queue の中身を limit 件覗く。"""
+    def peek(self, queue_table: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        """admin 用: queue の中身を limit 件覗く。offset でページネーション可。"""
         _validate_queue_table(queue_table)
         with self._get_db(queue_table).transaction() as conn:
             cur = conn.execute(
@@ -270,9 +270,9 @@ class QueueRepository:
                        enqueued_at, last_error, extra
                 FROM {queue_table}
                 ORDER BY enqueued_at DESC, pk
-                LIMIT :lim
+                LIMIT :lim OFFSET :off
                 """,
-                {"lim": int(limit)},
+                {"lim": int(limit), "off": int(offset)},
             )
             return [
                 {
