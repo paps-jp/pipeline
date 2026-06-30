@@ -103,6 +103,30 @@ def setup(**kwargs) -> dict[str, Any]:
         # balancer 状態 (= flap 抑制と OOM cool-down)
         "balancer_last_swap_mono": {},     # worker_id → monotonic 秒
         "balancer_oom_cooldown": {},        # (host, slug) → expire monotonic 秒
+        # MariaDB tank pressure balancer
+        "tank_pressure_cfg": {
+            "enabled": bool(int(kwargs.get("tank_pressure_enabled") or 0)),
+            "apply_mode": bool(int(kwargs.get("tank_pressure_apply_mode") or 0)),
+            "depth_hi": int(kwargs.get("tank_depth_hi") or 50_000),
+            "depth_lo": int(kwargs.get("tank_depth_lo") or 10_000),
+            "max_extra_workers": int(kwargs.get("tank_max_extra_workers") or 3),
+            "min_dwell_s": float(kwargs.get("tank_min_dwell_s") or 300),
+            # upstream boost: downstream tank ≈ 0 → upstream workload に worker 追加
+            "upstream_map": _parse_upstream_map(kwargs.get("tank_upstream_map") or ""),
+            "upstream_lo": int(kwargs.get("tank_upstream_lo") or 100),
+        },
+        "tank_assigned": {},           # downstream slug → [worker_id, ...]  (consumer boost)
+        "tank_assigned_at": {},        # worker_id → monotonic 秒
+        "tank_upstream_assigned": {},  # downstream slug → [worker_id, ...]  (upstream boost)
+        "tank_upstream_assigned_at": {},  # worker_id → monotonic 秒
+        # self_loop stall watcher
+        "stall_watcher_cfg": {
+            "enabled": bool(int(kwargs.get("stall_watcher_enabled") or 0)),
+            "apply_mode": bool(int(kwargs.get("stall_watcher_apply_mode") or 0)),
+            "threshold": int(kwargs.get("stall_threshold") or 10),
+            "timeout_s": float(kwargs.get("stall_timeout_s") or 300),
+        },
+        "stall_since": {},  # slug → first_stall_mono (claimed==0 かつ throughput==0 が続く開始時刻)
     }
     log.info("supervisor: control=%s rules=%s apply_mode=%s",
              state["control_url"], state["rules_path"], state["apply_mode"])
@@ -989,6 +1013,316 @@ def _balancer_run(state: dict[str, Any], hosts: list[dict],
     return report
 
 
+def _self_loop_stall_watcher(
+    state: dict[str, Any],
+    workload_stats: list[dict],
+    raw_wls: list[dict],
+) -> dict[str, Any]:
+    """self_loop workload の滞留検知と自動 re-enqueue。
+
+    pending >= threshold かつ claimed == 0 かつ throughput_min == 0 が
+    timeout_s 継続 → 新 tick を POST /api/v1/workloads/{slug}/tasks で挿入。
+
+    self_loop は通常 tick 完了後に次 tick を自己 enqueue する。この仕組みが
+    なんらかの理由で途切れると claimed=0/pending>0 のまま永久停止する。
+    supervisor がその状態を検知して蹴り直す。
+    """
+    cfg = state.get("stall_watcher_cfg") or {}
+    if not cfg.get("enabled"):
+        return {"skipped": "stall_watcher disabled"}
+
+    apply_mode = bool(cfg.get("apply_mode"))
+    threshold  = int(cfg.get("threshold") or 10)
+    timeout_s  = float(cfg.get("timeout_s") or 300)
+    control_url = state["control_url"]
+    now_mono   = time.monotonic()
+
+    stall_since: dict[str, float] = state.setdefault("stall_since", {})
+
+    self_loop_slugs: set[str] = {
+        w["slug"] for w in raw_wls
+        if w.get("workload_type") == "self_loop" and w.get("enabled")
+    }
+
+    actions: list[dict] = []
+    stall_status: dict[str, Any] = {}
+
+    for ws in workload_stats:
+        slug = ws.get("slug")
+        if slug not in self_loop_slugs:
+            continue
+
+        pending    = int(ws.get("pending") or 0)
+        claimed    = int(ws.get("claimed") or 0)
+        throughput = float(ws.get("throughput_min") or 0.0)
+
+        # stall 判定: pending あり + 現在 tick なし + 直近完了なし
+        is_stalled = pending >= threshold and claimed == 0 and throughput == 0.0
+
+        if not is_stalled:
+            stall_since.pop(slug, None)
+            continue
+
+        first   = stall_since.setdefault(slug, now_mono)
+        elapsed = now_mono - first
+        stall_status[slug] = {"elapsed_s": int(elapsed), "pending": pending}
+
+        if elapsed < timeout_s:
+            log.debug("[stall-watcher] %s stalled %ds/%ds pending=%d",
+                      slug, int(elapsed), int(timeout_s), pending)
+            continue
+
+        # timeout 超過 → 新 tick を挿入
+        stall_since.pop(slug, None)   # タイマーリセット (連打防止)
+        pk = f"tick-supervisor-{int(time.time())}"
+        log.warning("[stall-watcher] %s STALLED %ds (pending=%d claimed=0 tp=0) "
+                    "→ re-enqueue pk=%s %s",
+                    slug, int(elapsed), pending, pk,
+                    "APPLIED" if apply_mode else "DRY")
+        if apply_mode:
+            req = urllib.request.Request(
+                f"{control_url}/api/v1/workloads/{slug}/tasks",
+                data=json.dumps({"pk": pk}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    r.read()
+                actions.append({"slug": slug, "action": "re-enqueue",
+                                 "pk": pk, "elapsed_s": int(elapsed),
+                                 "pending": pending, "applied": True})
+            except Exception as e:
+                log.warning("[stall-watcher] re-enqueue failed for %s: %s", slug, e)
+                actions.append({"slug": slug, "action": "re-enqueue-failed",
+                                 "pk": pk, "error": str(e)[:120]})
+        else:
+            actions.append({"slug": slug, "action": "re-enqueue",
+                             "pk": pk, "elapsed_s": int(elapsed),
+                             "pending": pending, "dry_run": True})
+
+    return {
+        "enabled": True,
+        "apply_mode": apply_mode,
+        "threshold": threshold,
+        "timeout_s": timeout_s,
+        "self_loop_slugs": sorted(self_loop_slugs),
+        "stalled": stall_status,
+        "actions": actions,
+    }
+
+
+def _parse_upstream_map(raw: str) -> dict[str, str]:
+    """'{"face-person-link":"image-hash-extract"}' → dict。 空文字や不正 JSON は {}。"""
+    if not raw.strip():
+        return {}
+    try:
+        v = json.loads(raw)
+        return {str(k): str(v2) for k, v2 in v.items()} if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+# ── MariaDB tank pressure balancer ──────────────────────────────────────────
+# depth が depth_hi を超えたらアイドル worker を一時追加投入し、
+# depth_lo を下回り min_dwell_s 経過後に解放する。
+# preemption ループ回避のため、追加 worker はその workload 専用
+# ([slug] 単独 filter) に設定する (2026-06-30 実証)。
+# ──────────────────────────────────────────────────────────────────────────
+
+def _tank_pressure_run(
+    state: dict[str, Any],
+    workload_stats: list[dict],
+    raw_wls: list[dict],
+    workers: list[dict],
+) -> dict[str, Any]:
+    cfg = state.get("tank_pressure_cfg") or {}
+    if not cfg.get("enabled"):
+        return {"skipped": "tank_pressure disabled"}
+
+    apply_mode  = bool(cfg.get("apply_mode"))
+    depth_hi    = int(cfg.get("depth_hi") or 50_000)
+    depth_lo    = int(cfg.get("depth_lo") or 10_000)
+    max_extra   = int(cfg.get("max_extra_workers") or 3)
+    min_dwell   = float(cfg.get("min_dwell_s") or 300)
+    control_url = state["control_url"]
+    now_mono    = time.monotonic()
+
+    assigned: dict[str, list[str]] = state.setdefault("tank_assigned", {})
+    assigned_at: dict[str, float]  = state.setdefault("tank_assigned_at", {})
+
+    mariadb_slugs: set[str] = {
+        w["slug"] for w in raw_wls
+        if w.get("queue_backend") == "mariadb" and w.get("enabled")
+    }
+    if not mariadb_slugs:
+        return {"enabled": True, "mariadb_slugs": 0}
+
+    stat_by_slug = {ws["slug"]: ws for ws in workload_stats}
+
+    # アイドル候補: active + current_workload なし + operator 固定でない + 入口担当でない
+    idle_candidates: list[dict] = []
+    for w in workers:
+        if w.get("state") != "active":
+            continue
+        if w.get("current_workload"):
+            continue
+        if (w.get("filter_updated_by") or "").startswith("operator:"):
+            continue
+        if set(w.get("env_filter") or []) & ENTRY_WORKLOADS:
+            continue
+        idle_candidates.append(w)
+
+    all_assigned: set[str] = {wid for wids in assigned.values() for wid in wids}
+    actions: list[dict] = []
+
+    for slug in list(mariadb_slugs):
+        stat  = stat_by_slug.get(slug)
+        depth = int((stat or {}).get("pending") or 0)
+        cur   = list(assigned.get(slug) or [])
+
+        if depth <= depth_lo:
+            freed: list[str] = []
+            for wid in cur:
+                if now_mono - assigned_at.get(wid, 0.0) < min_dwell:
+                    continue
+                freed.append(wid)
+                _post_worker_filter(
+                    control_url, wid, None,
+                    updated_by="supervisor:tank-pressure:release",
+                    apply_mode=apply_mode,
+                )
+                assigned_at.pop(wid, None)
+                log.info("[tank-pressure] release wid=%s slug=%s depth=%d lo=%d %s",
+                         wid, slug, depth, depth_lo,
+                         "APPLIED" if apply_mode else "DRY")
+            if freed:
+                assigned[slug] = [w for w in cur if w not in freed]
+                actions.append({"slug": slug, "action": "release",
+                                 "workers": freed, "depth": depth, "applied": apply_mode})
+            continue
+
+        if depth < depth_hi:
+            continue
+
+        need = max_extra - len(cur)
+        if need <= 0:
+            continue
+
+        added: list[str] = []
+        for victim in list(idle_candidates):
+            if need <= 0:
+                break
+            wid = victim.get("id")
+            if not wid or wid in all_assigned:
+                continue
+            r = _post_worker_filter(
+                control_url, wid, [slug],
+                updated_by="supervisor:tank-pressure:assign",
+                apply_mode=apply_mode,
+            )
+            if not r.get("ok"):
+                log.warning("[tank-pressure] filter set failed wid=%s err=%s",
+                             wid, r.get("error"))
+                continue
+            added.append(wid)
+            assigned_at[wid] = now_mono
+            all_assigned.add(wid)
+            idle_candidates.remove(victim)
+            need -= 1
+
+        if added:
+            assigned[slug] = cur + added
+            actions.append({"slug": slug, "action": "assign",
+                             "workers": added, "depth": depth, "applied": apply_mode})
+            log.info("[tank-pressure] assign %d workers to %s depth=%d hi=%d %s: %s",
+                     len(added), slug, depth, depth_hi,
+                     "APPLIED" if apply_mode else "DRY", added)
+
+    # ── upstream boost: downstream depth ≈ 0 → upstream producer に worker 追加 ──
+    upstream_map: dict[str, str] = cfg.get("upstream_map") or {}
+    upstream_lo  = int(cfg.get("upstream_lo") or 100)
+    up_assigned: dict[str, list[str]] = state.setdefault("tank_upstream_assigned", {})
+    up_at: dict[str, float]           = state.setdefault("tank_upstream_assigned_at", {})
+
+    for ds_slug, us_slug in upstream_map.items():
+        ds_stat  = stat_by_slug.get(ds_slug)
+        ds_depth = int((ds_stat or {}).get("pending") or 0)
+        cur_up   = list(up_assigned.get(ds_slug) or [])
+
+        # downstream が回復したら upstream 追加 worker を解放
+        if ds_depth > upstream_lo:
+            freed_up: list[str] = []
+            for wid in cur_up:
+                if now_mono - up_at.get(wid, 0.0) < min_dwell:
+                    continue
+                freed_up.append(wid)
+                _post_worker_filter(
+                    control_url, wid, None,
+                    updated_by="supervisor:tank-pressure:upstream-release",
+                    apply_mode=apply_mode,
+                )
+                up_at.pop(wid, None)
+                log.info("[tank-pressure] upstream release wid=%s us=%s ds=%s ds_depth=%d %s",
+                         wid, us_slug, ds_slug, ds_depth,
+                         "APPLIED" if apply_mode else "DRY")
+            if freed_up:
+                up_assigned[ds_slug] = [w for w in cur_up if w not in freed_up]
+                actions.append({"slug": us_slug, "action": "upstream-release",
+                                 "downstream": ds_slug, "workers": freed_up,
+                                 "ds_depth": ds_depth, "applied": apply_mode})
+            continue
+
+        # downstream がほぼゼロ → upstream workload に worker 追加
+        need_up = max_extra - len(cur_up)
+        if need_up <= 0:
+            continue
+
+        added_up: list[str] = []
+        for victim in list(idle_candidates):
+            if need_up <= 0:
+                break
+            wid = victim.get("id")
+            if not wid or wid in all_assigned:
+                continue
+            r = _post_worker_filter(
+                control_url, wid, [us_slug],
+                updated_by="supervisor:tank-pressure:upstream-assign",
+                apply_mode=apply_mode,
+            )
+            if not r.get("ok"):
+                log.warning("[tank-pressure] upstream filter set failed wid=%s err=%s",
+                             wid, r.get("error"))
+                continue
+            added_up.append(wid)
+            up_at[wid] = now_mono
+            all_assigned.add(wid)
+            idle_candidates.remove(victim)
+            need_up -= 1
+
+        if added_up:
+            up_assigned[ds_slug] = cur_up + added_up
+            actions.append({"slug": us_slug, "action": "upstream-assign",
+                             "downstream": ds_slug, "workers": added_up,
+                             "ds_depth": ds_depth, "applied": apply_mode})
+            log.info("[tank-pressure] upstream assign %d workers to %s "
+                     "(ds=%s depth=%d <= lo=%d) %s: %s",
+                     len(added_up), us_slug, ds_slug, ds_depth, upstream_lo,
+                     "APPLIED" if apply_mode else "DRY", added_up)
+
+    return {
+        "enabled": True,
+        "apply_mode": apply_mode,
+        "depth_hi": depth_hi,
+        "depth_lo": depth_lo,
+        "upstream_lo": upstream_lo,
+        "mariadb_slugs": sorted(mariadb_slugs),
+        "assigned": {k: v for k, v in assigned.items() if v},
+        "upstream_assigned": {k: v for k, v in up_assigned.items() if v},
+        "actions": actions,
+    }
+
+
 # ---------------- main process ---------------- #
 
 def process(task, ctx, state):
@@ -1222,6 +1556,22 @@ def process(task, ctx, state):
     except Exception as e:
         log.warning("balancer pass failed: %s", e, exc_info=True)
         out["balancer"] = {"error": str(e)[:200]}
+
+    # ---------- 4.6. MariaDB tank pressure balancer ----------
+    try:
+        tank = _tank_pressure_run(state, workloads, wls, wks)
+        out["tank_pressure"] = tank
+    except Exception as e:
+        log.warning("tank pressure pass failed: %s", e, exc_info=True)
+        out["tank_pressure"] = {"error": str(e)[:200]}
+
+    # ---------- 4.7. self_loop stall watcher ----------
+    try:
+        sw = _self_loop_stall_watcher(state, workloads, wls)
+        out["stall_watcher"] = sw
+    except Exception as e:
+        log.warning("stall watcher pass failed: %s", e, exc_info=True)
+        out["stall_watcher"] = {"error": str(e)[:200]}
 
     # ---------- 5. LLM advisor (= 設定で enabled なら N min 毎) ----------
     try:

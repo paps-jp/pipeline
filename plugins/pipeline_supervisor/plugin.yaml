@@ -118,6 +118,88 @@ init_kwargs:
     min: 60
     max: 86400
 
+  # ---------------- MariaDB tank pressure balancer ---------------- #
+  # MariaDB-backed workload の queue depth 監視。depth_hi 超えでアイドル worker を
+  # 一時追加投入し、depth_lo + min_dwell_s 後に解放する。
+  # preemption ループ回避のため追加 worker を専用化 ([slug] 単独 filter) する。
+  - key: tank_pressure_enabled
+    type: int
+    default: 0
+    label: tank pressure ON/OFF (1=on, 0=off)
+    min: 0
+    max: 1
+  - key: tank_pressure_apply_mode
+    type: int
+    default: 0
+    label: tank pressure 実適用 (1=POST 発行, 0=dry-run log のみ)
+    min: 0
+    max: 1
+  - key: tank_depth_hi
+    type: int
+    default: 50000
+    label: worker 追加を発動する queue 深さ閾値
+    min: 100
+    max: 10000000
+  - key: tank_depth_lo
+    type: int
+    default: 10000
+    label: worker 解放を発動する queue 深さ閾値
+    min: 0
+    max: 10000000
+  - key: tank_max_extra_workers
+    type: int
+    default: 3
+    label: 1 workload に追加できる worker 数の上限
+    min: 1
+    max: 20
+  - key: tank_min_dwell_s
+    type: int
+    default: 300
+    label: 追加後に解放を待つ最短時間 (秒、 flap 防止)
+    min: 30
+    max: 3600
+  # upstream boost: downstream tank ≈ 0 のとき upstream producer に worker を追加
+  - key: tank_upstream_map
+    type: str
+    default: ""
+    label: '上流 workload マップ (JSON例: {"face-person-link":"image-hash-extract"})'
+    help: |
+      downstream tank がゼロに近づいたとき、対応する upstream workload に
+      アイドル worker を追加投入する。 downstream が回復後 min_dwell_s 後に解放。
+  - key: tank_upstream_lo
+    type: int
+    default: 100
+    label: upstream boost 発動閾値 (downstream pending がこの値以下で発動)
+    min: 0
+    max: 100000
+
+  # ---------------- self_loop stall watcher ---------------- #
+  # claimed=0 かつ throughput=0 が続く self_loop workload を検知して自動 re-enqueue する。
+  - key: stall_watcher_enabled
+    type: int
+    default: 0
+    label: stall watcher ON/OFF (1=on, 0=off)
+    min: 0
+    max: 1
+  - key: stall_watcher_apply_mode
+    type: int
+    default: 0
+    label: stall watcher 実適用 (1=POST 発行, 0=dry-run log のみ)
+    min: 0
+    max: 1
+  - key: stall_threshold
+    type: int
+    default: 10
+    label: stall 判定の pending 最小件数 (これ未満なら stall とみなさない)
+    min: 1
+    max: 100000
+  - key: stall_timeout_s
+    type: int
+    default: 300
+    label: stall が何秒続いたら re-enqueue するか
+    min: 60
+    max: 3600
+
 hidden_kwargs:
   - workload_slug
   - control_url
