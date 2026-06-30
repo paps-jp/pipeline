@@ -24,7 +24,7 @@ import { modals } from "@mantine/modals";
 import { IconUsersGroup } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -402,12 +402,29 @@ function RuntimeSection() {
   const stateOrder: Record<string, number> = {
     active: 0, connecting: 1, draining: 2, lost: 3,
   };
-  const workers = [...rawWorkers].sort((a, b) => {
+  // host (= "ai-gpu1-cpu6" / "nas-c2-cpu" 等) から実ホストを抽出して区切る。
+  const physicalHost = (h: string): string =>
+    h.match(/^(ai-gpu\d+|nas)/)?.[1] ?? h;
+  // 各 worker を state→worker_id で安定ソート (= 旧 last_seen_at 順は heartbeat 毎に
+  // 入れ替わって見づらかった)。 numeric:true で w_..._2 < w_..._10 の自然順。
+  const byWorkerId = (a: WorkerInfo, b: WorkerInfo) => {
     const da = stateOrder[a.state] ?? 9;
     const db_ = stateOrder[b.state] ?? 9;
     if (da !== db_) return da - db_;
-    return (b.last_seen_at ?? "").localeCompare(a.last_seen_at ?? "");
-  });
+    return (a.id ?? "").localeCompare(b.id ?? "", undefined, { numeric: true });
+  };
+  const workers = [...rawWorkers].sort(byWorkerId);
+  // 実ホスト毎にグループ化 → host 名で自然順、各 host 内は state→worker_id。
+  const hostMap = new Map<string, WorkerInfo[]>();
+  for (const w of rawWorkers) {
+    const k = physicalHost(w.host ?? "");
+    const arr = hostMap.get(k);
+    if (arr) arr.push(w);
+    else hostMap.set(k, [w]);
+  }
+  const hostGroups = [...hostMap.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+    .map(([host, ws]) => ({ host, workers: ws.sort(byWorkerId) }));
 
   return (
     <Box>
@@ -451,7 +468,24 @@ function RuntimeSection() {
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
-            {workers.map((w) => (
+            {hostGroups.map((g) => (
+              <Fragment key={g.host}>
+                <Table.Tr>
+                  <Table.Td
+                    colSpan={8}
+                    style={{
+                      background: "var(--mantine-color-default-hover)",
+                      fontWeight: 700,
+                      letterSpacing: 0.3,
+                    }}
+                  >
+                    {g.host}{" "}
+                    <Text span size="xs" c="dimmed" fw={400}>
+                      ({g.workers.length})
+                    </Text>
+                  </Table.Td>
+                </Table.Tr>
+                {g.workers.map((w) => (
               <Table.Tr key={w.id} style={w.state === "lost" ? { opacity: 0.5 } : undefined}>
                 <Table.Td><Code>{w.id}</Code></Table.Td>
                 <Table.Td>{w.host}</Table.Td>
@@ -480,6 +514,8 @@ function RuntimeSection() {
                   </Tooltip>
                 </Table.Td>
               </Table.Tr>
+                ))}
+              </Fragment>
             ))}
           </Table.Tbody>
         </Table>
