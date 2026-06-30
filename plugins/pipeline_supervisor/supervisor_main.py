@@ -887,6 +887,8 @@ def _balancer_run(state: dict[str, Any], hosts: list[dict],
                     "cur_score": round(cur_score, 2),
                     "new_score": round(new_score, 2),
                     "reason": f"pack target n[{plan_slug}]={target_n}",
+                    # apply 時の「入口 workload を奪わない」 ガード用 (2026-06-30 incident 対策)
+                    "worker_env_filter": list(victim.get("env_filter") or []),
                 })
                 surplus_workers.remove(victim)
                 slot_of[victim["id"]] = plan_slug
@@ -897,10 +899,36 @@ def _balancer_run(state: dict[str, Any], hosts: list[dict],
             break
 
     # 7) apply
+    #
+    # 「入口 workload を奪わない」 ガード (2026-06-30 incident 対策):
+    #   tank-balancer は worker の dynamic filter を「指定 1 workload 単独」 に強制置換
+    #   する仕組みだが、 これが paprika-image-pull / paprika-video-pull / *-dispatcher
+    #   等の「入口 workload」 を担当する worker から その slug を奪うと、
+    #   入口流入が完全停止する (= 2026-06-30 に paprika-image-pull が 0/min に陥った)。
+    #
+    #   対策: swap の plan_slug (= to) が「入口 workload を含まない」 場合、
+    #   victim worker の env_filter に入口 workload があれば skip。
+    #   = 入口 workload を持つ worker は tank-balancer の対象外。
+    ENTRY_WORKLOADS = {
+        "paprika-image-pull", "paprika-video-pull",
+        "paprika-links-pull", "paprika-job-submit",
+        "image-dispatcher", "video-dispatcher",
+    }
     applied = 0
     apply_mode = bool(cfg.get("apply_mode"))
     for s in swaps:
         if not apply_mode:
+            continue
+        # ガード: worker の env_filter に入口 workload があり、 plan_slug が
+        # 入口でない場合 → skip (= 入口流入を守る)
+        worker_env = (s.get("worker_env_filter") or [])
+        env_entries = set(worker_env) & ENTRY_WORKLOADS
+        if env_entries and s["to"] not in ENTRY_WORKLOADS:
+            log.info(
+                "tank-balancer skip: worker=%s holds entry %s, refuse to swap to %s",
+                s["worker_id"], sorted(env_entries), s["to"],
+            )
+            s["skipped_reason"] = f"entry_guard:env={sorted(env_entries)}"
             continue
         rp = _post_worker_filter(
             state["control_url"], s["worker_id"], [s["to"]],
