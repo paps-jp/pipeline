@@ -60,6 +60,28 @@ init_kwargs:
     min: 2
     max: 9
 
+  - key: delete_max_face_px
+    type: int
+    default: 50
+    label: bbox 短辺 < この px の face のみ削除 (= 回収可能な誤マークを守る)
+    help: 再検出バグ誤マーク (bbox>=50+kps有り) を消さないための安全弁。0=全 =2 対象(非推奨)
+    min: 0
+    max: 200
+
+  - key: reap_failed_enabled
+    type: int
+    default: 1
+    label: queue の古い failed 行も削除する (1=on)
+    min: 0
+    max: 1
+
+  - key: failed_retention_days
+    type: int
+    default: 7
+    label: failed 行を何日残すか (これより古い failed を削除)
+    min: 0
+    max: 365
+
 hidden_kwargs:
   - workload_slug
   - control_url

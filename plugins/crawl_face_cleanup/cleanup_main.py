@@ -175,9 +175,20 @@ def setup(**kwargs) -> dict[str, Any]:
         "target_state": int(kwargs.get("target_state") or 2),
         "run_interval_hours": int(kwargs.get("run_interval_hours") or 24),
         "check_interval_s": int(kwargs.get("check_interval_s") or 300),
+        # 削除対象を「bbox 短辺 < delete_max_face_px の真の極小 face」 に限定する安全弁。
+        # adaface_ready=2 の大半は image-embed の再検出バグ (= face crop を再 detect して
+        # 99% silent skip、 [[image-embed-video-redetect-bug]]) による誤マークで、 bbox>=50
+        # + kps_json 有りなら修正後 re-embed で回収可能。 それらを消さないため bbox で絞る。
+        # 0 で無効 (= 全 adaface_ready=2 を対象、 非推奨)。
+        "delete_max_face_px": int(kwargs.get("delete_max_face_px") or 50),
         "batch_size": int(kwargs.get("batch_size") or 1000),
         "max_deletes_per_run": int(kwargs.get("max_deletes_per_run") or 2_000_000),
         "dry_run": bool(int(kwargs.get("dry_run") or 0)),
+        # failed queue reaper: 各 <slug>_queue (mariadb backend) の state='failed' 行を
+        # retention 日数より古ければ削除。 complete は即 DELETE されるが failed は max_attempts
+        # 到達で永久残置するため (reaper 無し)、 ここで掃除する。 0 で無効。
+        "reap_failed_enabled": bool(int(kwargs.get("reap_failed_enabled") or 1)),
+        "failed_retention_days": int(kwargs.get("failed_retention_days") or 7),
         "counter": 0,
         "hostname": os.environ.get("PIPELINE_WORKER_HOSTNAME") or os.uname().nodename,
     }
@@ -201,6 +212,14 @@ def _run_cleanup_pass(state: dict, out: dict) -> int:
     bucket = state["minio_bucket"]
     dry = state["dry_run"]
 
+    # 削除対象は「真の極小 face」 のみに限定する WHERE 条件。
+    # bbox 短辺 < delete_max_face_px の face だけ消す (= 回収可能な誤マークを守る)。
+    max_px = int(state.get("delete_max_face_px") or 0)
+    if max_px > 0:
+        size_cond = ("AND LEAST(bbox_x2-bbox_x1, bbox_y2-bbox_y1) < %s" % max_px)
+    else:
+        size_cond = ""
+
     total_db = 0
     total_minio = 0
     started = time.time()
@@ -208,7 +227,7 @@ def _run_cleanup_pass(state: dict, out: dict) -> int:
         cur = db.cursor()
         cur.execute(
             "SELECT id, minio_key FROM crawl_face "
-            "WHERE adaface_ready=%s ORDER BY id DESC LIMIT %s",
+            f"WHERE adaface_ready=%s {size_cond} ORDER BY id DESC LIMIT %s",
             (target, batch),
         )
         rows = cur.fetchall()
@@ -220,7 +239,8 @@ def _run_cleanup_pass(state: dict, out: dict) -> int:
         if dry:
             total_db += len(ids)
             # dry_run は 1 batch だけ見て概算 (= 全件 scan しない)
-            out["dry_run_sample"] = {"batch_rows": len(ids), "with_key": len(keys)}
+            out["dry_run_sample"] = {"batch_rows": len(ids), "with_key": len(keys),
+                                     "size_filter": size_cond or "(none)"}
             break
         # 1. MinIO crop 削除 (best-effort、 失敗しても DB 行は消す)
         if minio is not None and keys:
@@ -231,11 +251,11 @@ def _run_cleanup_pass(state: dict, out: dict) -> int:
                 total_minio += len(keys) - err_n
             except Exception as e:
                 log.warning("cleanup: minio remove_objects failed: %s", str(e)[:120])
-        # 2. DB 行削除
+        # 2. DB 行削除 (= 同じ極小条件で二重ガード)
         cur = db.cursor()
         ph = ",".join(["%s"] * len(ids))
         cur.execute(
-            f"DELETE FROM crawl_face WHERE id IN ({ph}) AND adaface_ready=%s",
+            f"DELETE FROM crawl_face WHERE id IN ({ph}) AND adaface_ready=%s {size_cond}",
             (*ids, target),
         )
         total_db += cur.rowcount
@@ -245,6 +265,69 @@ def _run_cleanup_pass(state: dict, out: dict) -> int:
     out["minio_deleted"] = total_minio
     out["elapsed_s"] = round(time.time() - started, 1)
     return total_db
+
+
+def _valid_queue_table(name: str) -> bool:
+    """インジェクション防止: slug 由来の queue_table 名を簡易チェック。"""
+    return bool(name) and name.replace("_", "").isalnum()
+
+
+def _reap_failed_queues(state: dict, out: dict) -> int:
+    """各 workload の <slug>_queue (mariadb backend) から、 retention 日数より古い
+    state='failed' 行を削除する。 削除総数を返す。 dry_run なら件数カウントのみ。
+
+    sqlite backend queue (= control plane の primary DB 上) は worker から直接触れない
+    ため skip (= supervisor/cleanup 等の小さい queue のみ、 影響軽微)。
+    """
+    db = _ensure_db_alive(state)
+    retention = int(state["failed_retention_days"])
+    dry = state["dry_run"]
+    # control plane から workload 一覧 (= queue_table + queue_backend) を取得
+    try:
+        with urllib.request.urlopen(
+            f"{state['control_url']}/api/v1/workloads", timeout=10
+        ) as r:
+            wls = json.loads(r.read()).get("workloads", [])
+    except Exception as e:
+        out["reap_error"] = f"workloads fetch failed: {e}"[:160]
+        return 0
+
+    total = 0
+    per_queue: dict[str, int] = {}
+    skipped_sqlite = 0
+    for w in wls:
+        if (w.get("queue_backend") or "sqlite") != "mariadb":
+            skipped_sqlite += 1
+            continue
+        qt = w.get("queue_table") or ""
+        if not _valid_queue_table(qt):
+            continue
+        try:
+            cur = db.cursor()
+            if dry:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {qt} WHERE state='failed' "
+                    f"AND updated_at < UTC_TIMESTAMP() - INTERVAL %s DAY",
+                    (retention,),
+                )
+                n = int(cur.fetchone()[0])
+            else:
+                cur.execute(
+                    f"DELETE FROM {qt} WHERE state='failed' "
+                    f"AND updated_at < UTC_TIMESTAMP() - INTERVAL %s DAY",
+                    (retention,),
+                )
+                n = cur.rowcount
+            cur.close()
+            if n:
+                per_queue[qt] = n
+                total += n
+        except Exception as e:
+            log.debug("reap %s failed: %s", qt, str(e)[:80])
+    out["reap_failed"] = {"total": total, "per_queue": per_queue,
+                          "retention_days": retention, "dry_run": dry,
+                          "skipped_sqlite": skipped_sqlite}
+    return total
 
 
 def process(task, ctx, state):
@@ -265,10 +348,18 @@ def process(task, ctx, state):
         log.info("cleanup: due — running pass (target adaface_ready=%d, dry_run=%s)",
                  state["target_state"], state["dry_run"])
         deleted = _run_cleanup_pass(state, out)
+        # failed queue reaper (= 同じ日次 cycle に相乗り)
+        reaped = 0
+        if state.get("reap_failed_enabled"):
+            try:
+                reaped = _reap_failed_queues(state, out)
+            except Exception as e:
+                log.warning("cleanup: reap_failed_queues failed: %s", str(e)[:120])
+                out["reap_error"] = str(e)[:160]
         if not state["dry_run"]:
             _write_marker(db, deleted)
-        log.info("cleanup: pass done db_deleted=%d minio_deleted=%d elapsed=%.1fs",
-                 out.get("db_deleted", 0), out.get("minio_deleted", 0), out.get("elapsed_s", 0))
+        log.info("cleanup: pass done db_deleted=%d minio_deleted=%d failed_reaped=%d elapsed=%.1fs",
+                 out.get("db_deleted", 0), out.get("minio_deleted", 0), reaped, out.get("elapsed_s", 0))
     else:
         remain = int(interval_s - (now - last_run).total_seconds())
         out["next_due_in_s"] = remain
