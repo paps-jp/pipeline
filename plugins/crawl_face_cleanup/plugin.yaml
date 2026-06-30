@@ -1,0 +1,81 @@
+name: crawl-face-cleanup
+description: |
+  un-embeddable な死蔵 face (adaface_ready=2) を 1 日 1 回まとめて削除する。
+  crawl_face の行 (DB) と MinIO crop オブジェクトの両方を消す。
+
+  self_loop で check_interval_s 毎に tick し、 marker テーブルで前回実行から
+  run_interval_hours (既定 24) 経過していれば削除パスを実行、 それ以外は即 skip。
+
+  安全: 削除対象は adaface_ready=2 のみ (= embed worker が embed 不可と確定したもの、
+  person_id NULL / adaface_norm NULL / 検索 index 未登録)。 dry_run=1 でカウントのみ。
+
+workload_type: self_loop
+
+init_kwargs:
+  - key: db_env_file
+    type: path
+    default: /mnt/paps-ai/ai/.env
+    label: DB / MinIO 接続情報 (.env)
+    help: DB_HOST/DB_USER/DB_PASS/DB_NAME + MINIO_* を含む .env
+
+  - key: run_interval_hours
+    type: int
+    default: 24
+    label: 実行間隔 (時間) — 既定 1 日 1 回
+    min: 1
+    max: 720
+
+  - key: check_interval_s
+    type: int
+    default: 300
+    label: tick 間隔 (秒) — marker を確認する周期
+    min: 30
+    max: 3600
+
+  - key: batch_size
+    type: int
+    default: 1000
+    label: 1 batch の削除件数 (DB + MinIO)
+    min: 100
+    max: 1000
+
+  - key: max_deletes_per_run
+    type: int
+    default: 2000000
+    label: 1 回の実行で削除する上限件数 (超過分は次回)
+    min: 1000
+    max: 100000000
+
+  - key: dry_run
+    type: int
+    default: 0
+    label: 1=件数カウントのみ (削除しない) / 0=実削除
+    min: 0
+    max: 1
+
+  - key: target_state
+    type: int
+    default: 2
+    label: "削除対象の adaface_ready 値 (= 2 が embed 不可マーク)"
+    min: 2
+    max: 9
+
+hidden_kwargs:
+  - workload_slug
+  - control_url
+
+success_criteria:
+  type: exit_code
+  expected: 0
+
+# CPU 専用・低優先 (= GPU を奪わない)。 lease は削除パスが長引いても余る長さ。
+priority: 40
+weight: 1.0
+batch_size: 1
+lease_secs: 21600
+max_attempts: 3
+requires_gpu: false
+resources:
+  vram_mb: 0
+queue_backend: sqlite
+host_affinity: []
