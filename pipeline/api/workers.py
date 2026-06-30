@@ -386,6 +386,28 @@ def _get_workload_or_404(request: Request, slug: str) -> Workload:
         raise HTTPException(404, detail=str(e)) from e
 
 
+def _resolve_worker_filter(worker: dict[str, Any]) -> set[str] | None:
+    """workload_filter → env_filter の順で有効な allowlist を返す。
+    両方 None/空 の場合は None (= 無制限)。
+    workload_filter=None かつ env_filter あり の時 env_filter にフォールバックする
+    ことで、 env_filter 専用 worker が env 外の高 priority workload に preempt される
+    バグ (2026-06-30) を防ぐ。
+    """
+    def _parse(raw: Any) -> set[str] | None:
+        if not raw:
+            return None
+        try:
+            lst = json.loads(raw) if isinstance(raw, str) else list(raw)
+            return set(lst) if lst else None
+        except Exception:
+            return None
+
+    wf = _parse(worker.get("workload_filter"))
+    if wf is not None:
+        return wf
+    return _parse(worker.get("env_filter"))
+
+
 # ---------------- registry ----------------
 
 
@@ -605,14 +627,8 @@ def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorker
     # worker.workload_filter (= operator 設定の class 分離 SoT) を hub 側でも適用。
     # worker daemon が古い list で claim 呼んで filter 違反する事故を防ぐ
     # (= 2026-06-28 nas-cpu が video-face-extract 取りに行った bug 修正)。
-    worker_filter_raw = worker.get("workload_filter") if isinstance(worker, dict) else None
-    worker_filter: set[str] | None = None
-    if worker_filter_raw:
-        try:
-            parsed = json.loads(worker_filter_raw) if isinstance(worker_filter_raw, str) else list(worker_filter_raw)
-            worker_filter = set(parsed) if parsed else None
-        except Exception:
-            worker_filter = None
+    # workload_filter=None の時は env_filter (= systemd 固定 allowlist) にフォールバック。
+    worker_filter = _resolve_worker_filter(worker)
     all_wls = _wlrepo(request).list_all()
     # VRAM 予算チェック用 lookup
     # cost = peak ベース (= 常時 peak 近く使う plugin で avg 採用すると race で OOM 再発、
@@ -671,15 +687,9 @@ def higher_pending(worker_id: str, than: int, request: Request) -> dict[str, Any
     worker = _get_worker_or_404(request, worker_id)
     worker_host = worker.get("host") if isinstance(worker, dict) else getattr(worker, "host", None)
     # worker_filter は workloads_for_worker と同じく適用 (= filter 違反 workload を
-    # higher と判定して drain 誘発するのを防ぐ、 2026-06-28)
-    worker_filter_raw = worker.get("workload_filter") if isinstance(worker, dict) else None
-    worker_filter: set[str] | None = None
-    if worker_filter_raw:
-        try:
-            parsed = json.loads(worker_filter_raw) if isinstance(worker_filter_raw, str) else list(worker_filter_raw)
-            worker_filter = set(parsed) if parsed else None
-        except Exception:
-            worker_filter = None
+    # higher と判定して drain 誘発するのを防ぐ、 2026-06-28)。
+    # workload_filter=None の時は env_filter にフォールバック。
+    worker_filter = _resolve_worker_filter(worker)
     qrepo = _qrepo(request)
     higher_slugs: list[str] = []
     for w in _wlrepo(request).list_all():
