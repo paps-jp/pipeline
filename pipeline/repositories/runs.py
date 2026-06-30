@@ -189,6 +189,48 @@ class RunsRepository:
             rows = cur.fetchall()
         return [self._row(r) for r in rows]
 
+    def throughput_counts(self, since_iso: str) -> dict[str, int]:
+        """直近窓に開始した成功 run を slug 別に COUNT (= flow throughput 用)。
+
+        started_at index のみ使い、 行を Python にロードしないので、 runs が
+        数百万行ある高スループット時でも軽い。 返り値 = {slug: 件数} (= runs/分)。
+        """
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "SELECT workload_slug AS s, COUNT(*) AS c FROM runs "
+                "WHERE started_at >= :since AND success = 1 GROUP BY workload_slug",
+                {"since": str(since_iso)},
+            )
+            return {r["s"]: int(r["c"]) for r in cur.fetchall()}
+
+    def latest_by_slug(self, since_iso: str) -> dict[str, dict[str, Any]]:
+        """直近窓で slug ごとの最新 run 1 件を返す (= flow の state/last_output 用)。
+
+        window 関数 (ROW_NUMBER) で slug 数分の行だけ返すため、 全行ロードしない。
+        必要列のみ (stdout/stderr は除外)。 返り値 = {slug: row dict}。
+        """
+        out: dict[str, dict[str, Any]] = {}
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "SELECT workload_slug, started_at, finished_at, success, output_json FROM ("
+                "  SELECT workload_slug, started_at, finished_at, success, output_json,"
+                "         ROW_NUMBER() OVER (PARTITION BY workload_slug"
+                "                            ORDER BY started_at DESC) AS rn"
+                "  FROM runs WHERE started_at >= :since"
+                ") t WHERE rn = 1",
+                {"since": str(since_iso)},
+            )
+            for r in cur.fetchall():
+                oj = r["output_json"]
+                out[r["workload_slug"]] = {
+                    "workload_slug": r["workload_slug"],
+                    "started_at": r["started_at"],
+                    "finished_at": r["finished_at"],
+                    "success": bool(r["success"]) if r["success"] is not None else None,
+                    "output_json": json.loads(oj) if oj else None,
+                }
+        return out
+
     def list_recent_failures(self, limit: int = 10) -> list[dict[str, Any]]:
         # list_recent(limit=300) で fold すると、 高スループット workload で recent window が
         # 数分しか無く成功で埋まり failure が見えなくなる (=ダッシュボード "失敗はありません"

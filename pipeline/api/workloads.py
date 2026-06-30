@@ -187,10 +187,18 @@ def enqueue_task(slug: str, body: EnqueueRequest, request: Request) -> EnqueueRe
     response_model=EnqueueResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def enqueue_batch(slug: str, body: EnqueueBatchRequest, request: Request) -> EnqueueResponse:
+def enqueue_batch(
+    slug: str, body: EnqueueBatchRequest, request: Request, strict: bool = False
+) -> EnqueueResponse:
     w = _get_or_404(request, slug)
     items = [(it.pk, it.extra) for it in body.items]
-    n = _queue_repo(request).enqueue_many(w.queue_table, items)
+    repo = _queue_repo(request)
+    if strict:
+        # strict: INSERT OR IGNORE を使わず plain INSERT。呼出側が source CAS で一意性を
+        # 保証する前提 (= video-dispatcher 等)。衝突は IGNORE せず collided として返す。
+        r = repo.enqueue_many_strict(w.queue_table, items)
+        return EnqueueResponse(inserted=r["inserted"], duplicates=r["collided"])
+    n = repo.enqueue_many(w.queue_table, items)
     return EnqueueResponse(inserted=n, duplicates=len(items) - n)
 
 
@@ -199,6 +207,25 @@ def get_queue_stats(slug: str, request: Request) -> QueueStats:
     w = _get_or_404(request, slug)
     by_state = _queue_repo(request).count_by_state(w.queue_table)
     return QueueStats(by_state=by_state, total=sum(by_state.values()))
+
+
+class QueuePeekResponse(BaseModel):
+    items: list[dict[str, Any]]
+
+
+@router.get("/{slug}/queue/peek", response_model=QueuePeekResponse)
+def peek_queue(
+    slug: str,
+    request: Request,
+    limit: int = Query(500, ge=1, le=2000),
+    state: str | None = Query(None, description="絞り込む state (pending/claimed/failed)"),
+) -> QueuePeekResponse:
+    """queue の中身を覗く (admin / dispatcher 用)。state 指定で絞り込み可。"""
+    w = _get_or_404(request, slug)
+    items = _queue_repo(request).peek(w.queue_table, limit=limit)
+    if state:
+        items = [it for it in items if it.get("state") == state]
+    return QueuePeekResponse(items=items)
 
 
 @router.post(
