@@ -11,12 +11,18 @@
 出力: {face_id, action: assigned|created, person_id, score}
 
 Phase 1 = 1 face 単位 simple (= 動画 sibling bundle は Phase 2 で local_pid 列追加後)。
+
+process_batch: batch_size 件を受け取り、
+  - DB reads を IN クエリに集約 (embedding_index, crawl_face)
+  - FAISS 呼び出しを ThreadPoolExecutor で並列化
+  - 候補 person_id 確認も全候補を 1 IN クエリにまとめる
 """
 from __future__ import annotations
 
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -328,3 +334,135 @@ def process(task, ctx, state):
     _update_person_appearance(state, person_id, face_id)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Batch path: DB reads を IN クエリに集約 + FAISS を並列スレッドで呼ぶ
+# ---------------------------------------------------------------------------
+
+def process_batch(tasks, ctx, state) -> list[dict]:
+    """batch_size 件を一括処理。process() の直列呼び出しに比べ:
+    - crawl_embedding_index / crawl_face の DB read を IN クエリ 1 本に集約
+    - FAISS /search を ThreadPoolExecutor で並列発行
+    - 候補 person_id 確認も全候補まとめて IN クエリ 1 本
+    戻り値は tasks と同順の list[dict] (len == len(tasks))。
+    """
+    face_ids = [int(t.pk) for t in tasks]
+    results: dict[int, dict] = {fid: {"face_id": fid} for fid in face_ids}
+    db = _ensure_db(state)
+
+    # 1. embedding index を一括取得
+    ph = ",".join(["%s"] * len(face_ids))
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"SELECT face_id, shard_id, row_index FROM crawl_embedding_index WHERE face_id IN ({ph})",
+            face_ids,
+        )
+        index_rows = {int(r[0]): (int(r[1]), int(r[2])) for r in cur.fetchall()}
+    finally:
+        cur.close()
+
+    # 2. embedding を memmap から読む (shard_cache で重複 open 防止)
+    embeddings: dict[int, np.ndarray] = {}
+    for fid in face_ids:
+        if fid not in index_rows:
+            results[fid]["skip"] = "no_embedding"
+            continue
+        shard_id, row_index = index_rows[fid]
+        emb = _load_shard_embedding(state, shard_id, row_index)
+        if emb is None:
+            results[fid]["skip"] = "shard_read_failed"
+        else:
+            embeddings[fid] = emb
+
+    # 3. crawl_face (image_id / video_id) を一括取得
+    valid_ids = list(embeddings.keys())
+    face_info: dict[int, tuple] = {}
+    if valid_ids:
+        ph2 = ",".join(["%s"] * len(valid_ids))
+        cur = db.cursor()
+        try:
+            cur.execute(
+                f"SELECT id, image_id, video_id FROM crawl_face WHERE id IN ({ph2})", valid_ids
+            )
+            for r in cur.fetchall():
+                face_info[int(r[0])] = (r[1], r[2])
+        finally:
+            cur.close()
+
+    for fid in valid_ids:
+        if fid not in face_info:
+            results[fid]["skip"] = "face_missing"
+            embeddings.pop(fid, None)
+
+    # 4. FAISS knn を並列発行 (FAISS API は multi-vector 非対応のため per-face HTTP)
+    ready_ids = [fid for fid in valid_ids if fid in face_info and fid in embeddings]
+    topk = state["topk"]
+    faiss_results: dict[int, tuple[list[int], list[float]]] = {}
+
+    def _call_faiss(fid: int) -> tuple[int, list[int], list[float]]:
+        ids, scores = _faiss_knn(state, embeddings[fid], topk)
+        return fid, ids, scores
+
+    max_workers = min(len(ready_ids), 16) if ready_ids else 1
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_call_faiss, fid): fid for fid in ready_ids}
+        for fut in as_completed(futures):
+            fid, ids, scores = fut.result()
+            faiss_results[fid] = (ids, scores)
+
+    # 5. 全候補 face_id → person_id を 1 クエリで引く
+    all_cand_ids: set[int] = set()
+    per_face_cands: dict[int, list[tuple[int, float]]] = {}
+    for fid in ready_ids:
+        cand_ids, cand_scores = faiss_results.get(fid, ([], []))
+        cands = [(c, s) for c, s in zip(cand_ids, cand_scores) if c != fid and c > 0]
+        per_face_cands[fid] = cands
+        all_cand_ids.update(c for c, _ in cands)
+
+    person_map: dict[int, Any] = {}
+    if all_cand_ids:
+        ph3 = ",".join(["%s"] * len(all_cand_ids))
+        cur = db.cursor()
+        try:
+            cur.execute(
+                f"SELECT id, person_id FROM crawl_face WHERE id IN ({ph3})",
+                list(all_cand_ids),
+            )
+            person_map = {int(r[0]): r[1] for r in cur.fetchall()}
+        finally:
+            cur.close()
+
+    # 6. 各 face を assign / create
+    for fid in ready_ids:
+        emb = embeddings[fid]
+        image_id, video_id = face_info[fid]
+        is_video = video_id is not None
+        threshold = state["threshold_video"] if is_video else state["threshold_image"]
+        cands = per_face_cands.get(fid, [])
+
+        best_pid: int | None = None
+        best_score: float = 0.0
+        for cid, sc in cands:
+            pid = person_map.get(cid)
+            if pid is not None and sc > threshold:
+                best_pid = int(pid)
+                best_score = float(sc)
+                break
+
+        if best_pid is not None:
+            _assign_face_to_person(state, fid, best_pid, best_score)
+            person_id = best_pid
+            _update_person_stats(state, person_id, is_video, emb)
+            results[fid].update({"action": "assigned", "person_id": person_id,
+                                  "score": best_score, "candidates_n": len(cands)})
+        else:
+            person_id = _create_new_person(state, emb, fid, is_video)
+            _assign_face_to_person(state, fid, person_id, 1.0)
+            results[fid].update({"action": "created", "person_id": person_id,
+                                  "score": 1.0, "candidates_n": len(cands)})
+
+        _update_person_appearance(state, person_id, fid)
+
+    return [results[fid] for fid in face_ids]
