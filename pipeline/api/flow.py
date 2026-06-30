@@ -32,8 +32,9 @@ router = APIRouter(prefix="/api/v1/flow", tags=["flow"])
 _LAYOUT_PATH_DEFAULT = Path(__file__).resolve().parents[1] / "control" / "flow_layout.yaml"
 _DEFAULT_DB_ENV = "/home/paps-ai/ai/.env"
 
-# tank metric cache (= 3 秒)
-_TANK_CACHE_TTL_S = 3.0
+# tank metric cache (= 30 秒)
+# COUNT(*) on large tables can take 10-20s; poll every 30s to avoid query pile-up
+_TANK_CACHE_TTL_S = 30.0
 _tank_cache: dict[str, tuple[float, int | None, str | None]] = {}
 _tank_cache_lock = threading.Lock()
 _db_cfg_cache: tuple[float, dict[str, Any] | None] = (0.0, None)
@@ -162,7 +163,7 @@ def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[int | None, str | 
     # mariadb (C wrapper) があれば優先、 無ければ pure-python pymysql。
     try:
         import mariadb  # type: ignore
-        connect = lambda c: mariadb.connect(**c)   # noqa: E731
+        connect = lambda c: mariadb.connect(**{**c, "read_timeout": 28})  # noqa: E731
     except ImportError:
         try:
             import pymysql  # type: ignore
@@ -180,6 +181,7 @@ def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[int | None, str | 
 
     # tank ごとに独立した短命接続を張る (= 1 query の失敗が他 tank を巻き込まない)。
     # 大きな表の COUNT が timeout しても他 tank の water level は読める。
+    _STMT_TIMEOUT_MS = 25000  # 25s — 大テーブル COUNT の上限
     for tid, sql in to_query.items():
         if not _safe_sql(sql):
             results[tid] = (None, "unsafe sql")
@@ -188,6 +190,11 @@ def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[int | None, str | 
         try:
             conn = connect(cfg)
             cur = conn.cursor()
+            # クエリタイムアウトをセッションで設定 (MariaDB max_statement_time = ms)
+            try:
+                cur.execute(f"SET SESSION max_statement_time={_STMT_TIMEOUT_MS}")
+            except Exception:
+                pass  # 古い MariaDB / 権限なし でも続行
             cur.execute(sql)
             row = cur.fetchone()
             v = int(row[0]) if row and row[0] is not None else 0
@@ -311,14 +318,18 @@ def snapshot(req: Request) -> FlowSnapshot:
     # rate=0 強制で、 UI 上「アイドル状態」 と同じ表示に揃える (2026-06-28)。
     from pipeline.repositories.workloads import WorkloadRepository as _WLR
     _wlrepo = _WLR(req.app.state.db)
-    disabled_slugs = {w.slug for w in _wlrepo.list_all() if not w.enabled}
+    _all_wls = _wlrepo.list_all()
+    disabled_slugs = {w.slug for w in _all_wls if not w.enabled}
+    # 「捌いた件数/min」 = scheduler の 30s metric aggregator が runs.output_json から
+    # SUM 集計して workloads.observed_rate に書き込んだ値 (2026-06-30)。 ここでは
+    # snapshot ごと SQL 集計せず DB 列 1 回 SELECT で済ませて負荷を抑える。
+    rate_by_slug: dict[str, float] = {w.slug: float(w.observed_rate or 0.0) for w in _all_wls}
 
     import datetime as _dt
     now_dt = _dt.datetime.now(_dt.timezone.utc)
-    five_min = now_dt - _dt.timedelta(minutes=5)
     # latest_by_slug 用に広く取る。 30min cutoff は long-running な workload
-    # (= paprika-links-pull が 1 tick 5min かけて走る等) でも最新 run を必ず
-    # 拾えるよう余裕を持たせた数字。 image-embed 等の高頻度 workload は 30min で
+    # (= paprika-links-pull が sleep 含む 1 tick 10min かけて走る等) でも最新 run を
+    # 必ず拾えるよう余裕を持たせた数字。 image-embed 等の高頻度 workload は 30min で
     # ~5000 runs だが index 化済みなので軽い。
     thirty_min = now_dt - _dt.timedelta(minutes=30)
 
@@ -327,11 +338,11 @@ def snapshot(req: Request) -> FlowSnapshot:
     # ロードしていたため、 高負荷時に snapshot が激重 + throughput が窓ずれで
     # 過小表示 (= 実態 35k/min が 0.8/min 等) になっていた。 SQL 集計に置換:
     #   - throughput_by_slug = 直近 1min に開始した成功 run 数 = runs/min (COUNT のみ)
-    #   - latest_by_slug      = 5min 窓で slug ごと最新 run 1 件 (= state/last_output 用)
-    # いずれも started_at index を使い、 返る行は slug 数分だけ。 5min 以上アイドルな
+    #   - latest_by_slug      = 30min 窓で slug ごと最新 run 1 件 (= state/last_output 用)
+    # いずれも started_at index を使い、 返る行は slug 数分だけ。 30min 以上アイドルな
     # workload は latest に出ず node.state=idle (= 実態通り)。
     one_min = now_dt - _dt.timedelta(minutes=1)
-    latest_by_slug = runs_repo.latest_by_slug(five_min.isoformat())
+    latest_by_slug = runs_repo.latest_by_slug(thirty_min.isoformat())
     throughput_by_slug: dict[str, float] = {
         slug: float(cnt)
         for slug, cnt in runs_repo.throughput_counts(one_min.isoformat()).items()
@@ -363,7 +374,15 @@ def snapshot(req: Request) -> FlowSnapshot:
             r = latest_by_slug.get(slug)
             if r:
                 node.state = _classify_state(r)
-                node.throughput_per_min = throughput_by_slug.get(slug, 0.0)
+                # observed_rate (= 30s aggregator が runs.output_json から算出した
+                # 「捌いた件数/min」) を優先表示。 まだ 1 回も aggregate されてない
+                # 起動直後や、 1 run = 1 件で aggregator が runs/min fallback を
+                # 書いた slug でも整合する (= rate_by_slug は全 workload 網羅)。
+                # 0 のときは throughput_by_slug (= runs/min 直近 1min) で穴埋め。
+                node.throughput_per_min = (
+                    rate_by_slug.get(slug)
+                    or throughput_by_slug.get(slug, 0.0)
+                )
                 fin = r.get("finished_at")
                 if fin:
                     node.last_run_at = fin.isoformat() if hasattr(fin, "isoformat") else str(fin)

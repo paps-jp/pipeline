@@ -151,18 +151,66 @@ def create_app(settings: Settings) -> FastAPI:
                     pass
         vram_agg_task = _asyncio.create_task(_vram_aggregator_loop())
 
+        # metric rate aggregator (2026-06-30): 30s 周期で runs.output_json から
+        # WORKLOAD_METRIC_FIELDS を SUM して workloads.observed_rate に書く。
+        # 1 run = 1 件想定の slug (= 未宣言) は throughput_counts (= runs/min) を
+        # そのまま rate として書く。 flow.py が読み出して「捌いた件数/min」 表示。
+        from pipeline.models.metric_fields import WORKLOAD_METRIC_FIELDS as _WMF
+        from pipeline.repositories.runs import RunsRepository as _RR
+        import datetime as _dt
+        _metric_stop = _asyncio.Event()
+        async def _metric_aggregator_loop() -> None:
+            wlrepo = _WR(db)
+            runsrepo = _RR(db)
+            # 窓 20min / 20 で「件/min 平均」 にする。 paprika-links-pull のように
+            # sleep 含む 1 tick が 10min 超かかる workload でも前の completed tick が
+            # 必ず窓内に入り tpm が 0 にならない (= 5min だと started_at が窓外になる)。
+            WINDOW_MIN = 20
+            while not _metric_stop.is_set():
+                try:
+                    since = (_dt.datetime.utcnow() -
+                             _dt.timedelta(minutes=WINDOW_MIN)).isoformat()
+                    # 1) SUM(field) base = 宣言ある slug
+                    summed = runsrepo.metric_sum_by_slug(_WMF, since)
+                    # 2) runs/min fallback = 未宣言 slug (= 1 run = 1 件)
+                    counts = runsrepo.throughput_counts(since)
+                    rates: dict[str, float] = {}
+                    for slug, cnt in counts.items():
+                        if slug in _WMF:
+                            rates[slug] = float(summed.get(slug, 0.0)) / WINDOW_MIN
+                        else:
+                            rates[slug] = float(cnt) / WINDOW_MIN
+                    # 宣言あるが直近窓に run が無い slug は 0 を書いて idle 化
+                    for slug in _WMF.keys():
+                        rates.setdefault(slug, 0.0)
+                    n = wlrepo.update_observed_rates(rates)
+                    if n:
+                        log.debug("metric aggregator: updated=%d", n)
+                except Exception:
+                    log.exception("metric aggregator failed")
+                try:
+                    await _asyncio.wait_for(_metric_stop.wait(), timeout=30)
+                except _asyncio.TimeoutError:
+                    pass
+        metric_agg_task = _asyncio.create_task(_metric_aggregator_loop())
+
         try:
             yield
         finally:
             log.info("pipeline shutting down")
             _reaper_stop.set()
             _vram_stop.set()
+            _metric_stop.set()
             try:
                 await _asyncio.wait_for(reaper_task, timeout=3)
             except Exception:
                 pass
             try:
                 await _asyncio.wait_for(vram_agg_task, timeout=3)
+            except Exception:
+                pass
+            try:
+                await _asyncio.wait_for(metric_agg_task, timeout=3)
             except Exception:
                 pass
             try:

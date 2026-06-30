@@ -354,6 +354,7 @@ function WorkloadNode({ data }: { data: FlowNode & { activeHandles?: string[] } 
           </Group>
         )}
       </Stack>
+      {data.state === "failed" && <ErrorOverlay />}
     </motion.div>
   );
 }
@@ -531,13 +532,17 @@ function TankWave({ color, isLight }: { color: string; isLight: boolean }) {
 const HAZARD_THICK = 8;
 const HAZARD_HALF = 7.0710678;            // = 10 / √2
 const HAZARD_FULL = 14.1421356;           // = 2 * HAZARD_HALF
-const HAZARD_BG =
+const hazardStripe = (c: string) =>
   `repeating-linear-gradient(45deg, ` +
-  `#fbbf24 0 ${HAZARD_HALF}px, #0f172a ${HAZARD_HALF}px ${HAZARD_FULL}px)`;
+  `${c} 0 ${HAZARD_HALF}px, #0f172a ${HAZARD_HALF}px ${HAZARD_FULL}px)`;
+const HAZARD_BG = hazardStripe("#fbbf24");      // 黄黒: tank overflow 警告
+const HAZARD_RED_BG = hazardStripe("#ef4444");  // 赤黒: workload エラー
 // X / Y 軸 1 周期 = HAZARD_FULL * √2 = ちょうど 20px (= 整数)。
 const HAZARD_X_PERIOD = "20";
 
-function OverflowOverlay() {
+function HazardOverlay({ bg, barBg, barText, label, barBelow = false }: {
+  bg: string; barBg: string; barText: string; label: string; barBelow?: boolean;
+}) {
   return (
     <>
       <style>{`
@@ -563,7 +568,7 @@ function OverflowOverlay() {
         style={{
           position: "absolute",
           top: 0, left: 0, right: 0, height: HAZARD_THICK,
-          background: HAZARD_BG,
+          background: bg,
           animation: "hazardFlowRight 1.4s linear infinite",
           pointerEvents: "none", zIndex: 4,
         }}
@@ -573,7 +578,7 @@ function OverflowOverlay() {
         style={{
           position: "absolute",
           top: 0, right: 0, bottom: 0, width: HAZARD_THICK,
-          background: HAZARD_BG,
+          background: bg,
           animation: "hazardFlowDown 1.4s linear infinite",
           pointerEvents: "none", zIndex: 4,
         }}
@@ -583,7 +588,7 @@ function OverflowOverlay() {
         style={{
           position: "absolute",
           bottom: 0, left: 0, right: 0, height: HAZARD_THICK,
-          background: HAZARD_BG,
+          background: bg,
           animation: "hazardFlowLeft 1.4s linear infinite",
           pointerEvents: "none", zIndex: 4,
         }}
@@ -593,20 +598,21 @@ function OverflowOverlay() {
         style={{
           position: "absolute",
           top: 0, left: 0, bottom: 0, width: HAZARD_THICK,
-          background: HAZARD_BG,
+          background: bg,
           animation: "hazardFlowUp 1.4s linear infinite",
           pointerEvents: "none", zIndex: 4,
         }}
       />
-      {/* WARNING バー (= 下部・max width・黄背景+黒文字) */}
+      {/* ラベルバー。 barBelow=true は box の真下・box 全幅 (= ERROR 表示)、
+          false は box 内下部に inset (= 既存の WARNING 表示)。 */}
       <div
         style={{
           position: "absolute",
-          left: HAZARD_THICK,
-          right: HAZARD_THICK,
-          bottom: HAZARD_THICK,
-          background: "#fbbf24",
-          color: "#0f172a",
+          ...(barBelow
+            ? { top: "100%", left: 0, right: 0 }
+            : { left: HAZARD_THICK, right: HAZARD_THICK, bottom: HAZARD_THICK }),
+          background: barBg,
+          color: barText,
           padding: "3px 6px",
           fontSize: 14,
           fontFamily: "ui-monospace, monospace",
@@ -619,10 +625,20 @@ function OverflowOverlay() {
           overflow: "hidden",
         }}
       >
-        ⚠ WARNING
+        {label}
       </div>
     </>
   );
+}
+
+// 黄黒テープ: tank overflow (fill_ratio >= 1.0) 警告。
+function OverflowOverlay() {
+  return <HazardOverlay bg={HAZARD_BG} barBg="#fbbf24" barText="#0f172a" label="⚠ WARNING" />;
+}
+
+// 赤黒テープ: workload エラー (state === "failed") 表示。
+function ErrorOverlay() {
+  return <HazardOverlay bg={HAZARD_RED_BG} barBg="#ef4444" barText="#ffffff" label="✕ ERROR" barBelow />;
 }
 
 function TankNode({ data }: { data: FlowNode & { activeHandles?: string[];

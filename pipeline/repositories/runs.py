@@ -203,6 +203,53 @@ class RunsRepository:
             )
             return {r["s"]: int(r["c"]) for r in cur.fetchall()}
 
+    def metric_sum_by_slug(
+        self,
+        slug_fields: dict[str, list[str]],
+        since_iso: str,
+    ) -> dict[str, float]:
+        """slug 毎に指定 field 群 を SUM (= 直近窓に捌いた「件数」)。
+
+        slug_fields = {slug: [field, ...]} (= 例: image-dispatcher → [hash_detect_enqueued, ...])。
+        runs.output_json[field] を直近 1min で SUM。 返り値 = {slug: 件数/分}。
+        slug_fields が空 dict なら何も走らせず {} を返す (= flow snapshot fast path)。
+
+        1 回の SQL で全 slug を集計する: WHERE workload_slug IN (...) で絞ることで
+        通常 5800 runs/秒 のうち主要 slug 分だけスキャン。 既存 throughput_counts
+        が GROUP BY workload_slug で同じ index を引いてるため、 cost は線形。
+        """
+        if not slug_fields:
+            return {}
+        # 全 slug に登場する field の union を SELECT で SUM 列に並べる。
+        # SQLite には dynamic column 名がないので、 field ごとに SUM 列を作る。
+        all_fields = sorted({f for fields in slug_fields.values() for f in fields})
+        sum_cols = ", ".join(
+            f'SUM(COALESCE(JSON_EXTRACT(output_json, "$.{f}"), 0)) AS "m_{f}"'
+            for f in all_fields
+        )
+        placeholders = ", ".join(f":s{i}" for i in range(len(slug_fields)))
+        params: dict[str, Any] = {"since": str(since_iso)}
+        for i, slug in enumerate(slug_fields.keys()):
+            params[f"s{i}"] = slug
+        sql = (
+            f"SELECT workload_slug AS s, {sum_cols} "
+            f"FROM runs WHERE started_at >= :since AND success = 1 "
+            f"AND workload_slug IN ({placeholders}) GROUP BY workload_slug"
+        )
+        out: dict[str, float] = {}
+        with self.db.transaction() as conn:
+            cur = conn.execute(sql, params)
+            for r in cur.fetchall():
+                slug = r["s"]
+                fields = slug_fields.get(slug, [])
+                total = 0.0
+                for f in fields:
+                    v = r[f"m_{f}"]
+                    if v is not None:
+                        total += float(v)
+                out[slug] = total
+        return out
+
     def latest_by_slug(self, since_iso: str) -> dict[str, dict[str, Any]]:
         """直近窓で slug ごとの最新 run 1 件を返す (= flow の state/last_output 用)。
 

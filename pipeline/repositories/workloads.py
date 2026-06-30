@@ -304,6 +304,29 @@ class WorkloadRepository:
                     continue
         return updated
 
+    def update_observed_rates(self, rates: dict[str, float]) -> int:
+        """slug → 件数/min を workloads.observed_rate に一括 UPDATE (= 既存列流用)。
+
+        2026-06-30: flow snapshot で「捌いた件数/min」 を表示するために、
+        scheduler の 30s aggregate tick がこの関数を呼び observed_rate を更新する。
+        返り値 = 更新行数。 rates に無い slug は 0 のままなので、 全 slug を渡す側
+        (= aggregate loop) が一回の集計で全 workload を網羅する必要がある。
+        """
+        if not rates:
+            return 0
+        updated = 0
+        with self.db.transaction() as conn:
+            for slug, rate in rates.items():
+                try:
+                    conn.execute(
+                        "UPDATE workloads SET observed_rate = :r WHERE slug = :s",
+                        {"r": float(rate), "s": slug},
+                    )
+                    updated += 1
+                except Exception:
+                    continue
+        return updated
+
     def prune_vram_observations(self, retain_minutes: int = 60) -> int:
         """古い vram_observations を削除。 返り値 = 削除行数。"""
         import datetime as _dt
