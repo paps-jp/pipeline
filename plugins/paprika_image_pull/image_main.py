@@ -18,6 +18,8 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,55 @@ _sys.path.insert(0, str(Path(__file__).resolve().parent))
 from image_url_normalizer import normalize_image_url  # noqa: E402
 
 log = logging.getLogger(__name__)
+
+SAFETY_MARGIN_S = 60
+
+
+def _parse_dt(s) -> "datetime | None":
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _load_watermark(db, slug) -> "datetime | None":
+    try:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT last_completed_at FROM paprika_pull_watermark WHERE slug=%s",
+            (slug,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        if row and row[0]:
+            v = row[0]
+            if isinstance(v, datetime):
+                return v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v
+            return _parse_dt(str(v))
+    except Exception:
+        pass
+    return None
+
+
+def _save_watermark(db, slug, completed_at: "datetime") -> None:
+    if completed_at is None:
+        return
+    try:
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO paprika_pull_watermark (slug, last_completed_at, updated_at)"
+            " VALUES (%s, %s, NOW(6))"
+            " ON DUPLICATE KEY UPDATE"
+            "   last_completed_at=IF(VALUES(last_completed_at)>last_completed_at, VALUES(last_completed_at), last_completed_at),"
+            "   updated_at=NOW(6)",
+            (slug, completed_at.strftime("%Y-%m-%d %H:%M:%S.%f"))
+        )
+        cur.close()
+        db.commit()
+    except Exception as e:
+        log.debug("_save_watermark failed: %s", e)
 
 
 # -------------------- AIMD adaptive controller --------------------
@@ -129,9 +180,12 @@ def setup(**kwargs) -> dict[str, Any]:
         "hostname": os.uname().nodename,
         "session": sess,
         "site_cache": _build_site_cache(db),
+        "parallel_dl": int(kwargs.get("parallel_dl") or 8),
     }
     _adapt_init(state, kwargs)
-    log.info("image-pull: site cache loaded (%d domains)", len(state["site_cache"]))
+    state["watermark"] = _load_watermark(db, state["workload_slug"])
+    log.info("image-pull: site cache loaded (%d domains), watermark=%s",
+             len(state["site_cache"]), state["watermark"])
     try:
         _self_enqueue_next_tick(state["control_url"], state["workload_slug"], 1)
         log.info("image-pull: bootstrap tick-1 enqueued")
@@ -409,6 +463,100 @@ def _is_image_asset(asset: dict) -> bool:
     return name.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"))
 
 
+# ---------------- parallel asset worker ---------------- #
+
+def _process_one_asset(
+    *,
+    asset: dict,
+    site: str,
+    crawl_id: int,
+    parent_url: str,
+    known_urls: set,
+    paprika_hub: str,
+    raw_dir: Path,
+    tmp_dir: Path,
+    dir_base: int,
+    db_cfg: dict,
+) -> dict:
+    """1 asset を DL → DB INSERT → ファイル移動。ThreadPoolExecutor 内で実行。
+    MariaDB 接続はスレッドごとに独立して生成・破棄する。"""
+    import mariadb as _mariadb
+
+    result = {"inserted": 0, "dup": 0, "dl_failed": 0, "new_entry": None, "thumb": None}
+    asset_url = (asset.get("url") or "").strip()
+    href = asset.get("href") or ""
+
+    sess = requests.Session()
+    try:
+        if asset_url.startswith("data:"):
+            sha = _data_url_to_sha256(asset_url)
+            if not sha:
+                return result
+            store_url = f"data-image:{sha.hex()}"
+            download_src = f"{paprika_hub}{href}" if href else None
+            if not download_src:
+                return result
+            ok, _err, tmp_path = _download_image(sess, download_src, tmp_dir)
+            if not ok:
+                result["dl_failed"] = 1
+                return result
+        else:
+            if not asset_url:
+                return result
+            normalized = normalize_image_url(asset_url)
+            sha = None
+            store_url = normalized
+            if normalized in known_urls:
+                result["dup"] = 1
+                return result
+            download_src = f"{paprika_hub}{href}" if href else normalized
+            ok, _err, tmp_path = _download_image(sess, download_src, tmp_dir)
+            if not ok and download_src != normalized:
+                ok, _err, tmp_path = _download_image(sess, normalized, tmp_dir)
+            if not ok:
+                result["dl_failed"] = 1
+                return result
+
+        db = _mariadb.connect(**db_cfg)
+        db.autocommit = True
+        try:
+            if asset_url.startswith("data:") and _find_existing_image(db, store_url, sha):
+                result["dup"] = 1
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink()
+                return result
+            file_no = _next_file_no(db, site)
+            if not file_no:
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink()
+                return result
+            image_id = _insert_crawl_image(db, store_url, crawl_id, site, file_no, sha)
+            if not image_id:
+                result["dup"] = 1
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink()
+                return result
+            thumb = _make_thumb(tmp_path)
+            _move_to_raw(tmp_path, raw_dir, image_id, dir_base)
+            _mark_image_downloaded(db, image_id)
+            result["inserted"] = 1
+            result["new_entry"] = {
+                "image_id": image_id, "site": site,
+                "ts": int(time.time()), "page_url": parent_url[:200],
+            }
+            if thumb:
+                result["thumb"] = (image_id, thumb)
+        finally:
+            db.close()
+    except Exception as e:
+        log.debug("_process_one_asset error: %s", e)
+        result["dl_failed"] = 1
+    finally:
+        sess.close()
+
+    return result
+
+
 # ---------------- main process ---------------- #
 
 def process(task, ctx, state):
@@ -416,24 +564,44 @@ def process(task, ctx, state):
     started = time.time()
     out: dict[str, Any] = {"tick": state["counter"], "host": state["hostname"]}
     db = _ensure_db_alive(state)
-    session = state["session"]
     raw_dir = state["raw_dir"]
     tmp_dir = state["tmp_dir"]
     dir_base = state["dir_base"]
 
-    # 1. paprika hub から最近の completed/review job 一覧
+    # 1. paprika hub から最近の completed/review job 一覧 (watermark でインクリメンタル取得)
     status_csv = urllib.parse.quote(state["statuses"], safe="")
-    list_url = (
-        f"{state['paprika_hub']}/jobs"
-        f"?status={status_csv}&limit={state['adapt']['page_limit']}&offset=0"
-    )
-    try:
-        resp = _http_get_json(list_url, timeout=20.0)
-        jobs = resp.get("jobs", []) or []
-    except Exception as e:
-        out["paprika_list_error"] = str(e)[:200]
-        jobs = []
+    page_limit = state["adapt"]["page_limit"]
+    watermark: "datetime | None" = state.get("watermark")
+    completed_after_param = ""
+    if watermark is not None:
+        wm_s = (watermark.timestamp() - SAFETY_MARGIN_S)
+        wm_dt = datetime.fromtimestamp(wm_s, tz=timezone.utc)
+        completed_after_param = "&completed_after=" + urllib.parse.quote(
+            wm_dt.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00"), safe=""
+        )
+
+    jobs: list = []
+    offset = 0
+    while True:
+        list_url = (
+            f"{state['paprika_hub']}/jobs"
+            f"?status={status_csv}&limit={page_limit}&offset={offset}"
+            f"{completed_after_param}"
+        )
+        try:
+            resp = _http_get_json(list_url, timeout=20.0)
+            page = resp.get("jobs", []) or []
+        except Exception as e:
+            out["paprika_list_error"] = str(e)[:200]
+            break
+        jobs.extend(page)
+        if len(page) < page_limit:
+            break
+        offset += page_limit
     out["jobs_seen"] = len(jobs)
+
+    # watermark 候補 (fetch_failed でないジョブの completed_at の最大値)
+    new_watermark_candidate: "datetime | None" = watermark
 
     inserted = 0
     dup = 0
@@ -442,7 +610,10 @@ def process(task, ctx, state):
     no_site = 0
     no_image_jobs = 0
     fetch_failed = 0
+    new_entries: list[dict] = []
 
+    # Phase 1 (逐次): job result 取得 + batch dedup → asset タスクリストを構築
+    asset_tasks: list[dict] = []
     for j in jobs:
         job_id = j.get("job_id")
         parent_url = j.get("url") or ""
@@ -454,7 +625,6 @@ def process(task, ctx, state):
             no_site += 1
             continue
 
-        # 2. assets.json 取得
         try:
             res = _http_get_json(
                 f"{state['paprika_hub']}/jobs/{job_id}/result",
@@ -464,96 +634,70 @@ def process(task, ctx, state):
             fetch_failed += 1
             log.debug("fetch result failed job=%s: %s", job_id, e)
             continue
+
+        # watermark 候補: fetch 成功したジョブの completed_at を追跡
+        _cat = _parse_dt(j.get("completed_at"))
+        if _cat is not None:
+            if new_watermark_candidate is None or _cat > new_watermark_candidate:
+                new_watermark_candidate = _cat
         assets = res.get("assets") or []
         images = [a for a in assets if _is_image_asset(a)]
         if not images:
             no_image_jobs += 1
             continue
 
-        # 3. crawl_id (= 親 URL に対応する crawl table id) を見つける
         crawl_id = _find_crawl_id(db, parent_url) or 0
 
-        # 4. ジョブ単位で 1 回だけ batch SELECT — 既知 URL を fast-path skip
-        #    INSERT IGNORE 並列で 96% が dup だった頃の lock pressure を
-        #    根本的に消す。 残った race (=batch SELECT 後に他 worker が入れた行)
-        #    だけが INSERT に来る → deadlock 確率激減。
         _candidate_urls: list[str] = []
         for _a in images:
             _u = (_a.get("url") or "").strip()
             if _u and not _u.startswith("data:"):
                 _candidate_urls.append(normalize_image_url(_u))
         try:
-            _known_urls = _find_existing_images_batch(db, _candidate_urls)
+            known_urls = _find_existing_images_batch(db, _candidate_urls)
         except Exception as e:
             log.warning("batch dedup failed job=%s: %s", job_id, str(e)[:120])
-            _known_urls = set()
+            known_urls = set()
 
-        # 4. each image 処理
         for asset in images:
-            asset_url = (asset.get("url") or "").strip()
-            asset_name = (asset.get("name") or "").strip()
-            href = asset.get("href") or ""
+            asset_tasks.append({
+                "asset": asset,
+                "site": site,
+                "crawl_id": crawl_id,
+                "parent_url": parent_url,
+                "known_urls": known_urls,
+                "paprika_hub": state["paprika_hub"],
+                "raw_dir": raw_dir,
+                "tmp_dir": tmp_dir,
+                "dir_base": dir_base,
+                "db_cfg": state["db_cfg"],
+            })
 
-            if asset_url.startswith("data:"):
-                sha = _data_url_to_sha256(asset_url)
-                if not sha:
-                    continue
-                store_url = f"data-image:{sha.hex()}"
-                # dedup check
-                if _find_existing_image(db, store_url, sha):
-                    dup += 1
-                    continue
-                # data: URL は paprika が assets/{name} で実 byte 提供してるので、
-                # paprika 経由 download
-                download_src = f"{state['paprika_hub']}{href}" if href else None
-                if not download_src:
-                    continue
-                ok, err, tmp_path = _download_image(session, download_src, tmp_dir)
-                if not ok:
-                    dl_failed += 1
-                    continue
-                file_no = _next_file_no(db, site)
-                if not file_no:
-                    continue
-                image_id = _insert_crawl_image(db, store_url, crawl_id, site, file_no, sha)
-                if not image_id:
-                    dup += 1
-                    if tmp_path and tmp_path.exists(): tmp_path.unlink()
-                    continue
-                # rename to final path
-                _move_to_raw(tmp_path, raw_dir, image_id, dir_base)
-                _mark_image_downloaded(db, image_id)
-                inserted += 1
+    # Phase 2 (並列): DL + DB INSERT
+    n_workers = state.get("parallel_dl", 8)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_process_one_asset, **t): t for t in asset_tasks}
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+            except Exception as e:
+                log.debug("asset worker exception: %s", e)
+                dl_failed += 1
+                continue
+            inserted += res["inserted"]
+            dup += res["dup"]
+            dl_failed += res["dl_failed"]
+            if res["inserted"]:
                 downloaded += 1
-            else:
-                if not asset_url:
-                    continue
-                normalized = normalize_image_url(asset_url)
-                # batch SELECT で既知なら fast-path skip (= per-asset SELECT 省略)
-                if normalized in _known_urls:
-                    dup += 1
-                    continue
-                # download: paprika asset 経由 が安定 (= サイト直リンクは 403/cookie 問題)
-                download_src = f"{state['paprika_hub']}{href}" if href else normalized
-                ok, err, tmp_path = _download_image(session, download_src, tmp_dir)
-                if not ok and download_src != normalized:
-                    ok, err, tmp_path = _download_image(session, normalized, tmp_dir)
-                if not ok:
-                    dl_failed += 1
-                    continue
-                file_no = _next_file_no(db, site)
-                if not file_no:
-                    if tmp_path and tmp_path.exists(): tmp_path.unlink()
-                    continue
-                image_id = _insert_crawl_image(db, normalized, crawl_id, site, file_no, None)
-                if not image_id:
-                    dup += 1
-                    if tmp_path and tmp_path.exists(): tmp_path.unlink()
-                    continue
-                _move_to_raw(tmp_path, raw_dir, image_id, dir_base)
-                _mark_image_downloaded(db, image_id)
-                inserted += 1
-                downloaded += 1
+                if res["new_entry"]:
+                    new_entries.append(res["new_entry"])
+                if res["thumb"]:
+                    image_id, thumb_bytes = res["thumb"]
+                    try:
+                        _put_blob(state["control_url"], state["workload_slug"],
+                                  f"thumb/{image_id}", thumb_bytes)
+                    except Exception as _e:
+                        log.debug("viz thumb upload failed id=%s: %s", image_id, _e)
 
     out["inserted"] = inserted
     out["dup"] = dup
@@ -571,6 +715,18 @@ def process(task, ctx, state):
     if inserted > 0:
         log.info("image-pull: +%d images (dup=%d dl_failed=%d) from %d jobs adapt=%s in %.2fs",
                  inserted, dup, dl_failed, len(jobs), out["adapt"], out["dispatch_secs"])
+
+    if new_entries:
+        try:
+            _update_feed(state["control_url"], state["workload_slug"], new_entries)
+        except Exception as _e:
+            log.debug("viz feed update failed: %s", _e)
+
+    # watermark 保存
+    if new_watermark_candidate is not None and new_watermark_candidate != watermark:
+        _save_watermark(db, state["workload_slug"], new_watermark_candidate)
+        state["watermark"] = new_watermark_candidate
+    out["watermark"] = str(new_watermark_candidate) if new_watermark_candidate else None
 
     sleep_s = max(1, int(state["adapt"]["interval_s"]) - int(out["dispatch_secs"]))
     time.sleep(sleep_s)
@@ -611,6 +767,59 @@ def _move_to_raw(tmp_path: Path, raw_dir: Path, image_id: int, dir_base: int) ->
             tmp_path.unlink()
         except Exception:
             pass
+
+
+# ---- 可視化ヘルパー ----
+
+def _make_thumb(tmp_path: Path, max_size: int = 300) -> bytes | None:
+    """tmp_path の JPEG を縮小した JPEG bytes を返す。失敗時 None。"""
+    try:
+        img = Image.open(str(tmp_path))
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+        buf = BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=72)
+        return buf.getvalue()
+    except Exception as e:
+        log.debug("thumb failed: %s", e)
+        return None
+
+
+def _put_blob(control_url: str, slug: str, key: str, data: bytes) -> None:
+    req = urllib.request.Request(
+        f"{control_url}/api/v1/plugins/{slug}/blob/{key}",
+        data=data,
+        headers={"Content-Type": "image/jpeg"},
+        method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        r.read()
+
+
+def _update_feed(control_url: str, slug: str, new_entries: list[dict], max_entries: int = 200) -> None:
+    """new_entries を feed 先頭に prepend して max_entries に截断し PUT する。"""
+    if not new_entries:
+        return
+    try:
+        req = urllib.request.Request(
+            f"{control_url}/api/v1/plugins/{slug}/state/feed",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            current: list[dict] = (json.loads(r.read()) or {}).get("value") or []
+        if not isinstance(current, list):
+            current = []
+    except Exception:
+        current = []
+    combined = (new_entries + current)[:max_entries]
+    payload = json.dumps({"value": combined}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{control_url}/api/v1/plugins/{slug}/state/feed",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        r.read()
 
 
 def teardown(state) -> None:

@@ -88,6 +88,9 @@ hidden_kwargs:
   - workload_slug
   - control_url
 
+ui_panel: true
+ui_panel_mode: image
+
 success_criteria:
   type: exit_code
   expected: 0

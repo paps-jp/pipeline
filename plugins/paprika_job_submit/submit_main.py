@@ -225,17 +225,22 @@ def _mark_site_toppage_done(db, site_id: int, result: str) -> None:
 # ---------------- paprika hub helpers ---------------- #
 
 def _adopt_existing_job(paprika_hub: str, page_url: str) -> str | None:
-    """409 を受けた時 paprika hub から既存 job_id を引き取る。 running > review > completed の順で 1 件。"""
+    """409 を受けた時 paprika hub から既存 job_id を引き取る。任意ステータスの既存 job を採用。"""
     try:
         q = urllib.parse.quote(page_url, safe='')
-        resp = requests.get(f"{paprika_hub}/jobs?q={q}&limit=20", timeout=10)
+        resp = requests.get(f"{paprika_hub}/jobs?q={q}&limit=100", timeout=10)
         if resp.status_code != 200:
             return None
         jobs = (resp.json() or {}).get("jobs", []) or []
-        for st in ("running", "review", "completed"):
+        # 優先: running > review > completed > queued/pending (queue 内の job も adopt 対象)
+        for st in ("running", "review", "completed", "queued", "pending"):
             for j in jobs:
                 if j.get("url") == page_url and j.get("status") == st:
                     return j.get("job_id")
+        # ステータス不問で URL 一致する任意 job を採用
+        for j in jobs:
+            if j.get("url") == page_url:
+                return j.get("job_id")
         return None
     except Exception as e:
         log.debug("adopt failed: %s", e)
@@ -305,7 +310,11 @@ class _CapCache:
                 except Exception:
                     pass  # 失敗時は古い data 継続使用
                 self._fetched_at = now
-            return self._data or {"accept_new": False}
+            d = self._data or {}
+            # paprika の accept_new は保守的 (running>recommended で False)。
+            # available > 0 なら実際には受け付けるため available で上書きする。
+            available = int(d.get("available") or 0)
+            return {**d, "accept_new": available > 0}
 
 
 class _Coordinator:
@@ -425,6 +434,10 @@ class _Coordinator:
                 self.state["download_video"], self.state["min_asset_size_bytes"],
             )
             if jid is None:
+                # 409_no_existing = paprika にあるが queued 等で adopt できなかった。
+                # URL は既に paprika に入っているので done マークして再 loop を防ぐ。
+                if st == "409_no_existing":
+                    _mark_url_done(db, crawl_id)
                 self._bump("create_failed")
                 continue
             _mark_url_done(db, crawl_id)
@@ -556,23 +569,34 @@ def process(task, ctx, state):
     # tick 間 backoff sleep (= 通常は 1s、 失敗多発時は最大 120s)
     time.sleep(int(state["adapt_interval_s"]))
 
-    # next tick (1 個だけ、 self-loop 維持)
-    _self_enqueue_next_tick(
-        state["control_url"], state["workload_slug"], state["counter"] + 1,
-    )
+    # キュー補充: paprika capacity ベースで N 件 enqueue (= 並列 worker 数を自動決定)
+    _refill_queue(state)
     out["next_tick_scheduled"] = True
     return out
 
 
 def _get_paprika_capacity(paprika_hub: str) -> dict:
-    """paprika /workers/capacity を取得。 失敗時は accept_new=False 扱い."""
+    """paprika /workers/capacity を取得し、 フィールドを正規化して返す。
+
+    新 API: available / lanes.free (accept_new / recommended_free なし)
+    旧 API: accept_new / recommended_free
+    両方に対応するため accept_new・available・recommended_free を補完する。
+    """
     try:
         resp = requests.get(f"{paprika_hub}/workers/capacity", timeout=5)
         if resp.status_code != 200:
-            return {"accept_new": False}
-        return resp.json() or {}
+            return {"accept_new": False, "available": 0, "recommended_free": 0}
+        d = resp.json() or {}
+        available = int(
+            d.get("available")
+            or (d.get("lanes") or {}).get("free")
+            or 0
+        )
+        accept_new = available > 0  # available > 0 なら送れる (accept_new は保守的)
+        recommended_free = int(d.get("recommended_free") or available)
+        return {**d, "accept_new": accept_new, "available": available, "recommended_free": recommended_free}
     except Exception:
-        return {"accept_new": False}
+        return {"accept_new": False, "available": 0, "recommended_free": 0}
 
 
 def _get_queue_pending(control_url: str, workload_slug: str) -> int:
@@ -590,33 +614,28 @@ def _get_queue_pending(control_url: str, workload_slug: str) -> int:
         return 0
 
 
-def _sleep_and_enqueue(state: dict, started: float) -> None:
-    """補充モデル: queue depth を target 並列度に保つように不足分だけ enqueue。
+def _refill_queue(state: dict) -> None:
+    """paprika capacity に応じて job-submit キューを N 件まで補充。
 
-    target = min(paprika.recommended_free / max_pages_per_run, PARALLEL_CAP)
-    need = max(1, target - current_pending)   ← 最低 1 (= self-loop 維持)
+    paprika /workers/capacity の available (= 空きフェッチ枠数) を
+    そのまま target tick 数として使う。 空き枠 = そのまま並列投入できる数。
+    内部スレッドの accept_new gate がさらに個別制御するので over-submission にならない。
 
-    これで毎 tick 累積する fan-out 暴走を防ぐ。
+    accept_new=False または available=0 の場合は 1 件のみ (= self-loop 維持)。
+    複数 worker が同時に呼んでも need = max(1, target - current) で自己補正し
+    fan-out 暴走を防ぐ (若干の over-enqueue は次 tick で吸収される)。
     """
-    elapsed = int(time.time() - started)
-    sleep_s = max(1, int(state["interval_s"]) - elapsed)
-    time.sleep(sleep_s)
-
     cap = _get_paprika_capacity(state["paprika_hub"])
     accept = bool(cap.get("accept_new"))
-    free = int(cap.get("recommended_free") or 0)
-    per_site = max(1, int(state["max_pages_per_run"]))
-    PARALLEL_CAP = 9
+    available = int(cap.get("available") or 0)
 
-    if not accept:
-        # 投入停止: 1 個だけ enqueue (= self-loop 維持、 次 tick で再判定)
+    if not accept or available <= 0:
         target = 0
     else:
-        target = min(free // per_site, PARALLEL_CAP)
+        target = available  # paprika の空き枠数 = 理想並列 tick 数
 
     current = _get_queue_pending(state["control_url"], state["workload_slug"])
-    # 不足分だけ enqueue (= 最低 1 個で self-loop 切らさない)
-    need = max(1, target - current)
+    need = max(1, target - current)  # 最低 1 = self-loop 維持
 
     base_id = state["counter"] + 1
     for i in range(need):
@@ -624,8 +643,10 @@ def _sleep_and_enqueue(state: dict, started: float) -> None:
             state["control_url"], state["workload_slug"], base_id + i,
         )
     if need > 1:
-        log.info("submit: refill +%d (target=%d, current_pending=%d, paprika_free=%d)",
-                 need, target, current, free)
+        log.info(
+            "submit: refill +%d ticks (target=%d current_pending=%d paprika_available=%d)",
+            need, target, current, available,
+        )
 
 
 def teardown(state) -> None:

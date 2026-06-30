@@ -15,6 +15,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlsplit, urlunsplit
@@ -109,6 +110,7 @@ def setup(**kwargs) -> dict[str, Any]:
         "counter": 0,
         "hostname": os.uname().nodename,
         "site_cache": _build_site_cache(db),   # domain → site_name (= startup 一括 build)
+        "watermark": _load_watermark(db, kwargs.get("workload_slug") or "paprika-links-pull"),
     }
     _adapt_init(state, kwargs)
     log.info("links-pull: site cache loaded (%d domains)", len(state["site_cache"]))
@@ -250,6 +252,54 @@ def _site_for_domain(domain: str, cache: dict) -> str | None:
     return None
 
 
+# ---------------- watermark ---------------- #
+
+SAFETY_MARGIN_S = 60
+
+
+def _parse_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _load_watermark(db, slug: str) -> datetime | None:
+    cur = db.cursor()
+    try:
+        cur.execute(
+            "SELECT last_completed_at FROM paprika_pull_watermark WHERE slug=%s",
+            (slug,),
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            dt = row[0]
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+    finally:
+        cur.close()
+    return None
+
+
+def _save_watermark(db, slug: str, completed_at: datetime) -> None:
+    cur = db.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO paprika_pull_watermark (slug, last_completed_at, updated_at)
+               VALUES (%s, %s, NOW(6))
+               ON DUPLICATE KEY UPDATE last_completed_at=%s, updated_at=NOW(6)""",
+            (slug, completed_at, completed_at),
+        )
+    finally:
+        cur.close()
+
+
 # ---------------- paprika hub helpers ---------------- #
 
 def _http_get_json(url: str, timeout: float = 20.0) -> dict:
@@ -279,19 +329,40 @@ def process(task, ctx, state):
     out: dict[str, Any] = {"tick": state["counter"], "host": state["hostname"]}
     db = _ensure_db_alive(state)
 
-    # 1. paprika hub から最近の completed/review job 一覧
+    # 1. paprika hub から completed/review job 一覧 (watermark 差分取得 + 全ページネーション)
     status_csv = urllib.parse.quote(state["statuses"], safe="")
-    list_url = (
-        f"{state['paprika_hub']}/jobs"
-        f"?status={status_csv}&limit={state['adapt']['page_limit']}&offset=0"
-    )
-    try:
-        resp = _http_get_json(list_url, timeout=20.0)
-        jobs = resp.get("jobs", []) or []
-    except Exception as e:
-        out["paprika_list_error"] = str(e)[:200]
-        jobs = []
+    watermark: datetime | None = state["watermark"]
+    fetch_from = (watermark - timedelta(seconds=SAFETY_MARGIN_S)) if watermark else None
+    page_limit = state["adapt"]["page_limit"]
+    jobs: list[dict] = []
+    max_completed_at: datetime | None = watermark
+    page_idx = 0
+    stop_reason = "empty_page"
+    while True:
+        params = f"status={status_csv}&limit={page_limit}&offset={page_idx * page_limit}"
+        if fetch_from:
+            params += "&completed_after=" + urllib.parse.quote(
+                fetch_from.strftime("%Y-%m-%dT%H:%M:%S.%f")
+            )
+        try:
+            resp = _http_get_json(
+                f"{state['paprika_hub']}/jobs?{params}", timeout=20.0
+            )
+            page_jobs = resp.get("jobs") or []
+        except Exception as e:
+            out["paprika_list_error"] = str(e)[:200]
+            stop_reason = "list_error"
+            break
+        if not page_jobs:
+            break
+        for j in page_jobs:
+            jca = _parse_dt(j.get("completed_at"))
+            if jca and (max_completed_at is None or jca > max_completed_at):
+                max_completed_at = jca
+        jobs.extend(page_jobs)
+        page_idx += 1
     out["jobs_seen"] = len(jobs)
+    out["pages_fetched"] = page_idx
 
     inserted = 0
     dup = 0
@@ -366,6 +437,12 @@ def process(task, ctx, state):
     out["jobs_no_links"] = no_links
     out["fetch_failed"] = fetch_failed
     out["dispatch_secs"] = round(time.time() - started, 2)
+
+    # watermark 更新
+    if max_completed_at and (watermark is None or max_completed_at > watermark):
+        _save_watermark(db, state["workload_slug"], max_completed_at)
+        state["watermark"] = max_completed_at
+    out["watermark"] = state["watermark"].isoformat() if state["watermark"] else None
 
     # adapt: hit = 新規 URL を 1 件以上発見
     _adapt_after_tick(state, hit=(inserted > 0))

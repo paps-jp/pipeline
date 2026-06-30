@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Pull — Live Feed</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, monospace;
+    font-size: 12px;
+    background: #0d1117;
+    color: #c9d1d9;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #header {
+    padding: 8px 12px;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+
+  #header h1 {
+    font-size: 13px;
+    font-weight: 600;
+    color: #e6edf3;
+  }
+
+  #status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #3fb950;
+    flex-shrink: 0;
+    transition: background 0.3s;
+  }
+  #status-dot.error { background: #f85149; }
+  #status-dot.loading { background: #d29922; }
+
+  #meta {
+    margin-left: auto;
+    color: #8b949e;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  #feed {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 8px;
+    align-content: start;
+  }
+
+  .card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    animation: fadeIn 0.25s ease;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .card-img {
+    width: 100%;
+    aspect-ratio: 4/3;
+    object-fit: cover;
+    background: #21262d;
+    display: block;
+  }
+
+  .card-img.placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #484f58;
+    font-size: 20px;
+  }
+
+  .card-info {
+    padding: 5px 7px;
+    flex: 1;
+  }
+
+  .card-site {
+    color: #58a6ff;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .card-time {
+    color: #8b949e;
+    font-size: 10px;
+    margin-top: 2px;
+  }
+
+  .card-id {
+    color: #484f58;
+    font-size: 10px;
+    margin-top: 1px;
+  }
+
+  #empty {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    color: #484f58;
+    font-size: 14px;
+  }
+
+  #feed::-webkit-scrollbar { width: 6px; }
+  #feed::-webkit-scrollbar-track { background: transparent; }
+  #feed::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <div id="status-dot" class="loading"></div>
+  <h1>Image Pull — Live Feed</h1>
+  <div id="meta">— / 200</div>
+</div>
+
+<div id="feed">
+  <div id="empty">画像を待っています…</div>
+</div>
+
+<script>
+  // slug を URL から取得 (/api/v1/plugins/{slug}/web/panel.html)
+  const pathParts = location.pathname.split('/');
+  const pluginsIdx = pathParts.indexOf('plugins');
+  const SLUG = pluginsIdx >= 0 ? pathParts[pluginsIdx + 1] : 'paprika_image_pull';
+  const BASE = `/api/v1/plugins/${SLUG}`;
+
+  const dot = document.getElementById('status-dot');
+  const meta = document.getElementById('meta');
+  const feed = document.getElementById('feed');
+  const emptyEl = document.getElementById('empty');
+
+  let rendered = new Set();   // 表示済み image_id
+  let totalShown = 0;
+
+  function relTime(ts) {
+    const diffS = Math.floor(Date.now() / 1000) - ts;
+    if (diffS < 5)  return 'just now';
+    if (diffS < 60) return `${diffS}s ago`;
+    if (diffS < 3600) return `${Math.floor(diffS/60)}m ago`;
+    return `${Math.floor(diffS/3600)}h ago`;
+  }
+
+  function makeCard(entry) {
+    const { image_id, site, ts, page_url } = entry;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.dataset.id = image_id;
+
+    const imgUrl = `${BASE}/blob/thumb/${image_id}`;
+    const img = document.createElement('img');
+    img.className = 'card-img';
+    img.loading = 'lazy';
+    img.alt = '';
+    img.onerror = () => {
+      img.style.display = 'none';
+      const ph = document.createElement('div');
+      ph.className = 'card-img placeholder';
+      ph.textContent = '🖼';
+      card.insertBefore(ph, card.firstChild);
+    };
+    img.src = imgUrl;
+
+    const info = document.createElement('div');
+    info.className = 'card-info';
+
+    const siteEl = document.createElement('div');
+    siteEl.className = 'card-site';
+    siteEl.textContent = site || '—';
+    siteEl.title = page_url || '';
+
+    const timeEl = document.createElement('div');
+    timeEl.className = 'card-time';
+    timeEl.textContent = relTime(ts);
+
+    const idEl = document.createElement('div');
+    idEl.className = 'card-id';
+    idEl.textContent = `#${image_id}`;
+
+    info.appendChild(siteEl);
+    info.appendChild(timeEl);
+    info.appendChild(idEl);
+    card.appendChild(img);
+    card.appendChild(info);
+    return card;
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch(`${BASE}/state/feed`, { cache: 'no-store' });
+      if (!res.ok) {
+        if (res.status === 404) {
+          // まだ1件も書き込まれていない
+          dot.className = 'loading';
+          return;
+        }
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const entries = (data.value || []).slice(0, 200);
+
+      dot.className = '';
+      dot.style.background = '#3fb950';
+
+      if (entries.length === 0) {
+        meta.textContent = '0 / 200';
+        return;
+      }
+
+      // 新しいエントリを先頭に挿入 (FILO: 上から下へ)
+      let addedCount = 0;
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        if (rendered.has(e.image_id)) continue;
+        rendered.add(e.image_id);
+        addedCount++;
+        const card = makeCard(e);
+        if (emptyEl.parentNode) emptyEl.remove();
+        // i=0 が最新 → 先頭に追加していくと逆になるので insertBefore の基点を管理
+        const refNode = feed.children[i] || null;
+        feed.insertBefore(card, refNode);
+      }
+
+      // 200枚を超えたら末尾を削除
+      while (feed.children.length > 200) {
+        const last = feed.lastElementChild;
+        if (last) {
+          rendered.delete(parseInt(last.dataset.id || '0', 10));
+          feed.removeChild(last);
+        }
+      }
+
+      totalShown = feed.children.length;
+      meta.textContent = `${totalShown} / 200`;
+
+      // 相対時刻を更新
+      feed.querySelectorAll('.card-time').forEach(el => {
+        const id = parseInt(el.closest('.card').dataset.id, 10);
+        const entry = entries.find(e => e.image_id === id);
+        if (entry) el.textContent = relTime(entry.ts);
+      });
+
+    } catch (err) {
+      dot.className = 'error';
+      console.warn('feed poll error:', err);
+    }
+  }
+
+  // 初回 + 3秒ごとにポーリング
+  poll();
+  setInterval(poll, 3000);
+  // 相対時刻を1分ごとに再描画
+  setInterval(() => {
+    feed.querySelectorAll('.card').forEach(card => {
+      const timeEl = card.querySelector('.card-time');
+      const id = parseInt(card.dataset.id, 10);
+      // entries が手元にないので DOM から ts を取れないが、
+      // 次の poll() で更新されるので放置
+    });
+  }, 60000);
+</script>
+</body>
+</html>
