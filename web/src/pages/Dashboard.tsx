@@ -587,6 +587,8 @@ function GpuHostCard({
             <MetricSparkline points={points} label="VRAM" unit=" GB"
               gradientId={`g-${baseHost}-${gpuIdx}-vram`}
               accessor={(p) => p.mem_used_mb}
+              scaleMin={0}
+              scaleMax={Math.max(0, ...points.map((p) => p.mem_total_mb ?? 0)) || undefined}
               fmt={(v) => (v / 1024).toFixed(1)}
               colorOf={() => "#8b5cf6"} />
             <MetricSparkline points={points} label="Mem 帯域" unit="%"
@@ -629,7 +631,9 @@ export default function Dashboard() {
     for (const [wid, gpus] of Object.entries(metrics.workers)) {
       const host = workerHostMap.get(wid);
       if (!host) continue;
-      const baseHost = host.replace(/-\d+$/, "");
+      // worker host は `<host>-<n>` (GPU) / `<host>-cpu<n>` (CPU) と instance 化されている。
+      // 両 suffix を剥がして物理ホスト単位に集約 (= GPU カードを host ごと 1 枚に)。
+      const baseHost = host.replace(/-(?:cpu)?\d+$/, "");
       if (!byHost.has(baseHost)) byHost.set(baseHost, { workerIds: [], gpus: {} });
       const entry = byHost.get(baseHost)!;
       entry.workerIds.push(wid);

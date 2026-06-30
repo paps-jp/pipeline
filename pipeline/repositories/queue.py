@@ -14,11 +14,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from pipeline.db.base import Database
+
+log = logging.getLogger(__name__)
 
 
 def _utcnow_iso() -> str:
@@ -120,6 +123,35 @@ class QueueRepository:
                 if cur.rowcount == 1:
                     inserted += 1
         return inserted
+
+    def enqueue_many_strict(
+        self, queue_table: str, items: list[tuple[str, dict[str, Any]]]
+    ) -> dict[str, int]:
+        """bulk 投入の strict 版。INSERT OR IGNORE を使わず plain INSERT する。
+
+        pk の一意性は呼出側 (= source を CAS claim する dispatcher) が保証する前提。
+        既存 pk と衝突した場合は黙ってスキップ (IGNORE) せず WARN ログに残し collided として
+        数える (= 取りこぼしを不可視にしない)。1 行の衝突で batch 全体を巻き戻さないよう
+        行単位で握る (duplicate-key は statement レベルエラーで txn は継続可能)。
+        戻り値: {"inserted": n, "collided": m}。
+        """
+        _validate_queue_table(queue_table)
+        if not items:
+            return {"inserted": 0, "collided": 0}
+        inserted = 0
+        collided = 0
+        with self._get_db(queue_table).transaction() as conn:
+            for pk, extra in items:
+                try:
+                    conn.execute(
+                        f"INSERT INTO {queue_table} (pk, extra) VALUES (:pk, :extra)",
+                        {"pk": str(pk), "extra": json.dumps(extra or {})},
+                    )
+                    inserted += 1
+                except Exception as e:
+                    collided += 1
+                    log.warning("strict enqueue collision %s pk=%s: %s", queue_table, pk, e)
+        return {"inserted": inserted, "collided": collided}
 
     def claim(
         self,

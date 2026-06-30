@@ -408,7 +408,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 # こうしておけば install パスが /opt/pipeline でも /home/paps-ai/ai/pipeline でも動く
 PIPELINE_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP_SCRIPT_PATH = PIPELINE_ROOT / "scripts" / "bootstrap.sh"
-PIPELINE_SOURCE_DIRS = ["pipeline", "scripts"]   # tar.gz に含めるディレクトリ
+PIPELINE_SOURCE_DIRS = ["pipeline", "scripts", "plugins"]   # tar.gz に含めるディレクトリ
 # pip install -e . で必要な root レベルファイル (= 新規 box で venv 自前作成時に必須)
 PIPELINE_SOURCE_FILES = ["pyproject.toml", "README.md", "LICENSE"]
 
@@ -422,10 +422,12 @@ def get_bootstrap_source() -> StreamingResponse:
     def _stream():
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            # __pycache__ / .pyc / .bak 除外
+            # __pycache__ / .pyc / .bak / .bak-<timestamp> 除外
+            # (.bak-<ts> も除外しないと flow_layout.yaml.bak-* 等が tar に紛れ、
+            #  読取不可だと tar 全体が PermissionError で 0 bytes になる)
             def _filter(ti: tarfile.TarInfo):
                 name = ti.name
-                if "/__pycache__" in name or name.endswith(".pyc") or name.endswith(".bak"):
+                if "/__pycache__" in name or name.endswith(".pyc") or name.endswith(".bak") or ".bak-" in name:
                     return None
                 return ti
             for d in PIPELINE_SOURCE_DIRS:

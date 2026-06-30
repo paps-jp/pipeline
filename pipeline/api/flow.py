@@ -322,69 +322,20 @@ def snapshot(req: Request) -> FlowSnapshot:
     # ~5000 runs だが index 化済みなので軽い。
     thirty_min = now_dt - _dt.timedelta(minutes=30)
 
-    # 1. runs を 30min 内全件取得。
-    #    - throughput 集計 = 5min 以内に finished_at が入った run のみ (= 既存ロジック)
-    #    - latest_by_slug = 30min 内の最新 run 1 件 (= state/error/last_run_at 表示用)
-    #    限定 limit を使うと image-embed (5min 700+ runs) が枠を食い尽くし、
-    #    paprika-links-pull のような長い tick (start から 5-10分後 finish) の workload を
-    #    押し出して state=idle / throughput=0 誤判定する (2026-06-27 二度踏んだ)。
-    recent = runs_repo.list_since(thirty_min.isoformat())
-    latest_by_slug: dict[str, dict[str, Any]] = {}
-    for r in recent:
-        slug = r.get("workload_slug")
-        if not slug:
-            continue
-        if slug not in latest_by_slug:
-            latest_by_slug[slug] = r
-    # 30min 内に 1 件も無い真の idle workload は外側から最後の 1 件だけ拾う。
-    missing_slugs = {
-        n.get("workload_slug") or n.get("id")
-        for n in nodes_raw
-        if n.get("kind") == "workload"
-    } - set(latest_by_slug.keys())
-    if missing_slugs:
-        fallback = runs_repo.list_recent(limit=500)
-        for r in fallback:
-            slug = r.get("workload_slug")
-            if slug in missing_slugs and slug not in latest_by_slug:
-                latest_by_slug[slug] = r
-    # 主要 metric の合計 (= 正確な work units/min を出せる場合)
-    primary_by_slug: dict[str, float] = {}
-    # 直近 5min の成功 run 数 (= magic key 無い workload の fallback)
-    run_count_by_slug: dict[str, int] = {}
-    for r in recent:
-        slug = r.get("workload_slug")
-        fin = r.get("finished_at")
-        if not slug or not fin or not r.get("success"):
-            continue
-        try:
-            if isinstance(fin, _dt.datetime):
-                fdt = fin
-            else:
-                fdt = _dt.datetime.fromisoformat(str(fin).replace("Z", "+00:00"))
-            if fdt.tzinfo is None:
-                fdt = fdt.replace(tzinfo=_dt.timezone.utc)
-        except Exception:
-            continue
-        if fdt < five_min:
-            continue
-        run_count_by_slug[slug] = run_count_by_slug.get(slug, 0) + 1
-        out = r.get("output_json") or {}
-        for key in ("inserted", "submitted", "downloaded",
-                    "face_ids_inserted", "hash_detect_enqueued", "enqueued",
-                    "n", "claimed", "written"):
-            v = out.get(key)
-            if isinstance(v, (int, float)) and v > 0:
-                primary_by_slug[slug] = primary_by_slug.get(slug, 0.0) + float(v)
-                break
-    # throughput = primary metric 優先、 無ければ run-count を /min 換算 (= 活動の proxy)
-    throughput_by_slug: dict[str, float] = {}
-    for slug, cnt in run_count_by_slug.items():
-        primary = primary_by_slug.get(slug, 0.0)
-        if primary > 0:
-            throughput_by_slug[slug] = round(primary / 5.0, 2)
-        else:
-            throughput_by_slug[slug] = round(cnt / 5.0, 2)
+    # runs テーブルは高スループット時に巨大化する (= 35k/min 級・数百万行)。
+    # 旧実装は list_since(30min) で全行 (stdout/output_json 込み) を Python に
+    # ロードしていたため、 高負荷時に snapshot が激重 + throughput が窓ずれで
+    # 過小表示 (= 実態 35k/min が 0.8/min 等) になっていた。 SQL 集計に置換:
+    #   - throughput_by_slug = 直近 1min に開始した成功 run 数 = runs/min (COUNT のみ)
+    #   - latest_by_slug      = 5min 窓で slug ごと最新 run 1 件 (= state/last_output 用)
+    # いずれも started_at index を使い、 返る行は slug 数分だけ。 5min 以上アイドルな
+    # workload は latest に出ず node.state=idle (= 実態通り)。
+    one_min = now_dt - _dt.timedelta(minutes=1)
+    latest_by_slug = runs_repo.latest_by_slug(five_min.isoformat())
+    throughput_by_slug: dict[str, float] = {
+        slug: float(cnt)
+        for slug, cnt in runs_repo.throughput_counts(one_min.isoformat()).items()
+    }
 
     # 2. tank SQL を一括評価
     tank_sqls: dict[str, str] = {}
