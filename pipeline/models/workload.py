@@ -61,6 +61,12 @@ class WorkloadBase(BaseModel):
     # workloads_for_worker が claim 候補から外す形で適用 (= best-effort)。
     max_concurrent_per_host: int | None = Field(default=None, ge=1, le=100)
 
+    # fleet 全体 (= 全 host 合計) で同時実行できる worker 数の上限。 None = 無制限 (= 既定)。
+    # max_concurrent_per_host が host 単位なのに対し、 こちらは fleet 横断の絶対上限。
+    # 用途: 単一 writer 保証 (embed-write=1)、 balancer 過剰配分の抑制。
+    # workloads_for_worker が _count_total_concurrency で claim 候補から外す (= best-effort)。
+    max_concurrent_total: int | None = Field(default=None, ge=1, le=1000)
+
     # GPU heavy か CPU only か (2026-06-28、 静的配置設計用)。
     # True = ONNX/CUDA を使う、 GPU host に置く。
     # False (=既定) = web/IO bound、 CPU host で十分。

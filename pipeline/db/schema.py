@@ -63,6 +63,9 @@ WORKLOADS_ALTERS = [
     # 用途: image-embed のように cuBLAS init で VRAM をでかく確保する plugin で、
     # 同じ GPU を多重起動して CUBLAS_STATUS_ALLOC_FAILED で setup 死亡を防ぐ。
     "ALTER TABLE workloads ADD COLUMN max_concurrent_per_host INTEGER",
+    # fleet 全体 (= 全 host 合計) の同時実行 worker 上限。 NULL = 無制限。
+    # 単一 writer 保証 (embed-write=1) / balancer 過剰配分の抑制に使う。
+    "ALTER TABLE workloads ADD COLUMN max_concurrent_total INTEGER",
     # CPU/GPU 分類フラグ (2026-06-28)。 静的配置設計 + UI 表示用。
     # NULL/0 = CPU only (= web/IO bound)、 1 = GPU heavy (= ONNX/CUDA)。
     # operator が worker.workload_filter を配置するときの判断材料。
