@@ -127,6 +127,14 @@ def setup(**kwargs) -> dict[str, Any]:
             "timeout_s": float(kwargs.get("stall_timeout_s") or 300),
         },
         "stall_since": {},  # slug → first_stall_mono (claimed==0 かつ throughput==0 が続く開始時刻)
+        # worker watchdog: hung worker を stale last_seen_at で検知して SSH restart
+        "watchdog_cfg": {
+            "enabled": bool(int(kwargs.get("watchdog_enabled") or 0)),
+            "apply_mode": bool(int(kwargs.get("watchdog_apply_mode") or 0)),
+            "stale_s": float(kwargs.get("watchdog_stale_s") or 150),
+            "cooldown_s": float(kwargs.get("watchdog_cooldown_s") or 600),
+        },
+        "watchdog_last_restart": {},  # worker_id → monotonic 秒 (連続 restart 防止)
     }
     log.info("supervisor: control=%s rules=%s apply_mode=%s",
              state["control_url"], state["rules_path"], state["apply_mode"])
@@ -1112,6 +1120,68 @@ def _self_loop_stall_watcher(
     }
 
 
+def _worker_watchdog_run(state: dict[str, Any]) -> dict[str, Any]:
+    """last_seen_at が stale (= heartbeat 停止 = daemon hang) な worker を検知し、
+    制御プレーンの POST /workers/{id}/restart (SSH systemctl restart) で復旧する。
+
+    daemon 側 (service.py) の httpx client 再生成をすり抜けた hang の最終手段
+    (defense-in-depth)。 hung worker は polling しないので admin cmd では届かず、
+    外部からの restart でしか復旧できないため制御プレーン経由で SSH する。
+    """
+    cfg = state.get("watchdog_cfg") or {}
+    if not cfg.get("enabled"):
+        return {"skipped": "watchdog disabled"}
+    apply_mode = bool(cfg.get("apply_mode"))
+    stale_s    = float(cfg.get("stale_s") or 150)
+    cooldown_s = float(cfg.get("cooldown_s") or 600)
+    control_url = state["control_url"]
+    now_mono = time.monotonic()
+    last_restart: dict[str, float] = state.setdefault("watchdog_last_restart", {})
+
+    try:
+        workers = _http_get_json(f"{control_url}/api/v1/workers", timeout=5)
+    except Exception as e:
+        return {"error": f"list workers failed: {e}"}
+    if isinstance(workers, dict):
+        workers = workers.get("workers") or workers.get("items") or []
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    actions: list[dict] = []
+    stale_workers: list[dict] = []
+    for w in (workers or []):
+        wid = w.get("id")
+        ls = w.get("last_seen_at")
+        if not wid or not ls:
+            continue
+        try:
+            t = _dt.datetime.fromisoformat(str(ls).replace("Z", "+00:00"))
+            age = (now - t).total_seconds()
+        except Exception:
+            continue
+        if age < stale_s:
+            continue
+        stale_workers.append({"id": wid, "host": w.get("host"), "age_s": int(age)})
+        last = last_restart.get(wid, 0.0)
+        if (now_mono - last) < cooldown_s:
+            actions.append({"id": wid, "action": "skip-cooldown", "age_s": int(age)})
+            continue
+        log.warning("[watchdog] worker %s (host=%s) stale %ds → restart %s",
+                    wid, w.get("host"), int(age), "APPLIED" if apply_mode else "DRY")
+        if not apply_mode:
+            actions.append({"id": wid, "action": "restart", "age_s": int(age), "dry_run": True})
+            continue
+        try:
+            r = requests.post(f"{control_url}/api/v1/workers/{wid}/restart", timeout=40)
+            res = r.json() if "json" in r.headers.get("content-type", "") else {}
+            last_restart[wid] = now_mono
+            actions.append({"id": wid, "action": "restart", "age_s": int(age),
+                            "http": r.status_code, "rc": res.get("rc"), "ok": res.get("ok")})
+        except Exception as e:
+            actions.append({"id": wid, "action": "restart-failed", "error": str(e)[:120]})
+    return {"enabled": True, "apply_mode": apply_mode, "stale_s": int(stale_s),
+            "stale_workers": stale_workers, "actions": actions}
+
+
 def _parse_upstream_map(raw: str) -> dict[str, str]:
     """'{"face-person-link":"image-hash-extract"}' → dict。 空文字や不正 JSON は {}。"""
     if not raw.strip():
@@ -1572,6 +1642,14 @@ def process(task, ctx, state):
     except Exception as e:
         log.warning("stall watcher pass failed: %s", e, exc_info=True)
         out["stall_watcher"] = {"error": str(e)[:200]}
+
+    # ---------- 4.8. worker watchdog (hung worker を stale last_seen_at で検知→SSH restart) ----------
+    try:
+        wd = _worker_watchdog_run(state)
+        out["watchdog"] = wd
+    except Exception as e:
+        log.warning("worker watchdog pass failed: %s", e, exc_info=True)
+        out["watchdog"] = {"error": str(e)[:200]}
 
     # ---------- 5. LLM advisor (= 設定で enabled なら N min 毎) ----------
     try:

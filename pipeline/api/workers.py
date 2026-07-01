@@ -18,6 +18,7 @@ HTTP で叩いて control plane と通信する:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -263,6 +264,32 @@ def _host_family(worker_host: str) -> str:
     return parts[0] if (len(parts) == 2 and parts[1].isdigit()) else worker_host
 
 
+# --- worker restart (supervisor watchdog 用): hung worker を deploy key で SSH 再起動 ---
+_WATCHDOG_HOST_IP = {
+    "ai-gpu1": "10.10.50.23", "ai-gpu3": "10.10.50.28",
+    "ai-gpu4": "10.10.50.29", "ai-gpu5": "10.10.50.30",
+}
+_WATCHDOG_DEPLOY_KEY = os.environ.get("PIPELINE_DEPLOY_KEY", "/home/paps-ai/.ssh/id_ed25519")
+
+
+def _restart_target(worker_host: str) -> tuple[str, str] | None:
+    """worker.host → (ssh_ip, systemd_unit)。未対応形式は None。
+    ai-gpu1-cpu3→(.23, pipeline-worker-cpu@3) / ai-gpu1-2→(.23, pipeline-worker-gpu@2)
+    / ai-gpu3→(.28, pipeline-worker-gpu)。"""
+    import re
+    m = re.fullmatch(r"(ai-gpu\d+)-cpu(\d+)", worker_host or "")
+    if m:
+        fam, unit = m.group(1), f"pipeline-worker-cpu@{m.group(2)}"
+    elif (m := re.fullmatch(r"(ai-gpu\d+)-(\d+)", worker_host or "")):
+        fam, unit = m.group(1), f"pipeline-worker-gpu@{m.group(2)}"
+    elif re.fullmatch(r"ai-gpu\d+", worker_host or ""):
+        fam, unit = worker_host, "pipeline-worker-gpu"
+    else:
+        return None
+    ip = _WATCHDOG_HOST_IP.get(fam)
+    return (ip, unit) if ip else None
+
+
 def _count_host_concurrency(db: Any, worker_host: str, slug: str) -> int:
     """同じ host で current_workload=slug の worker 数 (= 自分自身も含む)。
 
@@ -409,6 +436,29 @@ def _resolve_worker_filter(worker: dict[str, Any]) -> set[str] | None:
 
 
 # ---------------- registry ----------------
+
+
+@router.post("/{worker_id}/restart")
+def restart_worker(worker_id: str, request: Request) -> dict[str, Any]:
+    """hung worker を制御プレーンから SSH で systemctl restart (supervisor watchdog 用)。
+    worker daemon が httpx stuck 等で応答不能 (= admin cmd も届かない) 場合の外部復旧手段。"""
+    import subprocess
+    worker = _get_worker_or_404(request, worker_id)
+    host = worker.get("host") or ""
+    tgt = _restart_target(host)
+    if tgt is None:
+        raise HTTPException(status_code=400, detail=f"restart 未対応の host 形式: {host}")
+    ip, unit = tgt
+    cmd = ["ssh", "-i", _WATCHDOG_DEPLOY_KEY, "-o", "StrictHostKeyChecking=no",
+           "-o", "ConnectTimeout=10", f"root@{ip}", f"systemctl restart {unit}"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ssh failed: {e}")
+    logging.getLogger(__name__).warning(
+        "watchdog restart worker=%s host=%s unit=%s rc=%s", worker_id, host, unit, r.returncode)
+    return {"worker_id": worker_id, "host": host, "unit": unit,
+            "ok": r.returncode == 0, "rc": r.returncode, "stderr": (r.stderr or "")[:300]}
 
 
 @router.post("", response_model=WorkerInfo, status_code=status.HTTP_201_CREATED)

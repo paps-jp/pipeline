@@ -199,6 +199,31 @@ init_kwargs:
     label: stall が何秒続いたら re-enqueue するか
     min: 60
     max: 3600
+  - key: watchdog_enabled
+    type: int
+    default: 0
+    label: worker watchdog ON/OFF (1=on, 0=off)
+    help: last_seen_at が stale な hung worker を検知し制御プレーン経由で SSH restart
+    min: 0
+    max: 1
+  - key: watchdog_apply_mode
+    type: int
+    default: 0
+    label: watchdog 実適用 (1=restart 発行, 0=dry-run log のみ)
+    min: 0
+    max: 1
+  - key: watchdog_stale_s
+    type: int
+    default: 150
+    label: last_seen_at が何秒古ければ hung とみなすか
+    min: 60
+    max: 3600
+  - key: watchdog_cooldown_s
+    type: int
+    default: 600
+    label: 同一 worker の再 restart 抑制時間 (秒)
+    min: 60
+    max: 7200
 
 hidden_kwargs:
   - workload_slug
