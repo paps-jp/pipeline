@@ -171,7 +171,7 @@ def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[int | None, str | 
                 host=c["host"], port=c["port"], user=c["user"],
                 password=c["password"], database=c["database"],
                 connect_timeout=c.get("connect_timeout", 3),
-                read_timeout=5, autocommit=True,
+                read_timeout=30, autocommit=True,
             )
         except ImportError:
             err = "no mysql driver (install pymysql)"
