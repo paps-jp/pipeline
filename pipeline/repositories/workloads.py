@@ -98,6 +98,7 @@ class WorkloadRepository:
             "on_failure": json.dumps(payload.on_failure) if payload.on_failure else None,
             "supervisor_enabled": 1 if payload.supervisor_enabled else 0,
             "max_concurrent_per_host": payload.max_concurrent_per_host,
+            "max_concurrent_total": payload.max_concurrent_total,
             "requires_gpu": 1 if payload.requires_gpu else 0,
             "queue_backend": payload.queue_backend,
             "created_by": created_by,
@@ -110,7 +111,7 @@ class WorkloadRepository:
             executor_type, executor_config, success_criteria,
             priority, weight, batch_size, lease_secs, max_attempts,
             resources, host_affinity, on_success, on_failure,
-            supervisor_enabled, max_concurrent_per_host, requires_gpu,
+            supervisor_enabled, max_concurrent_per_host, max_concurrent_total, requires_gpu,
             queue_backend,
             created_by, created_at, updated_at
         ) VALUES (
@@ -118,7 +119,7 @@ class WorkloadRepository:
             :executor_type, :executor_config, :success_criteria,
             :priority, :weight, :batch_size, :lease_secs, :max_attempts,
             :resources, :host_affinity, :on_success, :on_failure,
-            :supervisor_enabled, :max_concurrent_per_host, :requires_gpu,
+            :supervisor_enabled, :max_concurrent_per_host, :max_concurrent_total, :requires_gpu,
             :queue_backend,
             :created_by, :created_at, :updated_at
         )
@@ -155,6 +156,7 @@ class WorkloadRepository:
             "on_failure": json.dumps(payload.on_failure) if payload.on_failure else None,
             "supervisor_enabled": 1 if payload.supervisor_enabled else 0,
             "max_concurrent_per_host": payload.max_concurrent_per_host,
+            "max_concurrent_total": payload.max_concurrent_total,
             "requires_gpu": 1 if payload.requires_gpu else 0,
             "queue_backend": payload.queue_backend,
             "updated_at": now,
@@ -178,6 +180,7 @@ class WorkloadRepository:
             on_failure = :on_failure,
             supervisor_enabled = :supervisor_enabled,
             max_concurrent_per_host = :max_concurrent_per_host,
+            max_concurrent_total = :max_concurrent_total,
             requires_gpu = :requires_gpu,
             queue_backend = :queue_backend,
             updated_at = :updated_at

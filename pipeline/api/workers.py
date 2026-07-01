@@ -317,6 +317,23 @@ def _count_host_concurrency(db: Any, worker_host: str, slug: str) -> int:
     return int(row["cnt"]) if row else 0
 
 
+def _count_total_concurrency(db: Any, slug: str) -> int:
+    """fleet 全体 (= 全 host) で current_workload=slug の active worker 数 (= 自分含む)。
+
+    `max_concurrent_total` ガード用。 max_concurrent_per_host の host 制約を外した版。
+    best-effort: claim race で多少超えても次 cycle で収束する想定。
+    """
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM workers "
+            "WHERE current_workload = :s "
+            "  AND state IN ('active','running','claiming','draining')",
+            {"s": slug},
+        )
+        row = cur.fetchone()
+    return int(row["cnt"]) if row else 0
+
+
 def _host_vram_budget(
     db: Any,
     worker_host: str,
@@ -706,6 +723,14 @@ def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorker
             active = _count_host_concurrency(request.app.state.db, worker_host, w.slug)
             own = 1 if worker_current == w.slug else 0
             if max(0, active - own) >= limit:
+                continue
+        # 横方向 (fleet 全体): max_concurrent_total で全 host 合計の同時実行数を制限。
+        # 単一 writer (embed-write=1) 等、 host をまたいだ絶対上限を保証する。
+        tlimit = w.max_concurrent_total
+        if tlimit is not None and tlimit > 0:
+            tactive = _count_total_concurrency(request.app.state.db, w.slug)
+            town = 1 if worker_current == w.slug else 0
+            if max(0, tactive - town) >= tlimit:
                 continue
         # 縦方向: VRAM 予算チェック。 「他 active worker の avg 合計 + この workload
         # の p95」 が host capacity * safety を超える時 claim 候補から外す。
