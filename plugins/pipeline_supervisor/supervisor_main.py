@@ -18,6 +18,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import subprocess as _subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -38,6 +39,23 @@ DEFAULT_RULES_PATH = str(
 
 # 過去 throughput / 連続性判定用
 _HISTORY_LEN = 30   # = 30 tick × 30s = 15 min 分
+
+# 入口 workload セット (= 流入を守るべき workload 群)
+_ENTRY_WORKLOADS = {
+    "paprika-image-pull", "paprika-video-pull",
+    "paprika-links-pull", "paprika-job-submit",
+    "image-dispatcher", "video-dispatcher",
+}
+
+# 専用レーン固定 workload (= 単一 writer / orchestrator。 balancer swap から絶対に守る)。
+# env_filter に これらを持つ worker は idle でも balancer の再配分対象にしない。
+# 2026-07-02: embed-write writer(cpu3) / supervisor lane(cpu4) が tank-pressure と
+# bin-packing 両 balancer に「一瞬 idle になった隙」に乗っ取られ、単一 writer 保証が
+# 壊れて embed 書込停止・supervisor 停止した対策。 host_affinity=1レーン + env drop-in
+# で固定していても、 control-plane filter を balancer が上書きするため env_filter 側で守る。
+_PINNED_WORKLOADS = {"embed-write", "pipeline-supervisor"}
+# balancer が worker を奪ってはいけない workload 全体 (= 入口 + 専用固定)。
+_PROTECTED_WORKLOADS = _ENTRY_WORKLOADS | _PINNED_WORKLOADS
 
 
 def _utcnow_iso() -> str:
@@ -135,6 +153,18 @@ def setup(**kwargs) -> dict[str, Any]:
             "cooldown_s": float(kwargs.get("watchdog_cooldown_s") or 600),
         },
         "watchdog_last_restart": {},  # worker_id → monotonic 秒 (連続 restart 防止)
+        # service health monitor: systemd サービス生死を SSH で検知→再起動
+        "service_health_cfg": {
+            "enabled": bool(int(kwargs.get("service_health_enabled", 1))),
+            "apply_mode": bool(int(kwargs.get("service_health_apply_mode", 1))),
+            "check_interval_ticks": int(kwargs.get("service_health_check_interval_ticks") or 1),
+            "cooldown_s": float(kwargs.get("service_health_cooldown_s") or 600),
+            "ssh_timeout": int(kwargs.get("service_health_ssh_timeout") or 10),
+            "services": _parse_service_list(
+                kwargs.get("service_health_services") or ""
+            ),
+        },
+        "svc_health_last_restart": {},  # "host:service" → monotonic 秒
     }
     log.info("supervisor: control=%s rules=%s apply_mode=%s",
              state["control_url"], state["rules_path"], state["apply_mode"])
@@ -941,11 +971,6 @@ def _balancer_run(state: dict[str, Any], hosts: list[dict],
     #   対策: swap の plan_slug (= to) が「入口 workload を含まない」 場合、
     #   victim worker の env_filter に入口 workload があれば skip。
     #   = 入口 workload を持つ worker は tank-balancer の対象外。
-    ENTRY_WORKLOADS = {
-        "paprika-image-pull", "paprika-video-pull",
-        "paprika-links-pull", "paprika-job-submit",
-        "image-dispatcher", "video-dispatcher",
-    }
     applied = 0
     apply_mode = bool(cfg.get("apply_mode"))
     for s in swaps:
@@ -954,8 +979,17 @@ def _balancer_run(state: dict[str, Any], hosts: list[dict],
         # ガード: worker の env_filter に入口 workload があり、 plan_slug が
         # 入口でない場合 → skip (= 入口流入を守る)
         worker_env = (s.get("worker_env_filter") or [])
-        env_entries = set(worker_env) & ENTRY_WORKLOADS
-        if env_entries and s["to"] not in ENTRY_WORKLOADS:
+        # 専用固定レーン (embed-write/supervisor) は行き先問わず絶対 swap しない
+        pinned = set(worker_env) & _PINNED_WORKLOADS
+        if pinned:
+            log.info(
+                "tank-balancer skip: worker=%s holds pinned %s, refuse swap to %s",
+                s["worker_id"], sorted(pinned), s["to"],
+            )
+            s["skipped_reason"] = f"pinned_guard:{sorted(pinned)}"
+            continue
+        env_entries = set(worker_env) & _ENTRY_WORKLOADS
+        if env_entries and s["to"] not in _ENTRY_WORKLOADS:
             log.info(
                 "tank-balancer skip: worker=%s holds entry %s, refuse to swap to %s",
                 s["worker_id"], sorted(env_entries), s["to"],
@@ -1182,6 +1216,163 @@ def _worker_watchdog_run(state: dict[str, Any]) -> dict[str, Any]:
             "stale_workers": stale_workers, "actions": actions}
 
 
+# ---------------- service health monitor (systemd サービス生死監視) ---------------- #
+# control plane (pipeline-oss) や worker daemon が systemd の StartLimit / OOM /
+# ホスト再起動で完全停止した場合、 pipeline 全体が止まる。
+# SSH 経由で `systemctl is-active` を定期確認し、 failed/inactive なサービスを
+# `systemctl reset-failed && restart` する。
+#
+# 鶏と卵: control plane 自体が落ちると supervisor の tick が回らない。
+# そのケースは systemd timer (pipeline-health.timer) がカバーする (defense-in-depth)。
+# このモジュールがカバーするのは:
+#  - 一時的 API 障害中に次 tick で復旧を確認
+#  - GPU ホスト上の worker service が知らず死んだケース
+#  - pipeline-worker-c2 自身の障害検知 (= supervisor は pipeline-oss 経由で動く)
+
+_DEFAULT_SERVICE_MAP: list[dict[str, str]] = [
+    {"host": "127.0.0.1", "service": "pipeline-oss.service",
+     "label": "nas:pipeline-oss"},
+    {"host": "127.0.0.1", "service": "pipeline-worker-c2.service",
+     "label": "nas:pipeline-worker-c2"},
+]
+
+
+def _parse_service_list(raw: str) -> list[dict[str, str]]:
+    if not raw.strip():
+        return list(_DEFAULT_SERVICE_MAP)
+    try:
+        v = json.loads(raw)
+        return list(v) if isinstance(v, list) else list(_DEFAULT_SERVICE_MAP)
+    except Exception:
+        return list(_DEFAULT_SERVICE_MAP)
+
+
+def _ssh_run(host_ip: str, cmd: str, timeout: int = 10,
+             user: str = "root") -> dict[str, Any]:
+    """SSH でリモートコマンドを実行。 BatchMode で対話なし。"""
+    ssh_args = [
+        "ssh",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        f"{user}@{host_ip}",
+        cmd,
+    ]
+    try:
+        result = _subprocess.run(
+            ssh_args, capture_output=True, text=True, timeout=timeout,
+        )
+        return {
+            "ok": result.returncode == 0,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip()[:200],
+            "rc": result.returncode,
+        }
+    except _subprocess.TimeoutExpired:
+        return {"ok": False, "error": "ssh timeout", "rc": -1}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200], "rc": -1}
+
+
+def _service_health_run(state: dict[str, Any]) -> dict[str, Any]:
+    """systemd サービスの生死を SSH で検知し、停止中なら自動再起動する。"""
+    cfg = state.get("service_health_cfg") or {}
+    if not cfg.get("enabled"):
+        return {"skipped": "service_health disabled"}
+
+    apply_mode = bool(cfg.get("apply_mode"))
+    check_interval = int(cfg.get("check_interval_ticks") or 5)
+    cooldown_s = float(cfg.get("cooldown_s") or 600)
+    ssh_timeout = int(cfg.get("ssh_timeout") or 10)
+    services = cfg.get("services") or _DEFAULT_SERVICE_MAP
+
+    counter = state.get("counter", 0)
+    if counter % check_interval != 0:
+        return {"skipped": "not_check_tick",
+                "next_check_in": check_interval - (counter % check_interval)}
+
+    now_mono = time.monotonic()
+    last_restart: dict[str, float] = state.setdefault(
+        "svc_health_last_restart", {},
+    )
+
+    checks: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+
+    for svc in services:
+        host_ip = svc.get("host") or "127.0.0.1"
+        service = svc.get("service") or ""
+        label = svc.get("label") or f"{host_ip}:{service}"
+        if not service:
+            continue
+
+        r = _ssh_run(host_ip, f"systemctl is-active {service}",
+                     timeout=ssh_timeout)
+        # rc=0 → active, rc=3 → inactive/failed (not SSH error)
+        if r.get("rc") == 3:
+            status = r.get("stdout", "inactive")
+        elif r.get("ok"):
+            status = r.get("stdout", "unknown")
+        else:
+            status = "ssh_error"
+        is_active = (status == "active")
+
+        checks.append({"label": label, "host": host_ip,
+                        "service": service, "status": status})
+        if is_active:
+            continue
+
+        # --- service is down ---
+        key = f"{host_ip}:{service}"
+        last = last_restart.get(key, 0.0)
+        if last > 0 and (now_mono - last) < cooldown_s:
+            remaining = int(cooldown_s - (now_mono - last))
+            log.info("[service-health] %s is %s, cooldown %ds remaining",
+                     label, status, remaining)
+            actions.append({"label": label, "action": "skip-cooldown",
+                            "status": status,
+                            "cooldown_remaining_s": remaining})
+            continue
+
+        log.warning("[service-health] %s is %s → restart %s",
+                    label, status,
+                    "APPLIED" if apply_mode else "DRY")
+
+        if not apply_mode:
+            actions.append({"label": label, "action": "restart",
+                            "status": status, "dry_run": True})
+            continue
+
+        # reset-failed で StartLimit をクリアしてから restart
+        _ssh_run(host_ip, f"systemctl reset-failed {service}",
+                 timeout=ssh_timeout)
+        rr = _ssh_run(host_ip, f"systemctl restart {service}", timeout=30)
+        last_restart[key] = now_mono
+        ok = rr.get("ok", False)
+        actions.append({
+            "label": label, "action": "restart", "status": status,
+            "restart_ok": ok,
+            "restart_rc": rr.get("rc"),
+            "restart_stderr": rr.get("stderr", "")[:120],
+        })
+        if ok:
+            log.info("[service-health] %s restarted successfully", label)
+        else:
+            log.warning("[service-health] %s restart FAILED: rc=%s %s",
+                        label, rr.get("rc"), rr.get("stderr", "")[:120])
+
+    down_n = sum(1 for c in checks if c["status"] != "active")
+    log.info("[service-health] checked=%d down=%d actions=%d",
+             len(checks), down_n, len(actions))
+
+    return {
+        "enabled": True,
+        "apply_mode": apply_mode,
+        "checks": checks,
+        "actions": actions,
+    }
+
+
 def _parse_upstream_map(raw: str) -> dict[str, str]:
     """'{"face-person-link":"image-hash-extract"}' → dict。 空文字や不正 JSON は {}。"""
     if not raw.strip():
@@ -1239,7 +1430,7 @@ def _tank_pressure_run(
             continue
         if (w.get("filter_updated_by") or "").startswith("operator:"):
             continue
-        if set(w.get("env_filter") or []) & ENTRY_WORKLOADS:
+        if set(w.get("env_filter") or []) & _PROTECTED_WORKLOADS:
             continue
         idle_candidates.append(w)
 
@@ -1650,6 +1841,14 @@ def process(task, ctx, state):
     except Exception as e:
         log.warning("worker watchdog pass failed: %s", e, exc_info=True)
         out["watchdog"] = {"error": str(e)[:200]}
+
+    # ---------- 4.9. service health monitor (systemd サービス生死→SSH restart) ----------
+    try:
+        sh = _service_health_run(state)
+        out["service_health"] = sh
+    except Exception as e:
+        log.warning("service health pass failed: %s", e, exc_info=True)
+        out["service_health"] = {"error": str(e)[:200]}
 
     # ---------- 5. LLM advisor (= 設定で enabled なら N min 毎) ----------
     try:
