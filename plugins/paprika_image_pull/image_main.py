@@ -42,7 +42,10 @@ def _parse_dt(s) -> "datetime | None":
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
@@ -86,14 +89,16 @@ def _save_watermark(db, slug, completed_at: "datetime") -> None:
 
 
 # -------------------- AIMD adaptive controller --------------------
+INTERVAL_MIN_S = 5
+INTERVAL_MAX_S = 3600
+PAGE_LIMIT_MIN = 5
+PAGE_LIMIT_MAX = 500
+
+
 def _adapt_init(state: dict, kwargs: dict) -> None:
     state["adapt"] = {
         "interval_s": int(kwargs.get("interval_s") or 60),
-        "interval_min_s": int(kwargs.get("interval_min_s") or 5),
-        "interval_max_s": int(kwargs.get("interval_max_s") or 600),
         "page_limit": int(kwargs.get("page_limit") or 30),
-        "page_limit_min": int(kwargs.get("page_limit_min") or 10),
-        "page_limit_max": int(kwargs.get("page_limit_max") or 200),
         "miss_streak": 0,
     }
 
@@ -102,16 +107,13 @@ def _adapt_after_tick(state: dict, hit: bool) -> None:
     a = state["adapt"]
     if hit:
         a["miss_streak"] = 0
-        a["interval_s"] = max(a["interval_min_s"], int(a["interval_s"] * 0.6))
-        a["page_limit"] = min(
-            a["page_limit_max"],
-            max(a["page_limit_min"], int(a["page_limit"] * 1.3)),
-        )
+        a["interval_s"] = max(INTERVAL_MIN_S, int(a["interval_s"] * 0.6))
+        a["page_limit"] = min(PAGE_LIMIT_MAX, max(PAGE_LIMIT_MIN, int(a["page_limit"] * 1.3)))
     else:
         a["miss_streak"] += 1
         if a["miss_streak"] >= 2:
-            a["interval_s"] = min(a["interval_max_s"], int(a["interval_s"] * 1.8))
-            a["page_limit"] = max(a["page_limit_min"], int(a["page_limit"] * 0.8))
+            a["interval_s"] = min(INTERVAL_MAX_S, int(a["interval_s"] * 1.8))
+            a["page_limit"] = max(PAGE_LIMIT_MIN, int(a["page_limit"] * 0.8))
 
 
 def _adapt_snapshot(state: dict) -> dict:
@@ -155,7 +157,7 @@ def setup(**kwargs) -> dict[str, Any]:
     if not all(db_cfg[k] for k in ("host", "user", "password", "database")):
         raise RuntimeError("paprika-image-pull: DB credentials required")
     import mariadb
-    db = mariadb.connect(**db_cfg)
+    db = mariadb.connect(**{**db_cfg, "reconnect": True})
     db.autocommit = True
     log.info("image-pull: connected to MariaDB %s/%s", db_cfg["host"], db_cfg["database"])
 
@@ -181,6 +183,7 @@ def setup(**kwargs) -> dict[str, Any]:
         "session": sess,
         "site_cache": _build_site_cache(db),
         "parallel_dl": int(kwargs.get("parallel_dl") or 8),
+        "max_jobs_per_tick": int(kwargs.get("max_jobs_per_tick") or 2000),
     }
     _adapt_init(state, kwargs)
     state["watermark"] = _load_watermark(db, state["workload_slug"])
@@ -209,7 +212,7 @@ def _ensure_db_alive(state: dict) -> Any:
         except Exception:
             pass
         import mariadb
-        db = mariadb.connect(**state["db_cfg"])
+        db = mariadb.connect(**{**state["db_cfg"], "reconnect": True})
         db.autocommit = True
         state["db"] = db
         state["site_cache"] = _build_site_cache(db)
@@ -421,7 +424,7 @@ def _download_image(session: requests.Session, url: str, tmp_dir: Path,
     response = None
     tmp_path = None
     try:
-        response = s.get(url, timeout=(5, 15))
+        response = s.get(url, timeout=(5, 8))
         if response.status_code != 200:
             return False, f"HTTP {response.status_code}", None
         data = response.content
@@ -580,6 +583,7 @@ def process(task, ctx, state):
             wm_dt.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00"), safe=""
         )
 
+    max_jobs = state.get("max_jobs_per_tick", 2000)
     jobs: list = []
     offset = 0
     while True:
@@ -595,7 +599,7 @@ def process(task, ctx, state):
             out["paprika_list_error"] = str(e)[:200]
             break
         jobs.extend(page)
-        if len(page) < page_limit:
+        if len(page) < page_limit or len(jobs) >= max_jobs:
             break
         offset += page_limit
     out["jobs_seen"] = len(jobs)
@@ -612,27 +616,39 @@ def process(task, ctx, state):
     fetch_failed = 0
     new_entries: list[dict] = []
 
-    # Phase 1 (逐次): job result 取得 + batch dedup → asset タスクリストを構築
-    asset_tasks: list[dict] = []
-    for j in jobs:
+    # Phase 1 (並列): job result 取得 — HTTP fetch を並列化してレイテンシを削減
+    def _fetch_one_job(j: dict) -> "dict | None":
         job_id = j.get("job_id")
-        parent_url = j.get("url") or ""
         if not job_id:
+            return None
+        try:
+            res = _http_get_json(
+                f"{state['paprika_hub']}/jobs/{job_id}/result",
+                timeout=5.0,
+            )
+            return {"j": j, "res": res}
+        except Exception as e:
+            log.debug("fetch result failed job=%s: %s", job_id, e)
+            return None
+
+    n_fetch = min(state.get("parallel_dl", 8) * 2, 32)
+    with ThreadPoolExecutor(max_workers=n_fetch) as fetch_pool:
+        fetch_results = list(fetch_pool.map(_fetch_one_job, jobs))
+
+    db = _ensure_db_alive(state)
+
+    asset_tasks: list[dict] = []
+    for fetched in fetch_results:
+        if fetched is None:
+            fetch_failed += 1
             continue
+        j = fetched["j"]
+        res = fetched["res"]
+        parent_url = j.get("url") or ""
         parent_domain = _normalize_domain(parent_url)
         site = _site_for_domain(parent_domain, state["site_cache"])
         if not site:
             no_site += 1
-            continue
-
-        try:
-            res = _http_get_json(
-                f"{state['paprika_hub']}/jobs/{job_id}/result",
-                timeout=10.0,
-            )
-        except Exception as e:
-            fetch_failed += 1
-            log.debug("fetch result failed job=%s: %s", job_id, e)
             continue
 
         # watermark 候補: fetch 成功したジョブの completed_at を追跡
@@ -656,7 +672,7 @@ def process(task, ctx, state):
         try:
             known_urls = _find_existing_images_batch(db, _candidate_urls)
         except Exception as e:
-            log.warning("batch dedup failed job=%s: %s", job_id, str(e)[:120])
+            log.warning("batch dedup failed job=%s: %s", j.get("job_id"), str(e)[:120])
             known_urls = set()
 
         for asset in images:
