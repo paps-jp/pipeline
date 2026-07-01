@@ -250,6 +250,7 @@ class ControlClient:
 
     def __init__(self, control_url: str, *, token: str | None = None, timeout_s: float = 30.0) -> None:
         self.base = control_url.rstrip("/")
+        self._timeout_s = timeout_s
         self._headers = {"Content-Type": "application/json"}
         if token:
             self._headers["Authorization"] = f"Bearer {token}"
@@ -257,6 +258,15 @@ class ControlClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def reset(self) -> None:
+        """httpx client を作り直す。ReadTimeout 後に connection pool へ stuck 接続が
+        残り、次リクエストが timeout も発火せず hang する事象 (2026-07-01 cpu3) の予防/復旧。"""
+        try:
+            await self._client.aclose()
+        except Exception:
+            pass
+        self._client = httpx.AsyncClient(timeout=self._timeout_s, headers=self._headers)
 
     async def register(self, payload: dict) -> dict:
         r = await self._client.post(f"{self.base}/api/v1/workers", json=payload)
@@ -771,16 +781,26 @@ class WorkerDaemon:
 
     async def _drain_once(self) -> bool:
         try:
-            workloads = await self._client.list_workloads(self.worker_id)
+            # httpx client が timeout 後に stuck 接続を掴んで hang する事象を防ぐため、
+            # asyncio.wait_for で硬い上限を課す (httpx 自身の timeout=30s を超えても復帰)。
+            workloads = await asyncio.wait_for(
+                self._client.list_workloads(self.worker_id), timeout=35.0
+            )
         except httpx.HTTPStatusError as e:
             if self._is_worker_404(e):
                 # 404 = workers レコード消滅。 再 register して次サイクルでやり直す。
                 await self._reregister_self("list_workloads")
                 return False
             log.exception("list_workloads failed; sleeping")
+            await self._client.reset()
+            return False
+        except asyncio.TimeoutError:
+            log.warning("list_workloads hung (wait_for 35s); resetting httpx client")
+            await self._client.reset()
             return False
         except Exception:
             log.exception("list_workloads failed; sleeping")
+            await self._client.reset()
             return False
         # サーマルチェック (= 1 drain cycle で 1 回、 nvidia-smi 高々 1 回)
         self._update_thermal()
