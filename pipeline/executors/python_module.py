@@ -174,7 +174,7 @@ class PythonModuleExecutor:
             )
 
         # 戻り値の型 normalize:
-        #   - dict       → output_json に
+        #   - dict       → output_json に、 `_error` キーで success=False (batch と同規約)
         #   - None       → 単なる成功
         #   - bool       → success フラグ上書き
         #   - ExecutionResult を直接返す plugin もサポート
@@ -185,6 +185,15 @@ class PythonModuleExecutor:
             return out
         if isinstance(out, bool):
             return ExecutionResult(success=out, duration_ms=elapsed_ms)
+        # dict の場合、 batch executor と同じ `_error` 規約を適用する
+        # (以前は run_batch のみ判定し run では素通しになっていた)
+        if isinstance(out, dict) and "_error" in out:
+            return ExecutionResult(
+                success=False,
+                duration_ms=elapsed_ms,
+                output_json=out,
+                error=str(out.get("_error"))[:500],
+            )
         return ExecutionResult(
             success=True,
             duration_ms=elapsed_ms,
