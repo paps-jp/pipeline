@@ -365,7 +365,12 @@ class ControlClient:
             r.raise_for_status()
             return r.json()
         except Exception:
-            log.warning("poll_admin_cmd failed", exc_info=False)
+            # DEBUG に降格: pipeline-oss slow 時に秒数千件発火して service_logs を
+            # 埋め尽くしていた (2026-07-03 事故時に 30分で 260万行)。 poll 失敗は
+            # 25s long-poll の期限切れが主で通常運用時も稀に起きる想定内 event。
+            # journalctl には残るので調査は可能。 真の障害は heartbeat_failed で
+            # 別途 WARNING が出る (それも rate-limited)。
+            log.debug("poll_admin_cmd failed", exc_info=False)
             return None
 
     async def post_vram_observation(self, slug: str, used_mb: int, worker_id: str | None) -> None:

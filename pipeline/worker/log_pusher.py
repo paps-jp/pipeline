@@ -28,6 +28,10 @@ class ControlPlaneLogHandler(logging.Handler):
     - 各 record を bounded queue (maxsize=10000) に enqueue → drain thread が batch flush。
     - flush_interval_s 毎、 もしくは batch_max に達したら POST。
     - 失敗時は静かに drop (logging stack overflow を避けるため log しない)。
+    - 同一 (level, logger, record.msg) の spam は rate_limit_window_s 内 1 件だけ通し、
+      期間内の抑制件数は次の通過時に "+N suppressed" として合成表示する
+      (2026-07-03: pipeline-oss slow 時 poll_admin_cmd failed 等が秒 1500 件出て
+      service_logs が 30分で 260万行 → nas disk 100% 事故対策)。
     """
 
     def __init__(
@@ -42,6 +46,8 @@ class ControlPlaneLogHandler(logging.Handler):
         queue_maxsize: int = 10000,
         token: str | None = None,
         level: int = logging.INFO,
+        rate_limit_window_s: float = 10.0,
+        rate_limit_cache_max: int = 500,
     ) -> None:
         super().__init__(level=level)
         self._url = control_url.rstrip("/") + "/api/v1/service-logs"
@@ -53,16 +59,58 @@ class ControlPlaneLogHandler(logging.Handler):
         self._batch_max = batch_max
         self._queue: queue.Queue[dict] = queue.Queue(maxsize=queue_maxsize)
         self._stop = threading.Event()
+        # rate limit: (level, logger, record.msg) -> (last_ts, suppressed_count)
+        # record.msg は format 前の template (poll_admin_cmd failed 等) を使う
+        # ことで、 pk 等が入る動的メッセージも同一キーで束ねられる。
+        self._rate_lock = threading.Lock()
+        self._rate_seen: dict[tuple[str, str, str], tuple[float, int]] = {}
+        self._rate_window_s = float(rate_limit_window_s)
+        self._rate_cache_max = int(rate_limit_cache_max)
         self._thread = threading.Thread(
             target=self._run, name="LogPusher", daemon=True
         )
         self._thread.start()
+
+    def _rate_gate(self, record: logging.LogRecord) -> tuple[bool, int]:
+        """rate limit 判定。 (通すか, 抑制されていた件数) を返す。
+
+        window 内 2 回目以降は False (drop) + suppressed++。
+        window を越えたら True (通す) + prev_suppressed を返して 0 に reset。
+        """
+        try:
+            key = (record.levelname, record.name, str(record.msg))
+        except Exception:
+            return True, 0
+        now = time.time()
+        with self._rate_lock:
+            entry = self._rate_seen.get(key)
+            if entry is None:
+                # 未観測 → 通す + cache
+                if len(self._rate_seen) >= self._rate_cache_max:
+                    # 溢れそう: 一番古いキーを 1 個追い出す (簡易 LRU)
+                    oldest = min(self._rate_seen.items(), key=lambda kv: kv[1][0])
+                    self._rate_seen.pop(oldest[0], None)
+                self._rate_seen[key] = (now, 0)
+                return True, 0
+            last_ts, suppressed = entry
+            if now - last_ts < self._rate_window_s:
+                # window 内 → 抑制
+                self._rate_seen[key] = (last_ts, suppressed + 1)
+                return False, 0
+            # window 越え → 通す + 抑制回数を報告 + reset
+            self._rate_seen[key] = (now, 0)
+            return True, suppressed
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
         except Exception:
             return
+        allow, suppressed = self._rate_gate(record)
+        if not allow:
+            return
+        if suppressed > 0:
+            msg = f"{msg} (+{suppressed} suppressed in last {int(self._rate_window_s)}s)"
         item = {
             "ts": _utcnow_iso(),
             "host": self._host,
