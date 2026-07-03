@@ -475,6 +475,11 @@ class WorkerDaemon:
         self._filter_reload_interval_s = float(
             os.environ.get("PIPELINE_WORKER_FILTER_RELOAD_S", "30")
         )
+        # admin poll は本来 ~25s の long-poll。 即時 return (= 失敗 / 204 即返し / stuck pool)
+        # のとき次 poll まで最低これだけ空ける。 高速ループ (= service_logs 洪水) の構造的防止。
+        self._admin_poll_min_interval_s = float(
+            os.environ.get("PIPELINE_WORKER_ADMIN_POLL_MIN_S", "5")
+        )
 
     def _build_register_payload(self) -> dict[str, Any]:
         """register / 再 register 共通の payload。 hostname と env_filter は不変だが
@@ -664,18 +669,28 @@ class WorkerDaemon:
 
     async def _admin_loop(self) -> None:
         """control plane から admin コマンド (= shell exec, fetch_archive 等) を long poll で受信."""
+        loop = asyncio.get_running_loop()
         while not self._stop_evt.is_set():
+            started = loop.time()
             try:
                 cmd = await self._client.poll_admin_cmd(self.worker_id, self.hostname)
             except Exception:
-                log.warning("admin poll failed; retry in 5s", exc_info=False)
-                try:
-                    await asyncio.wait_for(self._stop_evt.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    pass
-                continue
+                # poll_admin_cmd は通常内部で握り潰して None を返すが、 想定外の raise でも
+                # 高速ループに落ちないよう None 扱いで下の最低間隔ガードに合流させる。
+                log.debug("admin poll raised", exc_info=False)
+                cmd = None
             if cmd is None:
-                continue  # 204 = nothing, すぐ次の poll
+                # 正常な long-poll は control plane 側で ~25s ブロックしてから 204 を返す。
+                # ここに即時到達した場合は失敗 / 204 即返し / stuck pool のいずれかなので、
+                # 次 poll まで最低間隔を空けて高速ループ (= ログ洪水 / CPU 空転) を防ぐ。
+                elapsed = loop.time() - started
+                remaining = self._admin_poll_min_interval_s - elapsed
+                if remaining > 0:
+                    try:
+                        await asyncio.wait_for(self._stop_evt.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        pass
+                continue  # 204 = nothing / 失敗, 最低間隔後に次の poll
             log.info("admin cmd received: id=%s type=%s host=%s",
                      cmd.get("id"), cmd.get("cmd_type"), cmd.get("target_host"))
             try:
