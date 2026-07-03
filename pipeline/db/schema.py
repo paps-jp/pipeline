@@ -78,6 +78,14 @@ WORKLOADS_ALTERS = [
     # 業務 queue 移行 (Phase 2-α 2026-06-29)。 queue の格納先 backend。
     # 'sqlite' (= 既定) / 'mariadb' (= secondary_db)。 workload 毎に切替。
     "ALTER TABLE workloads ADD COLUMN queue_backend TEXT NOT NULL DEFAULT 'sqlite'",
+    # Elastic Workers (2026-07-04)。 supervisor が worker プロセスを需要+余力で
+    # spawn/kill する際の baseline / 上限。
+    # min_resident_workers: 常に維持する最低 worker 数 (= 0 なら暇なとき 0 台まで縮小可、
+    #   1 なら最低 1 台常駐。 「1 workload=1 worker 固定」は min=1 かつ max=1)。 既定 0。
+    "ALTER TABLE workloads ADD COLUMN min_resident_workers INTEGER NOT NULL DEFAULT 0",
+    # max_workers: この workload 向けに elastic scaler が起こす worker 数の絶対上限。
+    #   NULL = 無制限 (= host 余力と max_concurrent_* だけで制限)。
+    "ALTER TABLE workloads ADD COLUMN max_workers INTEGER",
 ]
 
 # workers テーブルへの後付け列 (= 既存 DB を壊さず adopt)

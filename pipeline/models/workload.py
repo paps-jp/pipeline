@@ -80,6 +80,15 @@ class WorkloadBase(BaseModel):
     # よう型は str のまま緩く保つ (= Literal にしない)。
     queue_backend: str = "sqlite"
 
+    # Elastic Workers (2026-07-04)。 supervisor が worker プロセスを需要+余力で
+    # spawn/kill する際の baseline / 上限 (elastic scaler が有効なときのみ参照)。
+    # min_resident_workers: 常に維持する最低 worker 数。 0 = 暇なとき 0 台まで縮小可、
+    #   1 = 最低 1 台常駐。 「1 workload=1 worker 固定」は min=1 かつ max_workers=1。
+    min_resident_workers: int = Field(default=0, ge=0, le=100)
+    # max_workers: elastic scaler がこの workload 向けに起こす worker 数の絶対上限。
+    #   None = 無制限 (= host 余力 / max_concurrent_* だけで制限)。
+    max_workers: int | None = Field(default=None, ge=1, le=1000)
+
     @field_validator("host_affinity", mode="before")
     @classmethod
     def _coerce_host_affinity(cls, v: Any) -> list[str]:
