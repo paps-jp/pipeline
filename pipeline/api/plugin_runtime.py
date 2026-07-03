@@ -264,27 +264,3 @@ def serve_plugin_web(slug: str, path: str) -> FileResponse:
     headers = no_cache_headers if path.endswith(".html") else None
     return FileResponse(file_path, headers=headers)
 
-
-# ---------------- TTL reaper ----------------
-
-
-def reap_old_runtime_data(db, *, state_ttl_hours: int = 24,
-                          blob_ttl_minutes: int = 30) -> dict[str, int]:
-    """古い runtime データを削除。 state=24h, blob=30min がデフォルト。
-    blob は画像で容量を食うので短め。"""
-    now = datetime.now(timezone.utc)
-    state_cutoff = (now - timedelta(hours=state_ttl_hours)).isoformat()
-    blob_cutoff = (now - timedelta(minutes=blob_ttl_minutes)).isoformat()
-    deleted = {"state": 0, "blob": 0}
-    with db.transaction() as conn:
-        c1 = conn.execute(
-            "DELETE FROM plugin_runtime_state WHERE updated_at < :cut",
-            {"cut": state_cutoff},
-        )
-        deleted["state"] = c1.rowcount or 0
-        c2 = conn.execute(
-            "DELETE FROM plugin_runtime_blob WHERE updated_at < :cut",
-            {"cut": blob_cutoff},
-        )
-        deleted["blob"] = c2.rowcount or 0
-    return deleted

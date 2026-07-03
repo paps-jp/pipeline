@@ -194,23 +194,25 @@ def create_app(settings: Settings) -> FastAPI:
                     pass
         metric_agg_task = _asyncio.create_task(_metric_aggregator_loop())
 
-        # plugin_runtime reaper: blob=30min TTL, state=24h TTL で古いキャッシュを削除。
-        # 初回起動時に即実行して既存の古いデータを一掃する。
-        from pipeline.api.plugin_runtime import reap_old_runtime_data as _reap_runtime
-        _runtime_reaper_stop = _asyncio.Event()
-        async def _runtime_reaper_loop() -> None:
-            while not _runtime_reaper_stop.is_set():
+        # maintenance loop: 各テーブルの定期 purge を 5 分周期で実行。
+        # 追加/変更は pipeline/repositories/maintenance.py のみ編集すればよい。
+        from pipeline.repositories.maintenance import MaintenanceRepository as _MR
+        _maintenance_stop = _asyncio.Event()
+        async def _maintenance_loop() -> None:
+            repo = _MR(db)
+            while not _maintenance_stop.is_set():
                 try:
-                    deleted = _reap_runtime(db)
-                    if deleted["blob"] or deleted["state"]:
-                        log.info("runtime reaper: blob=%d state=%d", deleted["blob"], deleted["state"])
+                    deleted = repo.purge_all()
+                    nonempty = {k: v for k, v in deleted.items() if v}
+                    if nonempty:
+                        log.info("maintenance purge: %s", nonempty)
                 except Exception:
-                    log.exception("runtime reaper failed")
+                    log.exception("maintenance purge failed")
                 try:
-                    await _asyncio.wait_for(_runtime_reaper_stop.wait(), timeout=300)
+                    await _asyncio.wait_for(_maintenance_stop.wait(), timeout=300)
                 except _asyncio.TimeoutError:
                     pass
-        runtime_reaper_task = _asyncio.create_task(_runtime_reaper_loop())
+        maintenance_task = _asyncio.create_task(_maintenance_loop())
 
         try:
             yield
@@ -219,7 +221,7 @@ def create_app(settings: Settings) -> FastAPI:
             _reaper_stop.set()
             _vram_stop.set()
             _metric_stop.set()
-            _runtime_reaper_stop.set()
+            _maintenance_stop.set()
             try:
                 await _asyncio.wait_for(reaper_task, timeout=3)
             except Exception:
@@ -233,7 +235,7 @@ def create_app(settings: Settings) -> FastAPI:
             except Exception:
                 pass
             try:
-                await _asyncio.wait_for(runtime_reaper_task, timeout=3)
+                await _asyncio.wait_for(maintenance_task, timeout=3)
             except Exception:
                 pass
             try:
