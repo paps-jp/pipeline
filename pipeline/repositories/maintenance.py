@@ -88,6 +88,20 @@ class MaintenanceRepository:
             return cur.rowcount or 0
 
     # ------------------------------------------------------------------ #
+    # llm_calls — 件数ベース (最新 keep_n 件を残して古いものを削除)
+    # ------------------------------------------------------------------ #
+
+    def purge_llm_calls(self, *, keep_n: int = 1_000) -> int:
+        """最新 keep_n 件を残して古い llm_calls を削除する。"""
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM llm_calls WHERE id NOT IN "
+                "(SELECT id FROM llm_calls ORDER BY id DESC LIMIT :n)",
+                {"n": int(keep_n)},
+            )
+            return cur.rowcount or 0
+
+    # ------------------------------------------------------------------ #
     # 一括実行
     # ------------------------------------------------------------------ #
 
@@ -98,4 +112,5 @@ class MaintenanceRepository:
             "runs": self.purge_runs(),
             "plugin_runtime_blob": self.purge_plugin_runtime_blob(),
             "plugin_runtime_state": self.purge_plugin_runtime_state(),
+            "llm_calls": self.purge_llm_calls(),
         }
