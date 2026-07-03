@@ -140,6 +140,7 @@ export interface WorkerInfo {
   workload_filter: string[] | null;
   filter_updated_at: string | null;
   filter_updated_by: string | null;
+  env_filter: string[] | null;
 }
 
 // ----------------- Plugin Registry -----------------

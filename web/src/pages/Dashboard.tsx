@@ -259,17 +259,31 @@ function relativeAge(iso: string): string {
   return `${Math.floor(diff / 86400)}d`;
 }
 
-// ---- パネル: 実行中 -------------------------------------------------------
+// ---- パネル: 稼働中ワーカー -------------------------------------------------------
 
 function RunningPanel() {
   const q = useQuery({
-    queryKey: ["dashboard-overview"],
-    queryFn: api.dashboardOverview,
+    queryKey: ["workers-list"],
+    queryFn: api.listWorkers,
     refetchInterval: 3_000,
   });
   const nameMap = useWorkloadNameMap();
-  const count = q.data?.running.length ?? 0;
-  const live = count > 0;
+
+  const workers = q.data?.workers ?? [];
+  // current_workload を持つ = 今まさにタスクを処理中
+  const active = workers.filter((w) => w.current_workload != null);
+  const idle   = workers.filter((w) => w.current_workload == null && w.state === "active");
+  const live   = active.length > 0;
+
+  // workload ごとに処理中 worker をまとめる
+  const byWorkload = new Map<string, typeof active>();
+  for (const w of active) {
+    const slug = w.current_workload!;
+    if (!byWorkload.has(slug)) byWorkload.set(slug, []);
+    byWorkload.get(slug)!.push(w);
+  }
+  const rows = Array.from(byWorkload.entries())
+    .sort((a, b) => b[1].length - a[1].length);
 
   return (
     <Card
@@ -295,38 +309,44 @@ function RunningPanel() {
             ) : (
               <span className="paprika-status-dot" style={{ background: "var(--mantine-color-dimmed)" }} />
             )}
-            <Text fw={700} size="sm" tt="uppercase" c="dimmed" style={{ letterSpacing: 0.6 }}>実行中</Text>
+            <Text fw={700} size="sm" tt="uppercase" c="dimmed" style={{ letterSpacing: 0.6 }}>稼働ワーカー</Text>
           </Group>
           <Text size="xs" c="dimmed">3s 更新</Text>
         </Group>
         <Group align="baseline" gap={6}>
           <Text fw={800} c={live ? "indigo" : "dimmed"} style={{ fontSize: 44, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>
-            {q.isLoading ? "—" : count}
+            {q.isLoading ? "—" : active.length}
           </Text>
-          <Text size="sm" c="dimmed" fw={500}>件</Text>
+          <Text size="sm" c="dimmed" fw={500}>台</Text>
+          {idle.length > 0 && (
+            <Text size="xs" c="dimmed" style={{ alignSelf: "flex-end", paddingBottom: 4 }}>
+              / 待機 {idle.length}台
+            </Text>
+          )}
         </Group>
         {q.error && <ErrorState error={q.error} onRetry={() => q.refetch()} />}
-        {!q.error && count === 0 && !q.isLoading && (
-          <Text size="xs" c="dimmed">キューに pending が来ると ワーカーが拾います。</Text>
+        {!q.error && active.length === 0 && !q.isLoading && (
+          <Text size="xs" c="dimmed">稼働中のワーカーはいません。</Text>
         )}
-        {count > 0 && (
+        {active.length > 0 && (
           <Stack gap={6} mt={4} className="paprika-divided-rows">
-            {q.data!.running.slice(0, RUNNING_PANEL_ROWS).map((r) => (
-              <Group key={r.id} gap="xs" wrap="nowrap" justify="space-between">
-                <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-                  <Badge color="indigo" variant="light" size="sm" maw={150} style={{ flexShrink: 0 }} title={r.workload_slug}>
-                    {nameMap.get(r.workload_slug) ?? r.workload_slug}
-                  </Badge>
-                  <Code style={{ fontSize: 11, ...ELLIPSIS }}>{r.pk}</Code>
-                </Group>
+            {rows.slice(0, RUNNING_PANEL_ROWS).map(([slug, ws]) => (
+              <Group key={slug} gap="xs" wrap="nowrap" justify="space-between">
+                <Badge color="indigo" variant="light" size="sm" maw={160} style={{ flexShrink: 0 }} title={slug}>
+                  {nameMap.get(slug) ?? slug}
+                </Badge>
                 <Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
-                  <Text size="xs" c="dimmed" truncate maw={110}>{r.worker_id}</Text>
-                  <Badge size="sm" variant="default" style={{ fontVariantNumeric: "tabular-nums" }}>{relativeAge(r.started_at)}</Badge>
+                  <Text size="xs" c="dimmed" truncate maw={180}>
+                    {ws.map((w) => w.id).join(", ")}
+                  </Text>
+                  <Badge size="sm" color="indigo" variant="outline" style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {ws.length}台
+                  </Badge>
                 </Group>
               </Group>
             ))}
-            {count > RUNNING_PANEL_ROWS && (
-              <Text size="xs" c="dimmed">…他 {count - RUNNING_PANEL_ROWS} 件</Text>
+            {rows.length > RUNNING_PANEL_ROWS && (
+              <Text size="xs" c="dimmed">…他 {rows.length - RUNNING_PANEL_ROWS} workload</Text>
             )}
           </Stack>
         )}

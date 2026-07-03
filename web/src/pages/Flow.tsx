@@ -14,6 +14,7 @@ import {
   MiniMap,
   Position,
   useNodesState,
+  useViewport,
   type Node,
   type Edge,
   type NodeChange,
@@ -633,7 +634,7 @@ function HazardOverlay({ bg, barBg, barText, label, barBelow = false }: {
 
 // 黄黒テープ: tank overflow (fill_ratio >= 1.0) 警告。
 function OverflowOverlay() {
-  return <HazardOverlay bg={HAZARD_BG} barBg="#fbbf24" barText="#0f172a" label="⚠ WARNING" />;
+  return <HazardOverlay bg={HAZARD_BG} barBg="#fbbf24" barText="#0f172a" label="⚠ WARNING" barBelow />;
 }
 
 // 赤黒テープ: workload エラー (state === "failed") 表示。
@@ -823,9 +824,376 @@ const NODE_TYPES = {
   external: ExternalNode as never,
 };
 
+// ---------- Annotation layer ----------
+
+type AnnoKind = 'text' | 'line' | 'rect' | 'erase';
+
+interface Anno {
+  id: string;
+  kind: 'text' | 'line' | 'rect';
+  color: string;
+  fontSize: number;
+  x: number;
+  y: number;
+  x2: number;
+  y2: number;
+  text: string;
+}
+
+const ANNO_LS_KEY = 'pipeline-flow-annos-v1';
+
+function AnnotationCanvas({
+  annos,
+  activeTool,
+  annoColor,
+  annoFontSize,
+  rfBoxRef,
+  onAdd,
+  onDelete,
+  onTextPlace,
+}: {
+  annos: Anno[];
+  activeTool: AnnoKind | null;
+  annoColor: string;
+  annoFontSize: number;
+  rfBoxRef: { current: HTMLDivElement | null };
+  onAdd: (a: Omit<Anno, 'id'>) => void;
+  onDelete: (id: string) => void;
+  /** テキストツールでクリックされた座標を Flow へ通知 (Box相対スクリーン座標 + Flow座標) */
+  onTextPlace: (sx: number, sy: number, fx: number, fy: number) => void;
+}) {
+  const vp = useViewport();
+  const [draw, setDraw] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+
+  useEffect(() => { setDraw(null); }, [activeTool]);
+
+  const toFlow = useCallback((clientX: number, clientY: number) => {
+    const el = rfBoxRef.current;
+    if (!el) return { x: 0, y: 0 };
+    const r = el.getBoundingClientRect();
+    return {
+      x: (clientX - r.left - vp.x) / vp.zoom,
+      y: (clientY - r.top - vp.y) / vp.zoom,
+    };
+  }, [rfBoxRef, vp]);
+
+  const sw = Math.max(0.5, 2 / vp.zoom);
+  const dashArr = `${Math.max(2, 4 / vp.zoom)}`;
+  const isActive = !!activeTool;
+
+  const handleSvgDown = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!activeTool) return;
+    e.stopPropagation();
+    const p = toFlow(e.clientX, e.clientY);
+    if (activeTool === 'text') {
+      const r = rfBoxRef.current?.getBoundingClientRect();
+      const sx = e.clientX - (r?.left ?? 0);
+      const sy = e.clientY - (r?.top ?? 0);
+      onTextPlace(sx, sy, p.x, p.y);
+    } else if (activeTool !== 'erase') {
+      setDraw({ x1: p.x, y1: p.y, x2: p.x, y2: p.y });
+    }
+  };
+
+  const handleSvgMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!draw) return;
+    const p = toFlow(e.clientX, e.clientY);
+    setDraw((d) => d ? { ...d, x2: p.x, y2: p.y } : null);
+  };
+
+  const handleSvgUp = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!draw || !activeTool || activeTool === 'text' || activeTool === 'erase') return;
+    const p = toFlow(e.clientX, e.clientY);
+    const d = { ...draw, x2: p.x, y2: p.y };
+    const minSize = 3 / vp.zoom;
+    if (Math.abs(d.x2 - d.x1) > minSize || Math.abs(d.y2 - d.y1) > minSize) {
+      onAdd({ kind: activeTool as 'line' | 'rect', x: d.x1, y: d.y1, x2: d.x2, y2: d.y2, text: '', color: annoColor, fontSize: annoFontSize });
+    }
+    setDraw(null);
+  };
+
+  const handleAnnoClick = (id: string) => { if (activeTool === 'erase') onDelete(id); };
+
+  return (
+    <svg
+      style={{
+        position: 'absolute',
+        top: 0, left: 0, width: '100%', height: '100%',
+        zIndex: isActive ? 1000 : 1,
+        pointerEvents: isActive ? 'all' : 'none',
+        cursor: activeTool === 'erase' ? 'not-allowed' : isActive ? 'crosshair' : 'default',
+        overflow: 'visible',
+      }}
+      onMouseDown={handleSvgDown}
+      onMouseMove={handleSvgMove}
+      onMouseUp={handleSvgUp}
+    >
+      <g transform={`translate(${vp.x},${vp.y}) scale(${vp.zoom})`}>
+        {annos.map((a) => {
+          const clickHandler = (e: React.MouseEvent) => {
+            e.stopPropagation();
+            handleAnnoClick(a.id);
+          };
+          if (a.kind === 'text') {
+            return (
+              <text
+                key={a.id}
+                x={a.x} y={a.y}
+                fill={a.color}
+                fontSize={a.fontSize / vp.zoom}
+                style={{ userSelect: 'none', pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
+                onClick={clickHandler}
+              >
+                {a.text}
+              </text>
+            );
+          }
+          if (a.kind === 'line') {
+            return (
+              <line
+                key={a.id}
+                x1={a.x} y1={a.y} x2={a.x2} y2={a.y2}
+                stroke={a.color} strokeWidth={sw} strokeLinecap="round"
+                style={{ pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
+                onClick={clickHandler}
+              />
+            );
+          }
+          const rx = Math.min(a.x, a.x2), ry = Math.min(a.y, a.y2);
+          return (
+            <rect
+              key={a.id}
+              x={rx} y={ry} width={Math.abs(a.x2 - a.x)} height={Math.abs(a.y2 - a.y)}
+              stroke={a.color} strokeWidth={sw} fill={`${a.color}22`}
+              style={{ pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
+              onClick={clickHandler}
+            />
+          );
+        })}
+        {/* Drawing preview */}
+        {draw && activeTool === 'line' && (
+          <line x1={draw.x1} y1={draw.y1} x2={draw.x2} y2={draw.y2}
+            stroke={annoColor} strokeWidth={sw} strokeDasharray={dashArr}
+            strokeLinecap="round" pointerEvents="none" />
+        )}
+        {draw && activeTool === 'rect' && (() => {
+          const rx = Math.min(draw.x1, draw.x2), ry = Math.min(draw.y1, draw.y2);
+          return (
+            <rect x={rx} y={ry} width={Math.abs(draw.x2 - draw.x1)} height={Math.abs(draw.y2 - draw.y1)}
+              stroke={annoColor} strokeWidth={sw} strokeDasharray={dashArr}
+              fill={`${annoColor}11`} pointerEvents="none" />
+          );
+        })()}
+      </g>
+    </svg>
+  );
+}
+
+function AnnotationToolbar({
+  activeTool,
+  setActiveTool,
+  annoColor,
+  setAnnoColor,
+  annoFontSize,
+  setAnnoFontSize,
+  onClear,
+  isLight,
+}: {
+  activeTool: AnnoKind | null;
+  setActiveTool: (t: AnnoKind | null) => void;
+  annoColor: string;
+  setAnnoColor: (c: string) => void;
+  annoFontSize: number;
+  setAnnoFontSize: (n: number) => void;
+  onClear: () => void;
+  isLight: boolean;
+}) {
+  const bg = isLight ? '#ffffff' : '#1e293b';
+  const border = `1px solid ${isLight ? '#e2e8f0' : '#334155'}`;
+  const textC = isLight ? '#475569' : '#94a3b8';
+  const divider = <div style={{ width: 1, height: 18, background: isLight ? '#e2e8f0' : '#334155', flexShrink: 0 }} />;
+
+  const toolBtn = (tool: AnnoKind | null, label: string, tip: string) => (
+    <Tooltip label={tip} key={String(tool)}>
+      <button
+        onClick={() => setActiveTool(activeTool === tool ? null : tool)}
+        style={{
+          background: activeTool === tool ? '#3b82f6' : 'transparent',
+          color: activeTool === tool ? '#fff' : textC,
+          border: 'none',
+          borderRadius: 4,
+          padding: '3px 8px',
+          cursor: 'pointer',
+          fontSize: 13,
+          fontWeight: 700,
+          lineHeight: 1,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {label}
+      </button>
+    </Tooltip>
+  );
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        bottom: 15,
+        left: 52,
+        zIndex: 10,
+        background: bg,
+        border,
+        borderRadius: 6,
+        padding: '5px 8px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 5,
+        boxShadow: '0 2px 8px rgba(0,0,0,0.18)',
+      }}
+    >
+      <Text size="xs" c="dimmed" fw={600} style={{ marginRight: 2, whiteSpace: 'nowrap' }}>加筆</Text>
+      {divider}
+      {toolBtn('text', 'T', 'テキスト追加')}
+      {toolBtn('line', '╱', '線を引く')}
+      {toolBtn('rect', '□', '四角を描く')}
+      {toolBtn('erase', '✕', '加筆を消す（クリックで削除）')}
+      {divider}
+      <Tooltip label="色">
+        <input
+          type="color"
+          value={annoColor}
+          onChange={(e) => setAnnoColor(e.target.value)}
+          style={{ width: 22, height: 22, border: 'none', background: 'none', cursor: 'pointer', padding: 0, flexShrink: 0 }}
+        />
+      </Tooltip>
+      {activeTool === 'text' && (
+        <select
+          value={annoFontSize}
+          onChange={(e) => setAnnoFontSize(Number(e.target.value))}
+          style={{ fontSize: 11, background: bg, color: textC, border, borderRadius: 3, padding: '1px 3px' }}
+        >
+          {[10, 12, 14, 16, 20, 24, 32, 48].map((s) => (
+            <option key={s} value={s}>{s}px</option>
+          ))}
+        </select>
+      )}
+      {divider}
+      <Tooltip label="全消去">
+        <button
+          onClick={onClear}
+          style={{ background: 'transparent', color: '#ef4444', border: 'none', cursor: 'pointer', fontSize: 12, padding: '2px 5px', borderRadius: 4, whiteSpace: 'nowrap' }}
+        >
+          全消去
+        </button>
+      </Tooltip>
+    </div>
+  );
+}
+
 const EDGE_TYPES: EdgeTypes = {
   particle: ParticleEdge,
 };
+
+// ---------- Annotation drag handles ----------
+// 各アノテーションの左上に移動ハンドルを表示。useViewport() が必要なため
+// ReactFlow の子要素としてレンダするが、HTML div で実装（SVG の pointer-events
+// より CSS pointer-events が優先されるブラウザ挙動を回避するため）。
+
+function DragHandles({
+  annos,
+  onMove,
+}: {
+  annos: Anno[];
+  onMove: (id: string, x: number, y: number, x2: number, y2: number) => void;
+}) {
+  const vp = useViewport();
+  // 最新の zoom を ref で保持 (useEffect の stale closure 対策)
+  const vpRef = useRef(vp);
+  useEffect(() => { vpRef.current = vp; });
+
+  const [drag, setDrag] = useState<{
+    id: string;
+    startCx: number; startCy: number;
+    origX: number; origY: number; origX2: number; origY2: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!drag) return;
+    const handleMove = (e: MouseEvent) => {
+      const zoom = vpRef.current.zoom;
+      const dx = (e.clientX - drag.startCx) / zoom;
+      const dy = (e.clientY - drag.startCy) / zoom;
+      onMove(drag.id, drag.origX + dx, drag.origY + dy, drag.origX2 + dx, drag.origY2 + dy);
+    };
+    const handleUp = () => setDrag(null);
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+  }, [drag, onMove]);
+
+  const SZ = 12; // ハンドルサイズ (px)
+
+  return (
+    <>
+      {annos.map((a) => {
+        // スクリーン座標への変換 (ReactFlow container 相対)
+        let hx: number, hy: number;
+        if (a.kind === 'text') {
+          // テキスト: ベースラインが (x,y)。フォントサイズ分上がハンドル位置
+          hx = a.x * vp.zoom + vp.x - SZ / 2;
+          hy = a.y * vp.zoom + vp.y - a.fontSize - SZ / 2;
+        } else {
+          // line/rect: 左上コーナー
+          hx = Math.min(a.x, a.x2) * vp.zoom + vp.x - SZ / 2;
+          hy = Math.min(a.y, a.y2) * vp.zoom + vp.y - SZ / 2;
+        }
+        return (
+          <div
+            key={a.id}
+            title="ドラッグで移動"
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              setDrag({
+                id: a.id,
+                startCx: e.clientX, startCy: e.clientY,
+                origX: a.x, origY: a.y,
+                origX2: a.x2, origY2: a.y2,
+              });
+            }}
+            style={{
+              position: 'absolute',
+              left: hx,
+              top: hy,
+              width: SZ,
+              height: SZ,
+              background: drag?.id === a.id ? '#2563eb' : '#3b82f6',
+              border: '1.5px solid rgba(255,255,255,0.85)',
+              borderRadius: 2,
+              cursor: 'move',
+              zIndex: drag?.id === a.id ? 1100 : 50,
+              pointerEvents: 'all',
+              userSelect: 'none',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: 7,
+              color: 'rgba(255,255,255,0.9)',
+              lineHeight: 1,
+              boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
+            }}
+          >
+            ⠿
+          </div>
+        );
+      })}
+    </>
+  );
+}
 
 // ---------- worker × workload マトリクス ----------
 // worker daemon は workload_filter (= 自動切替の SoT) に従って claim する。
@@ -1053,6 +1421,50 @@ export default function Flow() {
   const { colorScheme } = useMantineColorScheme();
   const qc = useQueryClient();
   const [controlSlug, setControlSlug] = useState<string | null>(null);
+  const rfBoxRef = useRef<HTMLDivElement>(null);
+  const [annos, setAnnos] = useState<Anno[]>(() => {
+    try { return JSON.parse(localStorage.getItem(ANNO_LS_KEY) || '[]') as Anno[]; }
+    catch { return []; }
+  });
+  const [activeTool, setActiveTool] = useState<AnnoKind | null>(null);
+  const [annoColor, setAnnoColor] = useState('#ef4444');
+  const [annoFontSize, setAnnoFontSize] = useState(14);
+  // テキスト入力: Box直下でレンダ（ReactFlow内に置くとイベント干渉するため）
+  const [textInput, setTextInput] = useState<{ sx: number; sy: number; fx: number; fy: number } | null>(null);
+  const [textVal, setTextVal] = useState('');
+  const textInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { localStorage.setItem(ANNO_LS_KEY, JSON.stringify(annos)); }, [annos]);
+
+  const addAnno = useCallback((a: Omit<Anno, 'id'>) => {
+    setAnnos((prev) => [...prev, { ...a, id: `${Date.now()}-${Math.random().toString(36).slice(2)}` }]);
+  }, []);
+
+  const deleteAnno = useCallback((id: string) => {
+    setAnnos((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  const moveAnno = useCallback((id: string, x: number, y: number, x2: number, y2: number) => {
+    setAnnos((prev) => prev.map((a) => a.id === id ? { ...a, x, y, x2, y2 } : a));
+  }, []);
+
+  const commitTextInput = useCallback(() => {
+    if (textInput && textVal.trim()) {
+      addAnno({ kind: 'text', x: textInput.fx, y: textInput.fy, x2: textInput.fx, y2: textInput.fy, text: textVal.trim(), color: annoColor, fontSize: annoFontSize });
+    }
+    setTextInput(null);
+    setTextVal('');
+  }, [textInput, textVal, annoColor, annoFontSize, addAnno]);
+
+  const handleTextPlace = useCallback((sx: number, sy: number, fx: number, fy: number) => {
+    setTextInput({ sx, sy, fx, fy });
+    setTextVal('');
+    // フォーカスは次レンダ後に当てる
+    setTimeout(() => textInputRef.current?.focus(), 0);
+  }, []);
+
+  // ツール切替時にテキスト入力をキャンセル
+  useEffect(() => { setTextInput(null); setTextVal(''); }, [activeTool]);
   const ctrlValue = useMemo(
     () => ({ openControl: (slug: string) => setControlSlug(slug) }),
     [],
@@ -1369,8 +1781,18 @@ export default function Flow() {
 
   return (
     <FlowControlContext.Provider value={ctrlValue}>
-    <Box style={{ height: "calc(100vh - 80px)", background: bg, borderRadius: 8, overflow: "hidden", position: "relative" }}>
+    <Box ref={rfBoxRef} style={{ height: "calc(100vh - 80px)", background: bg, borderRadius: 8, overflow: "hidden", position: "relative" }}>
       <WorkerMatrixPanel isLight={isLight} />
+      <AnnotationToolbar
+        activeTool={activeTool}
+        setActiveTool={setActiveTool}
+        annoColor={annoColor}
+        setAnnoColor={setAnnoColor}
+        annoFontSize={annoFontSize}
+        setAnnoFontSize={setAnnoFontSize}
+        onClear={() => { if (window.confirm('加筆を全て消去しますか?')) setAnnos([]); }}
+        isLight={isLight}
+      />
       <Modal
         opened={controlSlug !== null}
         onClose={() => setControlSlug(null)}
@@ -1396,6 +1818,17 @@ export default function Flow() {
       >
         <Background gap={20} size={1} color={bgDotColor} />
         <Controls showInteractive={false} style={{ background: isLight ? "#ffffff" : "#1e293b" }} />
+        <AnnotationCanvas
+          annos={annos}
+          activeTool={activeTool}
+          annoColor={annoColor}
+          annoFontSize={annoFontSize}
+          rfBoxRef={rfBoxRef}
+          onAdd={addAnno}
+          onDelete={deleteAnno}
+          onTextPlace={handleTextPlace}
+        />
+        <DragHandles annos={annos} onMove={moveAnno} />
         <MiniMap
           nodeColor={(n) => {
             const d = n.data as unknown as FlowNode;
@@ -1407,6 +1840,36 @@ export default function Flow() {
           style={{ background: isLight ? "#ffffff" : "#0f172a" }}
         />
       </ReactFlow>
+      {/* テキスト入力: ReactFlow外のBox直下でレンダ（ReactFlow内ではイベント干渉するため） */}
+      {textInput && (
+        <input
+          ref={textInputRef}
+          value={textVal}
+          onChange={(e) => setTextVal(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') { e.preventDefault(); commitTextInput(); }
+            if (e.key === 'Escape') { setTextInput(null); setTextVal(''); }
+          }}
+          onBlur={commitTextInput}
+          style={{
+            position: 'absolute',
+            left: textInput.sx,
+            top: textInput.sy,
+            zIndex: 1100,
+            background: 'rgba(15,23,42,0.88)',
+            color: annoColor,
+            border: `1.5px solid ${annoColor}`,
+            borderRadius: 3,
+            padding: '2px 8px',
+            fontSize: annoFontSize,
+            outline: 'none',
+            minWidth: 140,
+            fontFamily: 'inherit',
+            pointerEvents: 'all',
+          }}
+          placeholder="Enter で確定 / Esc でキャンセル"
+        />
+      )}
     </Box>
     </FlowControlContext.Provider>
   );
