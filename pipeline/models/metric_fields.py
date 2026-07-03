@@ -17,12 +17,16 @@ from __future__ import annotations
 
 # slug → output_json で SUM すべき field 名のリスト
 # (= 直近 1min での合計 = 捌いた件数/min)
+#
+# 複数 field 指定時は SUM。 UI で「投入数/min」として表示される。
+# 実 output_json のキー名と一致する必要がある — 変更時は該当 plugin の
+# process() 戻り値を確認すること。
 WORKLOAD_METRIC_FIELDS: dict[str, list[str]] = {
     # paprika -> pipeline 入口
-    "paprika-links-pull": ["inserted"],       # = crawl 新規 INSERT 件数
-    "paprika-video-pull": ["inserted"],       # = crawl_video 新規 INSERT 件数
-    "paprika-image-pull": ["downloaded"],     # = MinIO に実 DL した件数
-    "paprika-job-submit": ["submitted"],      # = paprika に新 job 投入した件数
+    "paprika-links-pull": ["inserted"],           # = crawl 新規 INSERT 件数
+    "paprika-video-pull": ["inserted"],           # = crawl_video 新規 INSERT 件数
+    "paprika-image-pull": ["inserted"],           # = crawl_image 新規 INSERT (downloaded は 内訳)
+    "paprika-job-submit": ["submitted", "adopted"],  # = hub 投入 (新規 + 既存採用)
     # dispatcher (= 自己 tick で N 件を後段 queue に enqueue)
     "image-dispatcher": [
         "hash_detect_enqueued",
@@ -30,8 +34,9 @@ WORKLOAD_METRIC_FIELDS: dict[str, list[str]] = {
         "embed_movie_enqueued",
     ],
     "video-dispatcher": ["enqueued"],
-    # embed-write (= 1 tick で N 行 INSERT)
-    "embed-write": ["claimed"],
+    # embed-write (= 1 tick で N 行 shard に書込み)。 written = 実 shard 書込み成功数。
+    # claimed は tempo 内で pending → claimed に UPDATE した件数で成功指標ではない。
+    "embed-write": ["written"],
 }
 
 
