@@ -26,7 +26,12 @@ WORKLOAD_METRIC_FIELDS: dict[str, list[str]] = {
     "paprika-links-pull": ["inserted"],           # = crawl 新規 INSERT 件数
     "paprika-video-pull": ["inserted"],           # = crawl_video 新規 INSERT 件数
     "paprika-image-pull": ["inserted"],           # = crawl_image 新規 INSERT (downloaded は 内訳)
-    "paprika-job-submit": ["submitted", "adopted"],  # = hub 投入 (新規 + 既存採用)
+    # hub 側で本当に「新 Job 発生」する数だけ計上する。 adopted は既に hub に居た
+    # URL を pipeline が再認識しただけで、 hub 側の新規生産はない。
+    # 実測 (2026-07-03): submitted / (submitted + adopted) = 1 : 10 で 9 割が
+    # 重複再送 (crawl → q の filler が dedup していない)。 UI にはこの重複部分
+    # を混ぜず、 純粋な「hub 発生数」を出す。
+    "paprika-job-submit": ["submitted"],
     # dispatcher (= 自己 tick で N 件を後段 queue に enqueue)
     "image-dispatcher": [
         "hash_detect_enqueued",
