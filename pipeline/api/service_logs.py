@@ -40,6 +40,24 @@ def post_service_logs(body: ServiceLogPostBody, request: Request) -> dict[str, A
     return {"inserted": n}
 
 
+@router.get("/service-logs/count")
+def count_service_logs(request: Request) -> dict[str, Any]:
+    repo = ServiceLogsRepository(request.app.state.db)
+    with repo.db.transaction() as conn:
+        n = conn.execute("SELECT COUNT(*) AS n FROM service_logs").fetchone()["n"]
+    return {"count": n}
+
+
+@router.post("/service-logs/prune")
+def prune_service_logs(
+    request: Request,
+    keep_rows: int = Query(300_000, ge=10_000, le=1_000_000),
+) -> dict[str, Any]:
+    repo = ServiceLogsRepository(request.app.state.db)
+    deleted = repo.prune_old(keep_rows=keep_rows)
+    return {"deleted": deleted, "keep_rows": keep_rows}
+
+
 @router.get("/service-logs", response_model=ServiceLogListResponse)
 def list_service_logs(
     request: Request,
