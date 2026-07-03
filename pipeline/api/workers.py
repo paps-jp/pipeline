@@ -478,6 +478,104 @@ def restart_worker(worker_id: str, request: Request) -> dict[str, Any]:
             "ok": r.returncode == 0, "rc": r.returncode, "stderr": (r.stderr or "")[:300]}
 
 
+# --- Elastic Workers: 制御プレーン側 systemctl primitives (2026-07-04) ---
+# supervisor は user www で動き root@他ホストへ SSH できない。 privileged な
+# systemctl (spawn/stop/inventory) は control plane (pipeline + deploy key) に集約
+# する (= restart_worker と同型)。 supervisor はこれらを HTTP で叩く。
+
+class ElasticOpRequest(BaseModel):
+    family: str = Field(description="host family, e.g. 'ai-gpu5'")
+    group: str = Field(description="'cpu' | 'gpu'")
+    instance: int = Field(ge=1, le=100)
+
+
+def _elastic_ssh(host_ip: str, cmd: str, timeout: int = 12) -> dict[str, Any]:
+    import subprocess
+    args = ["ssh", "-i", _WATCHDOG_DEPLOY_KEY, "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+            f"root@{host_ip}", cmd]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return {"ok": r.returncode == 0, "stdout": (r.stdout or "").strip(),
+                "stderr": (r.stderr or "").strip()[:200], "rc": r.returncode}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200], "rc": -1}
+
+
+def _elastic_parse_instances(stdout: str, group: str) -> dict[str, str]:
+    """systemctl list-units 出力 → {instance_no(str): active_state}。"""
+    import re
+    out: dict[str, str] = {}
+    for line in (stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        m = re.fullmatch(rf"pipeline-worker-{group}@(\d+)\.service", parts[0])
+        if m:
+            out[m.group(1)] = parts[2]   # systemctl の ACTIVE 列
+    return out
+
+
+@router.get("/elastic/inventory")
+def elastic_inventory(request: Request, hosts: str = "") -> dict[str, Any]:
+    """hosts=CSV family。 各 family の pipeline-worker-{cpu,gpu}@N instance を列挙 (read-only)。
+    supervisor の elastic scaler が需要判断の材料に使う。"""
+    families = [h.strip() for h in hosts.split(",") if h.strip()]
+    result: dict[str, Any] = {}
+    for fam in families:
+        ip = _WATCHDOG_HOST_IP.get(fam)
+        if not ip:
+            result[fam] = {"error": "unknown family"}
+            continue
+        inv: dict[str, Any] = {}
+        for group in ("cpu", "gpu"):
+            r = _elastic_ssh(
+                ip,
+                "systemctl list-units --all --no-legend --plain --type=service "
+                f"'pipeline-worker-{group}@*.service'",
+            )
+            if r.get("ok"):
+                inv[group] = _elastic_parse_instances(r.get("stdout", ""), group)
+            else:
+                inv[group] = {}
+                inv[f"{group}_error"] = r.get("stderr") or r.get("error") or "ssh failed"
+        result[fam] = inv
+    return {"inventory": result}
+
+
+@router.post("/elastic/spawn")
+def elastic_spawn(body: ElasticOpRequest) -> dict[str, Any]:
+    """pipeline-worker-{group}@N を start (reset-failed で StartLimit クリアしてから)。"""
+    if body.group not in ("cpu", "gpu"):
+        raise HTTPException(status_code=400, detail="group must be 'cpu' or 'gpu'")
+    ip = _WATCHDOG_HOST_IP.get(body.family)
+    if not ip:
+        raise HTTPException(status_code=400, detail=f"unknown family: {body.family}")
+    unit = f"pipeline-worker-{body.group}@{body.instance}.service"
+    _elastic_ssh(ip, f"systemctl reset-failed {unit}")
+    r = _elastic_ssh(ip, f"systemctl start {unit}", timeout=25)
+    logging.getLogger(__name__).warning(
+        "elastic spawn %s %s rc=%s", body.family, unit, r.get("rc"))
+    return {"family": body.family, "unit": unit, "ok": bool(r.get("ok")),
+            "rc": r.get("rc"), "stderr": (r.get("stderr") or r.get("error") or "")[:200]}
+
+
+@router.post("/elastic/stop")
+def elastic_stop(body: ElasticOpRequest) -> dict[str, Any]:
+    """pipeline-worker-{group}@N を stop (graceful drain は呼出側 supervisor が担保)。"""
+    if body.group not in ("cpu", "gpu"):
+        raise HTTPException(status_code=400, detail="group must be 'cpu' or 'gpu'")
+    ip = _WATCHDOG_HOST_IP.get(body.family)
+    if not ip:
+        raise HTTPException(status_code=400, detail=f"unknown family: {body.family}")
+    unit = f"pipeline-worker-{body.group}@{body.instance}.service"
+    r = _elastic_ssh(ip, f"systemctl stop {unit}", timeout=35)
+    logging.getLogger(__name__).warning(
+        "elastic stop %s %s rc=%s", body.family, unit, r.get("rc"))
+    return {"family": body.family, "unit": unit, "ok": bool(r.get("ok")),
+            "rc": r.get("rc"), "stderr": (r.get("stderr") or r.get("error") or "")[:200]}
+
+
 @router.post("", response_model=WorkerInfo, status_code=status.HTTP_201_CREATED)
 def register_worker(body: WorkerRegisterRequest, request: Request) -> WorkerInfo:
     rec = _wrepo(request).register(
