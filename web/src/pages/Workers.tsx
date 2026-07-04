@@ -9,7 +9,6 @@ import {
   Loader,
   Modal,
   NumberInput,
-  Select,
   Stack,
   Switch,
   Table,
@@ -446,53 +445,71 @@ function StateBadge({ state }: { state: string }) {
   return <Badge color={color} variant="light">{state}</Badge>;
 }
 
-const FREE_VALUE = "__free__";
+// elastic ワーカーの「担当ワークロード」を read-only 表示する (Track B: 単一 workload)。
+//  - 実行中(current_workload) → indigo 実行バッジ
+//  - idle だが担当 workload あり → gray「待機中」バッジ(担当 slug)
+//  - 担当なし → 待機中(テキスト)。旧「フリー」概念は廃止。
+//  - workload_filter が複数 slug の worker は Track B 移行残 → 赤バッジで警告。
+// 担当は単一スカラ worker.workload を正典とし、control-plane 未 deploy 時 (= 露出前)
+// は workload_filter が要素1のときのみ slug という backend と同一の派生で fallback。
+function WorkloadCell({ worker, nameMap }: { worker: WorkerInfo; nameMap: Map<string, string> }) {
+  const { t } = useTranslation();
+  const filter = worker.workload_filter ?? [];
+  const assigned = worker.workload ?? (filter.length === 1 ? filter[0] : null);
+  const isMultiRemnant = filter.length > 1;
 
-function FilterSelect({ worker, workloadSlugs }: { worker: WorkerInfo; workloadSlugs: string[] }) {
-  const qc = useQueryClient();
-  const current = worker.workload_filter?.[0] ?? FREE_VALUE;
-  const hasMulti = (worker.workload_filter?.length ?? 0) > 1;
+  const envBadge =
+    worker.env_filter && filter.length === 0 ? (
+      <Tooltip label={`ENV: ${worker.env_filter.join(", ")}`}>
+        <Badge size="xs" color="orange" variant="outline">ENV</Badge>
+      </Tooltip>
+    ) : null;
 
-  const setFilter = useMutation({
-    mutationFn: (workloads: string[] | null) => api.setWorkerFilter(worker.id, workloads, "ui"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["workers"] }),
-  });
+  const remnantBadge = isMultiRemnant ? (
+    <Tooltip label={`${t("workers.multi_remnant_tip")}: ${filter.join(", ")}`}>
+      <Badge size="xs" color="red" variant="light">{t("workers.multi_remnant")}</Badge>
+    </Tooltip>
+  ) : null;
 
-  const data = [
-    { value: FREE_VALUE, label: "— フリー —" },
-    ...workloadSlugs.map((s) => ({ value: s, label: s })),
-  ];
+  if (worker.current_workload) {
+    return (
+      <Group gap={4} wrap="nowrap">
+        <Tooltip label={worker.current_workload}>
+          <Badge color="indigo" variant="light" size="sm">
+            {nameMap.get(worker.current_workload) ?? worker.current_workload}
+          </Badge>
+        </Tooltip>
+        {remnantBadge}
+        {envBadge}
+      </Group>
+    );
+  }
+
+  if (assigned) {
+    return (
+      <Group gap={4} wrap="nowrap">
+        <Tooltip label={`${assigned} — ${t("workers.idle")}`}>
+          <Badge color="gray" variant="outline" size="sm">
+            {nameMap.get(assigned) ?? assigned}
+          </Badge>
+        </Tooltip>
+        {remnantBadge}
+      </Group>
+    );
+  }
 
   return (
     <Group gap={4} wrap="nowrap">
-      <Select
-        size="xs"
-        data={data}
-        value={current}
-        onChange={(val) => setFilter.mutate(val === null || val === FREE_VALUE ? null : [val])}
-        disabled={setFilter.isPending}
-        style={{ minWidth: 160 }}
-        comboboxProps={{ withinPortal: true }}
-        allowDeselect={false}
-      />
-      {hasMulti && (
-        <Tooltip label={worker.workload_filter!.join(", ")}>
-          <Badge size="xs" color="violet" variant="dot">+{worker.workload_filter!.length - 1}</Badge>
-        </Tooltip>
-      )}
-      {worker.env_filter && !worker.workload_filter && (
-        <Tooltip label={`ENV: ${worker.env_filter.join(", ")}`}>
-          <Badge size="xs" color="orange" variant="outline">ENV</Badge>
-        </Tooltip>
-      )}
+      <Text size="sm" c="dimmed">{t("workers.idle")}</Text>
+      {remnantBadge}
+      {envBadge}
     </Group>
   );
 }
 
-function WorkerTable({ workers, workloadNameMap, workloadSlugs }: {
+function WorkerTable({ workers, workloadNameMap }: {
   workers: WorkerInfo[];
   workloadNameMap: Map<string, string>;
-  workloadSlugs: string[];
 }) {
   const { t } = useTranslation();
   return (
@@ -502,8 +519,7 @@ function WorkerTable({ workers, workloadNameMap, workloadSlugs }: {
           <Table.Th>{t("workers.id")}</Table.Th>
           <Table.Th>{t("workers.host")}</Table.Th>
           <Table.Th>{t("workers.state")}</Table.Th>
-          <Table.Th>{t("workers.current_workload")}</Table.Th>
-          <Table.Th>{t("workers.filter_col")}</Table.Th>
+          <Table.Th>{t("workers.workload_col")}</Table.Th>
           <Table.Th>{t("workers.processed")}</Table.Th>
           <Table.Th>{t("workers.errors")}</Table.Th>
           <Table.Th>{t("workers.last_seen")}</Table.Th>
@@ -516,18 +532,7 @@ function WorkerTable({ workers, workloadNameMap, workloadSlugs }: {
             <Table.Td><Code>{w.id}</Code></Table.Td>
             <Table.Td><Text size="xs" c="dimmed">{w.host}</Text></Table.Td>
             <Table.Td><StateBadge state={w.state} /></Table.Td>
-            <Table.Td>
-              {w.current_workload ? (
-                <Tooltip label={w.current_workload}>
-                  <Badge color="indigo" variant="light" size="sm">
-                    {workloadNameMap.get(w.current_workload) ?? w.current_workload}
-                  </Badge>
-                </Tooltip>
-              ) : (
-                <Text size="sm" c="dimmed">—</Text>
-              )}
-            </Table.Td>
-            <Table.Td><FilterSelect worker={w} workloadSlugs={workloadSlugs} /></Table.Td>
+            <Table.Td><WorkloadCell worker={w} nameMap={workloadNameMap} /></Table.Td>
             <Table.Td>{w.rows_processed}</Table.Td>
             <Table.Td>{w.errors_total > 0 ? <Text c="red">{w.errors_total}</Text> : w.errors_total}</Table.Td>
             <Table.Td>
@@ -561,7 +566,6 @@ function RuntimeSection() {
     refetchInterval: 60_000,
   });
   const workloadNameMap = new Map((workloadsQ.data?.workloads ?? []).map((w) => [w.slug, w.name]));
-  const workloadSlugs = (workloadsQ.data?.workloads ?? []).map((w) => w.slug);
 
   const rawWorkers: WorkerInfo[] = q.data?.workers ?? [];
   const activeCount = rawWorkers.filter((w) => w.state === "active").length;
@@ -588,8 +592,6 @@ function RuntimeSection() {
     .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
     .map(([host, ws]) => ({ host, workers: ws.sort(byWorkerId) }));
 
-  const defaultTab = hostGroups[0]?.host;
-
   return (
     <Box>
       <Group justify="space-between" mb="xs">
@@ -612,40 +614,29 @@ function RuntimeSection() {
       )}
 
       {hostGroups.length > 0 && (
-        <Tabs defaultValue={defaultTab} keepMounted={false}>
-          <Tabs.List>
-            {hostGroups.map((g) => {
-              const active = g.workers.filter((w) => w.state === "active").length;
-              const lost = g.workers.filter((w) => w.state === "lost").length;
-              return (
-                <Tabs.Tab key={g.host} value={g.host}>
-                  <Group gap={6} wrap="nowrap">
-                    <Text size="sm">{g.host}</Text>
+        <Stack gap="lg">
+          {hostGroups.map((g) => {
+            const active = g.workers.filter((w) => w.state === "active").length;
+            const lost = g.workers.filter((w) => w.state === "lost").length;
+            return (
+              <Box key={g.host}>
+                <Group justify="space-between" mb="xs">
+                  <Group gap={8} wrap="nowrap">
+                    <Title order={5}>{g.host}</Title>
                     <Badge size="xs" color="green" variant="light">{active}</Badge>
                     {lost > 0 && <Badge size="xs" color="gray" variant="light">{lost}</Badge>}
+                    <Text size="xs" c="dimmed">
+                      CPU: {g.workers.filter(isCpuWorker).length} /
+                      GPU: {g.workers.filter(isGpuWorker).length}
+                    </Text>
                   </Group>
-                </Tabs.Tab>
-              );
-            })}
-          </Tabs.List>
-
-          {hostGroups.map((g) => (
-            <Tabs.Panel key={g.host} value={g.host} pt="md">
-              <Group justify="space-between" mb="xs">
-                <AddWorkerButtons hostWorkers={g.workers} physHost={g.host} />
-                <Text size="xs" c="dimmed">
-                  CPU: {g.workers.filter(isCpuWorker).length} /
-                  GPU: {g.workers.filter(isGpuWorker).length}
-                </Text>
-              </Group>
-              <WorkerTable
-                workers={g.workers}
-                workloadNameMap={workloadNameMap}
-                workloadSlugs={workloadSlugs}
-              />
-            </Tabs.Panel>
-          ))}
-        </Tabs>
+                  <AddWorkerButtons hostWorkers={g.workers} physHost={g.host} />
+                </Group>
+                <WorkerTable workers={g.workers} workloadNameMap={workloadNameMap} />
+              </Box>
+            );
+          })}
+        </Stack>
       )}
     </Box>
   );

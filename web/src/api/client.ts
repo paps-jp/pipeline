@@ -137,6 +137,9 @@ export interface WorkerInfo {
   current_phase: string | null;
   rows_processed: number;
   errors_total: number;
+  // Track B (単一 workload 移行): 担当 workload の派生スカラ (read-only)。
+  // workload_filter が要素1のときのみ slug、None/空/複数 (= 移行残) は null。
+  workload: string | null;
   workload_filter: string[] | null;
   filter_updated_at: string | null;
   filter_updated_by: string | null;
