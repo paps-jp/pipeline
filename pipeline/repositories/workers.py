@@ -228,6 +228,10 @@ class WorkerRepository:
 
         worker が居なければ WorkerNotFound。
         無効な mode は ValueError。
+
+        Track B (単一 workload 移行): "add"/"remove" は複数 slug 前提の set-algebra
+        で deprecated。 単一割当は set_workload() を使うこと。 これらは storage を
+        scalar 化する B4 で削除予定。
         """
         if mode not in ("replace", "add", "remove"):
             raise ValueError(f"invalid mode: {mode}")
