@@ -39,9 +39,11 @@ WORKLOAD_METRIC_FIELDS: dict[str, list[str]] = {
         "embed_movie_enqueued",
     ],
     "video-dispatcher": ["enqueued"],
-    # embed-write (= 1 tick で N 行 shard に書込み)。 written = 実 shard 書込み成功数。
-    # claimed は tempo 内で pending → claimed に UPDATE した件数で成功指標ではない。
-    "embed-write": ["written"],
+    # embed-write (= 1 tick で N 行 shard に書込み)。
+    # 注意: output_json["written"] は {"image": N} の dict なので JSON_EXTRACT の SUM が
+    # 効かず rate=0(→ runs/min ~11 にフォールバック表示)になる。 スカラーの
+    # deleted_from_queue(= 書込後に queue から消した件数 = 実処理数)を使う。
+    "embed-write": ["deleted_from_queue"],
 }
 
 
