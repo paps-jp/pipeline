@@ -282,6 +282,24 @@ class WorkerRepository:
             )
         return self.get(worker_id)
 
+    def set_workload(
+        self,
+        worker_id: str,
+        slug: str | None,
+        updated_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Track B (単一 workload 移行): worker に単一 workload を割り当てる。
+        内部的には workload_filter=[slug] へ replace 委譲するので、 既存の
+        永続化・updated_by 記録をそのまま使う。 slug=None で解除。 storage を
+        scalar 化する最終段でも、 呼び出し側はこのメソッドのままでよい。
+        """
+        return self.set_filter(
+            worker_id,
+            filter_list=([slug] if slug else None),
+            mode="replace",
+            updated_by=updated_by,
+        )
+
     @staticmethod
     def _row(r: dict[str, Any]) -> dict[str, Any]:
         out = dict(r)
@@ -301,6 +319,11 @@ class WorkerRepository:
                 out["workload_filter"] = None
         elif wf in (None, ""):
             out["workload_filter"] = None
+        # Track B (単一 workload 移行): 派生スカラ (read-only)。
+        # 要素1のときのみその slug。 None/空/複数 (= 移行中の残骸) は None。
+        _wf1 = out.get("workload_filter")
+        out["workload"] = (_wf1[0] if isinstance(_wf1, list) and len(_wf1) == 1
+                           else None)
         # env_filter (= systemd PIPELINE_WORKLOAD_FILTER で固定された fallback)
         ef = out.get("env_filter")
         if isinstance(ef, str) and ef:
