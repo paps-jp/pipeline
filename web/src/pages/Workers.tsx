@@ -275,7 +275,7 @@ function WorkerEditor({
 // ホスト登録セクション
 // ============================================================
 
-function WorkerRegistrySection() {
+export function WorkerRegistrySection() {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const list = useQuery({
@@ -661,7 +661,6 @@ export default function Workers() {
     <Stack gap="lg">
       <PageHeader title={t("workers.title")} subtitle={t("workers.subtitle")} />
       <RuntimeSection />
-      <WorkerRegistrySection />
     </Stack>
   );
 }
