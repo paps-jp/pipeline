@@ -103,9 +103,13 @@ class WorkerInfo(BaseModel):
     current_phase: str | None = None
     rows_processed: int = 0
     errors_total: int = 0
+    # Track B (単一 workload 移行): worker の担当 workload (= 派生スカラ, read-only)。
+    # workload_filter が要素1のときのみその slug、None/空/複数 (= 移行残) は None。
+    # elastic の "1 worker = 1 workload" 既定はこれを正典とする。
+    workload: str | None = None
     # 自動切替: 制御プレーンが保持する workload allow-list (= 空/None=フィルタ解除)。
     # worker daemon は 30s 毎にこれを poll し、 変化があれば executor cache を捨てて
-    # 反映する (= プロセス再起動なしの runtime 切替)。
+    # 反映する (= プロセス再起動なしの runtime 切替)。 Track B で単一 slug へ移行中。
     workload_filter: list[str] | None = None
     filter_updated_at: str | None = None
     filter_updated_by: str | None = None

@@ -78,6 +78,38 @@ def test_deregister(client: TestClient):
     assert client.get("/api/v1/workers").json()["total"] == 0
 
 
+# ---------------- Track B: 単一 workload スカラ ----------------
+
+
+def test_workload_scalar_derived_from_filter(client: TestClient):
+    """WorkerInfo.workload は Track B の派生スカラ: filter が要素1のときのみ slug、
+    None/複数 (= 移行残) は None。"""
+    wid = client.post("/api/v1/workers", json={"host": "h"}).json()["id"]
+
+    # filter 未設定 → workload=None
+    info = client.get("/api/v1/workers").json()["workers"][0]
+    assert "workload" in info, "WorkerInfo に workload スカラが露出していること"
+    assert info["workload"] is None
+
+    # 単一 slug filter → その slug
+    r = client.post(f"/api/v1/workers/{wid}/filter", json={"workloads": ["w1"]})
+    assert r.status_code == 200
+    assert r.json()["workload"] == "w1"
+    assert r.json()["workload_filter"] == ["w1"]
+
+    # 複数 slug (移行残) → workload は None、filter 配列は保持
+    r = client.post(f"/api/v1/workers/{wid}/filter", json={"workloads": ["w1", "w2"]})
+    assert r.status_code == 200
+    assert r.json()["workload"] is None
+    assert set(r.json()["workload_filter"]) == {"w1", "w2"}
+
+    # 解除 → None に戻る
+    r = client.post(f"/api/v1/workers/{wid}/filter", json={"workloads": None})
+    assert r.status_code == 200
+    assert r.json()["workload"] is None
+    assert r.json()["workload_filter"] is None
+
+
 # ---------------- workloads-for-worker ----------------
 
 

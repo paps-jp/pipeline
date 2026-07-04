@@ -301,6 +301,12 @@ class WorkerRepository:
                 out["workload_filter"] = None
         elif wf in (None, ""):
             out["workload_filter"] = None
+        # Track B (単一 workload 移行): 派生スカラ (read-only)。
+        # 要素1のときのみその slug。 None/空/複数 (= 移行残) は None。
+        _wf1 = out.get("workload_filter")
+        out["workload"] = (
+            _wf1[0] if isinstance(_wf1, list) and len(_wf1) == 1 else None
+        )
         # env_filter (= systemd PIPELINE_WORKLOAD_FILTER で固定された fallback)
         ef = out.get("env_filter")
         if isinstance(ef, str) and ef:
