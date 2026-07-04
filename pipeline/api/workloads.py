@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import time as _time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from pipeline.api.plugins_local import read_plugin_workload_type
 from pipeline.models.workload import Workload, WorkloadCreate, WorkloadUpdate
 from pipeline.repositories.queue import QueueRepository
 from pipeline.repositories.runs import RunsRepository
@@ -17,6 +20,33 @@ from pipeline.repositories.workloads import (
 )
 
 router = APIRouter(prefix="/api/v1/workloads", tags=["workloads"])
+
+# --- self_loop enqueue coalescing (2026-07-04) ---
+# self_loop workload は「次の1 tick」を自分でキューに入れて回り続けるが、 pk が毎回
+# ユニーク + bootstrap 多重 + lease<run 再配布 で self-enqueue が無限増殖する(fan-out。
+# 例: video-dispatcher が tick タスク 15368 件)。 これを INSERT IGNORE 等の一意制約でなく
+# 「入れる前に pending 数を数えて cap 以上ならスキップ」する depth-check 方式で抑える。
+# cap 個までの concurrency は許容(worker を養う分)、 それ以上の tick 積み増しは coalesce。
+# 実データの下流 enqueue は consumer(非 self_loop)宛なので影響しない。
+_SELFLOOP_MAX_PENDING = int(os.environ.get("PIPELINE_SELFLOOP_MAX_PENDING", "8"))
+_SELFLOOP_TTL_S = 300.0
+_selfloop_cache: dict[str, tuple[float, bool]] = {}   # slug → (mono, is_self_loop)
+
+
+def _is_self_loop(w: Workload) -> bool:
+    """workload が self_loop か (plugin.yaml の workload_type)。 slug 単位で TTL キャッシュ
+    (= enqueue 毎の file 読みを避ける)。 判定不能は False(= coalesce しない安全側)。"""
+    now = _time.monotonic()
+    ent = _selfloop_cache.get(w.slug)
+    if ent is not None and (now - ent[0]) < _SELFLOOP_TTL_S:
+        return ent[1]
+    try:
+        sp = (w.executor_config or {}).get("source_path")
+        is_sl = read_plugin_workload_type(sp) == "self_loop"
+    except Exception:
+        is_sl = False
+    _selfloop_cache[w.slug] = (now, is_sl)
+    return is_sl
 
 
 class WorkloadListResponse(BaseModel):
@@ -178,7 +208,13 @@ def delete_workload(slug: str, request: Request) -> None:
 )
 def enqueue_task(slug: str, body: EnqueueRequest, request: Request) -> EnqueueResponse:
     w = _get_or_404(request, slug)
-    inserted = _queue_repo(request).enqueue(w.queue_table, body.pk, body.extra)
+    repo = _queue_repo(request)
+    # self_loop coalesce: 既に cap 件 pending なら tick 積み増しをスキップ(= fan-out 抑止)。
+    if _SELFLOOP_MAX_PENDING > 0 and _is_self_loop(w):
+        pending = int(repo.count_by_state(w.queue_table).get("pending", 0))
+        if pending >= _SELFLOOP_MAX_PENDING:
+            return EnqueueResponse(inserted=0, duplicates=1)   # coalesced
+    inserted = repo.enqueue(w.queue_table, body.pk, body.extra)
     return EnqueueResponse(inserted=1 if inserted else 0, duplicates=0 if inserted else 1)
 
 
