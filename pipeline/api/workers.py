@@ -560,6 +560,16 @@ def elastic_spawn(body: ElasticOpRequest) -> dict[str, Any]:
     if not ip:
         raise HTTPException(status_code=400, detail=f"unknown family: {body.family}")
     unit = f"pipeline-worker-{body.group}@{body.instance}.service"
+    # 既に稼働中の instance には spawn しない。 stale inventory で稼働中 slot を free と
+    # 誤認すると、下の drop-in 書込みが稼働 worker の filter.conf を clobber し (start は
+    # no-op でも) 次回再起動で誤 workload をロードする (2026-07-05: supervisor cpu@4 が
+    # crawl-face-cleanup に化けた事故)。 fresh に is-active を確認して稼働中なら skip。
+    act = _elastic_ssh(ip, f"systemctl is-active {unit}", timeout=8)
+    if (act.get("stdout") or "").strip() == "active":
+        logging.getLogger(__name__).warning(
+            "elastic spawn %s %s SKIP (already active)", body.family, unit)
+        return {"family": body.family, "unit": unit, "ok": False,
+                "rc": 0, "skipped": "already_active"}
     # P2: spawn 前に担当 slug を drop-in へ焼き込む (無フィルタ期間の誤 claim を無くす)。
     # slug は英数と - _ のみ許可してシェル注入を防ぐ。 書込み失敗は非致命 (旧挙動 =
     # 無フィルタ start + reconcile 後付け に degrade)。 daemon-reload してから start。
