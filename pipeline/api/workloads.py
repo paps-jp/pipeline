@@ -265,6 +265,26 @@ def peek_queue(
     return QueuePeekResponse(items=items)
 
 
+class ResetFailedResponse(BaseModel):
+    reset: int
+
+
+@router.post(
+    "/{slug}/queue/reset-failed",
+    response_model=ResetFailedResponse,
+    status_code=status.HTTP_200_OK,
+)
+def reset_failed_queue(slug: str, request: Request) -> ResetFailedResponse:
+    """failed 状態のタスクを pending に戻す (supervisor autoreset / admin 用)。
+
+    一時障害で terminal 化した failed タスクを再試行可能にする。
+    戻り値: reset = pending に戻した件数。
+    """
+    w = _get_or_404(request, slug)
+    n = _queue_repo(request).reset_failed(w.queue_table)
+    return ResetFailedResponse(reset=n)
+
+
 @router.post(
     "/{slug}/vram_observation",
     response_model=VramObservationResponse,

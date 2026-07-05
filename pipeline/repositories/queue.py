@@ -260,6 +260,27 @@ class QueueRepository:
             rows = cur.fetchall()
         return {r["state"]: int(r["c"]) for r in rows}
 
+    def reset_failed(self, queue_table: str) -> int:
+        """failed 状態のタスクを pending に戻す (attempt=0 にリセットして再試行可能化)。
+
+        一時障害 (worker 側 build error / OOM / 上流の一過性エラー等) で max_attempts に
+        達し terminal 化した failed を回収する。 supervisor の autoreset が周期呼び出す。
+        戻り値 = pending に戻した件数。
+        """
+        _validate_queue_table(queue_table)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_db(queue_table).transaction() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE {queue_table}
+                SET state='pending', attempt=0, last_error=NULL,
+                    claimed_by=NULL, claimed_at=NULL, updated_at=:now
+                WHERE state='failed'
+                """,
+                {"now": now},
+            )
+            return int(cur.rowcount)
+
     def peek(self, queue_table: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         """admin 用: queue の中身を limit 件覗く。offset でページネーション可。"""
         _validate_queue_table(queue_table)
