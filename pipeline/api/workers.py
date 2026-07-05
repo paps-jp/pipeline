@@ -434,9 +434,18 @@ def _get_workload_or_404(request: Request, slug: str) -> Workload:
         raise HTTPException(404, detail=str(e)) from e
 
 
+def _claim_none_is_idle() -> bool:
+    """Track B B4 フラグ: True なら「filter 無し = idle (= 何も claim しない)」、
+    False (既定) なら旧挙動「filter 無し = 優先度で何でも claim」。 claim パス=生命線
+    ゆえ既定 off。 PIPELINE_CLAIM_NONE_IS_IDLE=1 + pipeline-oss 再起動で段階有効化 →
+    問題あれば env を戻して即 rollback。 full-elastic では全 worker が単一 slug 担当
+    (elastic 割当) になるので、 filter 無し worker は「割当待ち/停止待ちの idle」であるべき。"""
+    return os.environ.get("PIPELINE_CLAIM_NONE_IS_IDLE", "0") == "1"
+
+
 def _resolve_worker_filter(worker: dict[str, Any]) -> set[str] | None:
     """workload_filter → env_filter の順で有効な allowlist を返す。
-    両方 None/空 の場合は None (= 無制限)。
+    両方 None/空 の場合: 旧挙動=None (= 無制限)。 B4 有効時=空集合 (= idle, 何も許可しない)。
     workload_filter=None かつ env_filter あり の時 env_filter にフォールバックする
     ことで、 env_filter 専用 worker が env 外の高 priority workload に preempt される
     バグ (2026-06-30) を防ぐ。
@@ -453,7 +462,11 @@ def _resolve_worker_filter(worker: dict[str, Any]) -> set[str] | None:
     wf = _parse(worker.get("workload_filter"))
     if wf is not None:
         return wf
-    return _parse(worker.get("env_filter"))
+    ef = _parse(worker.get("env_filter"))
+    if ef is not None:
+        return ef
+    # B4: 両 filter 空 → flag on なら空集合(idle)、off(既定)なら None(無制限=旧挙動)。
+    return frozenset() if _claim_none_is_idle() else None
 
 
 # ---------------- registry ----------------
@@ -925,6 +938,12 @@ def claim(worker_id: str, body: ClaimRequest, request: Request) -> ClaimResponse
     w = _get_workload_or_404(request, body.workload_slug)
     # enabled=0 (= operator が停止指定) なら新規 claim 拒否。
     if not w.enabled:
+        return ClaimResponse(workload_slug=w.slug, tasks=[])
+    # B4 (Track B): flag on かつ filter 無し (= 真の free) worker は idle 扱いで claim 拒否。
+    # workloads_for_worker が空を返すので daemon は claim しないが、 古い list で叩いても
+    # ここで止める defense-in-depth。 flag off (既定) なら旧挙動 (下の wf チェックのみ)。
+    if _claim_none_is_idle() and not (
+        worker.get("workload_filter") or worker.get("env_filter")):
         return ClaimResponse(workload_slug=w.slug, tasks=[])
     # worker.workload_filter が設定されていて、 リクエストの slug がそこに無いなら
     # 拒否。 workloads_for_worker は filter 適用するが、 worker daemon が古い list で

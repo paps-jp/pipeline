@@ -132,6 +132,23 @@ def test_workloads_for_worker_returns_enabled(client: TestClient):
     assert "disabled-one" not in slugs
 
 
+def test_b4_none_is_idle_flag(client: TestClient, monkeypatch):
+    """Track B B4: PIPELINE_CLAIM_NONE_IS_IDLE=1 なら filter 無し worker は idle
+    (workloads_for_worker が空)。 既定 off なら旧挙動 (優先度で全 workload 受け)。"""
+    _make_workload(client, "w1")
+    wid = client.post("/api/v1/workers", json={"host": "h"}).json()["id"]
+    # flag off (既定): filter 無し worker は w1 を claim 候補にできる
+    off = client.get(f"/api/v1/workers/{wid}/workloads").json()
+    assert "w1" in [x["slug"] for x in off["workloads"]]
+    # flag on: filter 無し worker は idle (空)
+    monkeypatch.setenv("PIPELINE_CLAIM_NONE_IS_IDLE", "1")
+    on = client.get(f"/api/v1/workers/{wid}/workloads").json()
+    assert on["workloads"] == []
+    # claim も拒否される (defense-in-depth)
+    r = client.post(f"/api/v1/workers/{wid}/claim", json={"workload_slug": "w1", "limit": 1})
+    assert r.json()["tasks"] == []
+
+
 # ---------------- claim / complete / fail ----------------
 
 
