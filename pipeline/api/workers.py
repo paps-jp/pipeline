@@ -491,6 +491,10 @@ class ElasticOpRequest(BaseModel):
     family: str = Field(description="host family, e.g. 'ai-gpu5'")
     group: str = Field(description="'cpu' | 'gpu'")
     instance: int = Field(ge=1, le=100)
+    # P2 (spawn-with-filter): spawn 時に焼き込む担当 slug。 instance の systemd drop-in に
+    # PIPELINE_WORKLOAD_FILTER として書いてから start する → worker は起動直後から
+    # env_filter=この slug で claim し、 無フィルタ期間の誤 claim が起きない (= 生誕時から単一)。
+    filter: list[str] | None = Field(default=None, description="spawn 時に焼き込む担当 slug")
 
 
 def _elastic_ssh(host_ip: str, cmd: str, timeout: int = 12) -> dict[str, Any]:
@@ -556,10 +560,24 @@ def elastic_spawn(body: ElasticOpRequest) -> dict[str, Any]:
     if not ip:
         raise HTTPException(status_code=400, detail=f"unknown family: {body.family}")
     unit = f"pipeline-worker-{body.group}@{body.instance}.service"
+    # P2: spawn 前に担当 slug を drop-in へ焼き込む (無フィルタ期間の誤 claim を無くす)。
+    # slug は英数と - _ のみ許可してシェル注入を防ぐ。 書込み失敗は非致命 (旧挙動 =
+    # 無フィルタ start + reconcile 後付け に degrade)。 daemon-reload してから start。
+    if body.filter:
+        safe = [s.strip() for s in body.filter
+                if s.strip() and all(c.isalnum() or c in "-_" for c in s.strip())]
+        if safe:
+            slugs = ",".join(safe)
+            d = f"/etc/systemd/system/{unit}.d"
+            drop = (f"mkdir -p {d} && "
+                    f"printf '[Service]\\nEnvironment=PIPELINE_WORKLOAD_FILTER=%s\\n' "
+                    f"'{slugs}' > {d}/filter.conf && systemctl daemon-reload")
+            _elastic_ssh(ip, drop, timeout=15)
     _elastic_ssh(ip, f"systemctl reset-failed {unit}")
     r = _elastic_ssh(ip, f"systemctl start {unit}", timeout=25)
     logging.getLogger(__name__).warning(
-        "elastic spawn %s %s rc=%s", body.family, unit, r.get("rc"))
+        "elastic spawn %s %s filter=%s rc=%s",
+        body.family, unit, body.filter, r.get("rc"))
     return {"family": body.family, "unit": unit, "ok": bool(r.get("ok")),
             "rc": r.get("rc"), "stderr": (r.get("stderr") or r.get("error") or "")[:200]}
 
