@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -87,6 +88,13 @@ class AgentSupervisor:
         env["PIPELINE_WORKLOAD_FILTER"] = workload
         env["PIPELINE_PLUGIN_CACHE_DIR"] = cache_dir
         env["CUDA_VISIBLE_DEVICES"] = self.gpu_index if gpu else "-1"
+        if gpu:
+            # systemd gpu@ の drop-in (mps.conf / dynamo-disable.conf) 相当を子に付与。
+            # MPS を経由させないと単一 GPU で複数子が排他 CUDA context を作り init が stuck する
+            # (PoC 2026-07-06 で再現)。 既に env にあれば尊重、無ければ標準パスを補う。
+            env.setdefault("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps")
+            env.setdefault("CUDA_MPS_LOG_DIRECTORY", "/tmp/nvidia-mps-log")
+            env.setdefault("TORCHDYNAMO_DISABLE", "1")
         cmd = [
             self.pipeline_exe, "worker",
             "--control-url", self.control_url,
@@ -129,6 +137,42 @@ class AgentSupervisor:
                             "(P1: 再spawnせず次tickのdesired判定に委ねる)", cid, c.workload, rc)
         for cid in dead:
             self.children.pop(cid, None)
+
+    def cleanup_orphans(self) -> int:
+        """起動時: 前世代 agent が crash して残した孤児子 worker を kill する。
+        子は cmdline の `--worker-id w_{host}_a<N>` で識別 (agent 専用の命名)。
+        孤児は管理外なので graceful を待たず SIGKILL (in-flight は lease 失効で回収)。"""
+        marker = f"--worker-id w_{self.host.replace('-', '_')}_a"
+        try:
+            out = subprocess.check_output(["pgrep", "-af", "pipeline"], timeout=5, text=True)
+        except subprocess.CalledProcessError:
+            return 0  # 該当プロセスなし
+        except Exception as e:
+            log.warning("[agent] orphan pgrep failed: %s", e)
+            return 0
+        me = os.getpid()
+        killed = 0
+        for line in out.strip().splitlines():
+            parts = line.split(None, 1)
+            if len(parts) < 2 or marker not in parts[1]:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if pid == me:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+                log.warning("[agent] orphan child killed pid=%s (%s)", pid, parts[1][:100])
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log.warning("[agent] orphan kill pid=%s failed: %s", pid, e)
+        if killed:
+            log.info("[agent] cleanup_orphans: %d 孤児を kill", killed)
+        return killed
 
     def _active_by_workload(self) -> dict[str, list[Child]]:
         out: dict[str, list[Child]] = {}
