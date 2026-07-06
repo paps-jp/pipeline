@@ -122,6 +122,10 @@ CREATE TABLE IF NOT EXISTS workers (
 
 
 # --- runs (個別 task の処理履歴) ----------------------------------------
+# runs は数百万行に育つ。 started_at/finished_at/workload_slug/worker_id で絞るクエリ
+# (metric aggregator 30s周期・flow snapshot・maintenance purge・/workers fair-share・
+# list_for_workload) が index 無しだと全行フルスキャン→SQLite 同期実行でイベントループを
+# 周期ブロックする (2026-07-06 に control-plane stall の主因と特定)。 下記 index で解消。
 RUNS_DDL = """
 CREATE TABLE IF NOT EXISTS runs (
     id             TEXT PRIMARY KEY,
@@ -139,6 +143,10 @@ CREATE TABLE IF NOT EXISTS runs (
     output_json    TEXT,
     error          TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs (started_at);
+CREATE INDEX IF NOT EXISTS idx_runs_wl_started ON runs (workload_slug, started_at);
+CREATE INDEX IF NOT EXISTS idx_runs_finished ON runs (finished_at);
+CREATE INDEX IF NOT EXISTS idx_runs_worker ON runs (worker_id);
 """
 
 
