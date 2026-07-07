@@ -1,0 +1,21 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: minio-crawl
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"      # S3 API   -> http://192.0.2.17:9000
+      - "9001:9001"      # console  -> http://192.0.2.17:9001
+    environment:
+      MINIO_ROOT_USER: "CHANGE_ME_access"
+      MINIO_ROOT_PASSWORD: "CHANGE_ME_secret_min8chars"
+      # 圧縮は画像(既圧縮)には無効のまま
+    volumes:
+      # ← MinIO のデータ実体を Volume2 に置く。TOS の実パスに合わせて要調整
+      - /Volume2/minio/data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
