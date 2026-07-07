@@ -327,11 +327,10 @@ def snapshot(req: Request) -> FlowSnapshot:
 
     import datetime as _dt
     now_dt = _dt.datetime.now(_dt.timezone.utc)
-    # latest_by_slug 用に広く取る。 30min cutoff は long-running な workload
-    # (= paprika-links-pull が sleep 含む 1 tick 10min かけて走る等) でも最新 run を
-    # 必ず拾えるよう余裕を持たせた数字。 image-embed 等の高頻度 workload は 30min で
-    # ~5000 runs だが index 化済みなので軽い。
-    thirty_min = now_dt - _dt.timedelta(minutes=30)
+    # latest_by_slug 用に広く取る。 long-running self_loop (image-pull は hub read_timeout で
+    # 1 tick が 30min 超になることがある) の進行中 run を state 判定で拾えるよう 60min にする
+    # (窓が短いと長 tick が窓外→ 稼働中なのに state=idle 誤表示。 2026-07-07)。 index 化済で軽い。
+    state_window = now_dt - _dt.timedelta(minutes=60)
 
     # runs テーブルは高スループット時に巨大化する (= 35k/min 級・数百万行)。
     # 旧実装は list_since(30min) で全行 (stdout/output_json 込み) を Python に
@@ -342,7 +341,7 @@ def snapshot(req: Request) -> FlowSnapshot:
     # いずれも started_at index を使い、 返る行は slug 数分だけ。 30min 以上アイドルな
     # workload は latest に出ず node.state=idle (= 実態通り)。
     one_min = now_dt - _dt.timedelta(minutes=1)
-    latest_by_slug = runs_repo.latest_by_slug(thirty_min.isoformat())
+    latest_by_slug = runs_repo.latest_by_slug(state_window.isoformat())
     throughput_by_slug: dict[str, float] = {
         slug: float(cnt)
         for slug, cnt in runs_repo.throughput_counts(one_min.isoformat()).items()
