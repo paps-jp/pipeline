@@ -447,11 +447,32 @@ CREATE INDEX IF NOT EXISTS vram_observations_idx_ts
 """
 
 
+# --- agent_desired (pipeline-agent の desired 配信 + 最新報告状態) -------
+# P2: agent はローカル desired.json でなく control plane からこの行を取得する
+# (POST /agents/{host}/sync)。 supervisor が VRAM 安全な desired を算定して upsert し、
+# agent ホストの GPU 子数を中央制御する (2026-07-07。 agent ホストが supervisor 制御面の
+# 外にあり VRAM 過剰供給を自動で直せなかった問題への構造対処)。
+# last_* 列は agent が sync で報告した最新状態 (観測 + supervisor の算定入力)。
+AGENT_DESIRED_DDL = """
+CREATE TABLE IF NOT EXISTS agent_desired (
+    host             TEXT PRIMARY KEY,
+    desired_json     TEXT,                       -- {"workloads": {slug: {count,gpu,vram_mb}}}
+    updated_at       TEXT,
+    updated_by       TEXT,                       -- 'supervisor' / 'operator' 等
+    last_seen_at     TEXT,                       -- 最後に sync してきた時刻
+    last_vram_total_mb  INTEGER,
+    last_vram_free_mb    INTEGER,
+    last_children_json  TEXT                      -- agent 報告の子一覧 (観測用)
+);
+"""
+
+
 ALL_DDL = [
     WORKLOADS_DDL,
     WORKERS_DDL,
     RUNS_DDL,
     FLOW_RATE_1M_DDL,
+    AGENT_DESIRED_DDL,
     USERS_DDL,
     SESSIONS_DDL,
     API_KEYS_DDL,

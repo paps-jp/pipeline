@@ -66,6 +66,27 @@ class AgentSupervisor:
             log.warning("[agent] nvidia-smi free query failed: %s", e)
             return None
 
+    def _gpu_total_mb(self) -> int | None:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.total",
+                 "--format=csv,noheader,nounits", "-i", self.gpu_index],
+                timeout=5, text=True,
+            )
+            return int(out.strip().splitlines()[0].strip())
+        except Exception:
+            return None
+
+    def children_status(self) -> list[dict]:
+        """sync packet 用: 子一覧 (child_id, workload, gpu, alive)。"""
+        out = []
+        for c in self.children.values():
+            out.append({
+                "child_id": c.child_id, "workload": c.workload,
+                "gpu": c.gpu, "alive": c.proc.poll() is None,
+            })
+        return out
+
     def _vram_room_for(self, vram_mb: int) -> bool:
         """spawn 直前の実 VRAM で「今 入るか」を判定。 不明なら False (OOM 回避で spawn しない)。"""
         free = self._gpu_free_mb()

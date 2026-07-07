@@ -11,7 +11,7 @@ import signal
 import socket
 import time
 
-from pipeline.agent.desired import load_desired
+from pipeline.agent.desired import fetch_desired_via_sync, load_desired
 from pipeline.agent.supervisor import AgentSupervisor
 
 log = logging.getLogger("pipeline.agent")
@@ -33,6 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--proxy-port", type=int, default=8799)
     p.add_argument("--coalesce-heartbeat", action="store_true",
                    help="proxy で heartbeat を refresh 周期に合体 (control plane の lost 閾値確認後に)")
+    p.add_argument("--no-sync", action="store_true",
+                   help="P2 sync を使わずローカル desired.json のみ (bootstrap/検証用)")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
 
@@ -79,12 +81,27 @@ def main(argv: list[str] | None = None) -> int:
     n_orphan = sup.cleanup_orphans()  # 前世代 agent の孤児子を回収してから clean start
     if n_orphan:
         log.info("[agent] 起動時に孤児 %d を回収", n_orphan)
+    sync_control_url = d0.control_url  # sync は本物の control plane へ (proxy 経由でない)
     tick = 0
     try:
         while not stop["v"]:
             tick += 1
             try:
-                d = load_desired(args.desired)
+                # P2: control plane から desired を取得 (状態を報告しつつ)。 失敗/未設定なら
+                # ローカル desired.json に fallback (bootstrap + control plane 断時の保険)。
+                d = None
+                if not args.no_sync:
+                    try:
+                        d = fetch_desired_via_sync(
+                            sync_control_url, host,
+                            vram_total_mb=sup._gpu_total_mb(),
+                            vram_free_mb=sup._gpu_free_mb(),
+                            children=sup.children_status(),
+                        )
+                    except Exception as e:
+                        log.debug("[agent] sync failed (fallback local): %s", e)
+                if d is None:
+                    d = load_desired(args.desired)
                 if proxy is not None:
                     proxy.upstream = d.control_url.rstrip("/")  # 子は proxy 固定、 上流だけ追従
                 else:

@@ -31,12 +31,9 @@ class Desired:
     workloads: list[WorkloadDesired]
 
 
-def load_desired(path: str) -> Desired:
-    with open(path, encoding="utf-8") as f:
-        raw = json.load(f)
-    control_url = str(raw["control_url"]).rstrip("/")
+def _parse_workloads(raw_workloads: dict) -> list[WorkloadDesired]:
     wls: list[WorkloadDesired] = []
-    for slug, spec in (raw.get("workloads") or {}).items():
+    for slug, spec in (raw_workloads or {}).items():
         if isinstance(spec, int):
             spec = {"count": spec}
         wls.append(
@@ -47,4 +44,45 @@ def load_desired(path: str) -> Desired:
                 vram_mb=int(spec.get("vram_mb", 1500)),
             )
         )
-    return Desired(control_url=control_url, workloads=wls)
+    return wls
+
+
+def load_desired(path: str) -> Desired:
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    control_url = str(raw["control_url"]).rstrip("/")
+    return Desired(control_url=control_url, workloads=_parse_workloads(raw.get("workloads")))
+
+
+def fetch_desired_via_sync(
+    control_url: str,
+    host: str,
+    *,
+    vram_total_mb: int | None,
+    vram_free_mb: int | None,
+    children: list,
+    timeout: float = 10.0,
+) -> Desired | None:
+    """P2: POST /agents/{host}/sync で状態を報告し desired を受領。
+
+    desired があれば Desired を返す (control_url は引数のものを使う)。 desired 未設定/
+    到達不可なら None (呼び出し側はローカルファイルに fallback する)。
+    """
+    import urllib.request
+
+    base = control_url.rstrip("/")
+    body = json.dumps({
+        "vram_total_mb": vram_total_mb,
+        "vram_free_mb": vram_free_mb,
+        "children": children,
+    }).encode()
+    req = urllib.request.Request(
+        f"{base}/api/v1/agents/{host}/sync", data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        resp = json.load(r)
+    d = resp.get("desired")
+    if not d or not d.get("workloads"):
+        return None
+    return Desired(control_url=base, workloads=_parse_workloads(d.get("workloads")))
