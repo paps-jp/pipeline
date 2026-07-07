@@ -51,14 +51,26 @@ class AgentRepository:
                 return None
         return None
 
-    def set_desired(self, host: str, desired: dict[str, Any], by: str) -> None:
-        """desired を upsert (supervisor / operator が呼ぶ)。"""
+    def set_template(self, host: str, template: dict[str, Any], by: str) -> None:
+        """operator が上限テンプレ(max intent)を設定。 planner 未介入時に agent が困らないよう
+        effective(desired_json)も初期値としてテンプレで埋める (planner が後で VRAM 算定して上書き)。"""
+        tj = json.dumps(template, ensure_ascii=False)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO agent_desired (host, template_json, desired_json, updated_at, updated_by) "
+                "VALUES (:h, :t, :t, :now, :by) "
+                "ON CONFLICT(host) DO UPDATE SET template_json=:t, desired_json=:t, "
+                "  updated_at=:now, updated_by=:by",
+                {"h": host, "t": tj, "now": _now(), "by": by},
+            )
+
+    def set_effective(self, host: str, desired: dict[str, Any], by: str) -> None:
+        """planner が VRAM から算定した effective desired を設定 (template は触らない)。"""
         dj = json.dumps(desired, ensure_ascii=False)
         with self.db.transaction() as conn:
             conn.execute(
-                "INSERT INTO agent_desired (host, desired_json, updated_at, updated_by) "
-                "VALUES (:h, :d, :now, :by) "
-                "ON CONFLICT(host) DO UPDATE SET desired_json=:d, updated_at=:now, updated_by=:by",
+                "UPDATE agent_desired SET desired_json=:d, updated_at=:now, updated_by=:by "
+                "WHERE host=:h",
                 {"h": host, "d": dj, "now": _now(), "by": by},
             )
 
@@ -79,7 +91,7 @@ class AgentRepository:
     @staticmethod
     def _row(r: Any) -> dict[str, Any]:
         d = dict(r)
-        for k in ("desired_json", "last_children_json"):
+        for k in ("desired_json", "template_json", "last_children_json"):
             if d.get(k):
                 try:
                     d[k.replace("_json", "")] = json.loads(d[k])

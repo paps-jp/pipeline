@@ -52,10 +52,19 @@ def agent_sync(host: str, body: AgentSyncBody, req: Request) -> dict[str, Any]:
 
 @router.put("/{host}/desired")
 def set_agent_desired(host: str, body: AgentDesiredBody, req: Request) -> dict[str, Any]:
-    """desired を設定 (operator / supervisor)。"""
+    """operator が上限テンプレ(max intent)を設定。 effective も初期値として同値で埋める
+    (supervisor planner が VRAM から算定して effective を後で上書きする)。"""
     repo = AgentRepository(req.app.state.db)
-    repo.set_desired(host, {"workloads": body.workloads}, by="operator")
-    return {"host": host, "ok": True, "workloads": body.workloads}
+    repo.set_template(host, {"workloads": body.workloads}, by="operator")
+    return {"host": host, "ok": True, "template": body.workloads}
+
+
+@router.put("/{host}/effective")
+def set_agent_effective(host: str, body: AgentDesiredBody, req: Request) -> dict[str, Any]:
+    """supervisor planner が VRAM から算定した effective desired を設定 (template は不変)。"""
+    repo = AgentRepository(req.app.state.db)
+    repo.set_effective(host, {"workloads": body.workloads}, by="supervisor")
+    return {"host": host, "ok": True, "effective": body.workloads}
 
 
 @router.get("")

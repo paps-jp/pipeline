@@ -456,7 +456,8 @@ CREATE INDEX IF NOT EXISTS vram_observations_idx_ts
 AGENT_DESIRED_DDL = """
 CREATE TABLE IF NOT EXISTS agent_desired (
     host             TEXT PRIMARY KEY,
-    desired_json     TEXT,                       -- {"workloads": {slug: {count,gpu,vram_mb}}}
+    desired_json     TEXT,                       -- effective (agent が取得。 planner が VRAM で算定)
+    template_json    TEXT,                       -- operator が設定する上限テンプレ (max intent)
     updated_at       TEXT,
     updated_by       TEXT,                       -- 'supervisor' / 'operator' 等
     last_seen_at     TEXT,                       -- 最後に sync してきた時刻
@@ -465,6 +466,11 @@ CREATE TABLE IF NOT EXISTS agent_desired (
     last_children_json  TEXT                      -- agent 報告の子一覧 (観測用)
 );
 """
+
+# 既存 DB (先に template 無しで作成済) に列を後付けする idempotent ALTER。
+AGENT_DESIRED_ALTERS = [
+    "ALTER TABLE agent_desired ADD COLUMN template_json TEXT",
+]
 
 
 ALL_DDL = [
