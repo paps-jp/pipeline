@@ -457,3 +457,30 @@ def snapshot(req: Request) -> FlowSnapshot:
         edges.append(edge)
 
     return FlowSnapshot(canvas=canvas, nodes=nodes, edges=edges)
+
+
+@router.get("/rates")
+def flow_rates(
+    req: Request,
+    since_min: int = 60,
+    slug: str | None = None,
+    metric: str | None = None,
+) -> dict[str, Any]:
+    """flow_rate_1m の 1 分バケット時系列を返す (グラフ用)。
+
+    - since_min: 何分遡るか (既定 60、 上限 2880=48h)。
+    - slug / metric: 任意フィルタ (metric 既定 = 全: runs_per_min / items_per_min)。
+    runs を触らず flow_rate_1m (index 済) を引くだけなので、 複数ブラウザが叩いても軽い
+    (= サーバ側 60s 集約が実質キャッシュ)。
+    """
+    import datetime as _dt
+
+    from pipeline.repositories.flow_rate import FlowRateRepository
+
+    n = max(1, min(int(since_min), 2880))
+    since = (
+        _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=n)
+    ).replace(second=0, microsecond=0).isoformat()
+    repo = FlowRateRepository(req.app.state.db)
+    series = repo.read_series(since, slug=slug, metric=metric)
+    return {"since": since, "count": len(series), "series": series}

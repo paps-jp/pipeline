@@ -214,6 +214,27 @@ def create_app(settings: Settings) -> FastAPI:
                     pass
         maintenance_task = _asyncio.create_task(_maintenance_loop())
 
+        # flow_rate_1m aggregator (2026-07-07): 60s 毎に「直近数分」の各 slug rate を
+        # runs (index 済) から集約して flow_rate_1m へ upsert。 flow API はこの表を引くので
+        # 複数ブラウザのアクセスでも runs を再スキャンしない (= サーバ 1 分 1 回集約=キャッシュ)。
+        # long-format のためノード増減は行追加で吸収。 late-finishing run を拾うため直近3分を再集約。
+        _flow_rate_stop = _asyncio.Event()
+        async def _flow_rate_1m_loop() -> None:
+            from pipeline.repositories.flow_rate import FlowRateRepository as _FRR
+            frepo = _FRR(db)
+            while not _flow_rate_stop.is_set():
+                try:
+                    base = _dt.datetime.now(_dt.timezone.utc).replace(second=0, microsecond=0)
+                    for k in range(1, 4):   # 直近3分を再集約 (upsert で late 完了を反映)
+                        frepo.sample_minute(base - _dt.timedelta(minutes=k), _WMF)
+                except Exception:
+                    log.exception("flow_rate_1m aggregator failed")
+                try:
+                    await _asyncio.wait_for(_flow_rate_stop.wait(), timeout=60)
+                except _asyncio.TimeoutError:
+                    pass
+        flow_rate_task = _asyncio.create_task(_flow_rate_1m_loop())
+
         try:
             yield
         finally:
@@ -222,6 +243,11 @@ def create_app(settings: Settings) -> FastAPI:
             _vram_stop.set()
             _metric_stop.set()
             _maintenance_stop.set()
+            _flow_rate_stop.set()
+            try:
+                await _asyncio.wait_for(flow_rate_task, timeout=3)
+            except Exception:
+                pass
             try:
                 await _asyncio.wait_for(reaper_task, timeout=3)
             except Exception:

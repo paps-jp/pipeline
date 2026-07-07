@@ -102,6 +102,19 @@ class MaintenanceRepository:
             return cur.rowcount or 0
 
     # ------------------------------------------------------------------ #
+    # flow_rate_1m — 時間ベース (1分バケット時系列を retain_hours 保持)
+    # ------------------------------------------------------------------ #
+
+    def purge_flow_rate_1m(self, *, retain_hours: int = 48) -> int:
+        """retain_hours より古い 1 分バケットを削除 (= グラフ履歴を有界化)。"""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=retain_hours)).isoformat()
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM flow_rate_1m WHERE ts_min < :cut", {"cut": cutoff}
+            )
+            return cur.rowcount or 0
+
+    # ------------------------------------------------------------------ #
     # 一括実行
     # ------------------------------------------------------------------ #
 
@@ -113,4 +126,5 @@ class MaintenanceRepository:
             "plugin_runtime_blob": self.purge_plugin_runtime_blob(),
             "plugin_runtime_state": self.purge_plugin_runtime_state(),
             "llm_calls": self.purge_llm_calls(),
+            "flow_rate_1m": self.purge_flow_rate_1m(),
         }

@@ -150,6 +150,27 @@ CREATE INDEX IF NOT EXISTS idx_runs_worker ON runs (worker_id);
 """
 
 
+# --- flow_rate_1m (フロー各ノードの 1 分バケット時系列) --------------------
+# サーバが 60s 毎に「直前 1 分」の各 slug の rate を runs から集約し upsert する。
+# 目的: (1) 1 分毎グラフ、 (2) サーバ 1 回集約で複数ブラウザのアクセスに対する
+#       キャッシュ (各 request で runs を再スキャンしない)、 (3) real-time 表示。
+# **long-format (ts_min, slug, metric, value)** = ノードが増減しても行追加だけで済む
+# (固定カラム = slug 毎の列は NG。 新 workload/新 metric は行が増えるだけ)。
+#   metric 例: 'runs_per_min' (= その分に開始した成功 run 数)、 'items_per_min'
+#   (= output_json の宣言 metric field の SUM)。 将来 tank depth 等も metric 追加で対応。
+FLOW_RATE_1M_DDL = """
+CREATE TABLE IF NOT EXISTS flow_rate_1m (
+    ts_min  TEXT NOT NULL,     -- 1分バケット開始 (UTC ISO, 秒=00)
+    slug    TEXT NOT NULL,     -- workload slug (= ノード識別)
+    metric  TEXT NOT NULL DEFAULT 'runs_per_min',
+    value   REAL NOT NULL,
+    PRIMARY KEY (ts_min, slug, metric)
+);
+CREATE INDEX IF NOT EXISTS flow_rate_1m_idx_ts ON flow_rate_1m (ts_min);
+CREATE INDEX IF NOT EXISTS flow_rate_1m_idx_slug_ts ON flow_rate_1m (slug, ts_min);
+"""
+
+
 # --- users (UI ログインユーザ) ------------------------------------------
 USERS_DDL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -430,6 +451,7 @@ ALL_DDL = [
     WORKLOADS_DDL,
     WORKERS_DDL,
     RUNS_DDL,
+    FLOW_RATE_1M_DDL,
     USERS_DDL,
     SESSIONS_DDL,
     API_KEYS_DDL,
