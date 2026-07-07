@@ -14,8 +14,11 @@ nodes:
   kind: tank
   x: 26
   y: -441
-  label: crawl (URL 候補)
+  label: crawl (URL総数)
   icon: link
+  # 本来はキュー(未投入=submitted_at IS NULL の残数)を出したいが、 submitted_at は backfill
+  # 未実施で古い投入済み行も NULL のため正確に数えられない (crawl-submitted-at-column)。
+  # backfill + index 後に `WHERE submitted_at IS NULL` へ変更する。 現状は総数(TABLE_ROWS)。
   metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
     AND TABLE_NAME='crawl'
   capacity_warn: 500000000
@@ -44,9 +47,12 @@ nodes:
   kind: tank
   x: 609
   y: -56
-  label: crawl_image
+  label: crawl_image (未hash)
   icon: photo
-  metric_sql: SELECT COUNT(*) FROM crawl_image WHERE hash_id IS NULL
+  # 実 backlog = 未hash かつ dead-mark されていない (dispatcher が実際に処理できる) 分のみ。
+  # ignore_reason(file_lost/not_in_minio/dead_link)を除外しないと、 入手不能な死蔵 29.3M を
+  # 偽 backlog として表示してしまう (2026-07-07 特定)。 idx_ci_hash_ignore(hash_id,ignore_reason)で高速。
+  metric_sql: SELECT COUNT(*) FROM crawl_image WHERE hash_id IS NULL AND ignore_reason IS NULL
   capacity_warn: 500000000
 - id: image-dispatcher
   kind: workload
@@ -74,10 +80,11 @@ nodes:
   kind: tank
   x: 1174
   y: -393
-  label: crawl_face
+  label: crawl_face (未embed)
   icon: face
-  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
-    AND TABLE_NAME='crawl_face'
+  # キュー: 未embed の顔 (adaface_ready=0) の残数のみ。 総行数(TABLE_ROWS)だと 99.99% が
+  # embed 済(adaface_ready=1)の総数を偽 backlog 表示してしまう。 idx_cf_adaface で高速。
+  metric_sql: SELECT COUNT(*) FROM crawl_face WHERE adaface_ready=0
   capacity_warn: 500000000
 - id: image-embed
   kind: workload
