@@ -324,8 +324,39 @@ def snapshot(req: Request) -> FlowSnapshot:
     # SUM 集計して workloads.observed_rate に書き込んだ値 (2026-06-30)。 ここでは
     # snapshot ごと SQL 集計せず DB 列 1 回 SELECT で済ませて負荷を抑える。
     rate_by_slug: dict[str, float] = {w.slug: float(w.observed_rate or 0.0) for w in _all_wls}
-
+    # リアルタイム表示: flow_rate_1m の「最新の完了1分バケット」を優先する (2026-07-07)。
+    # observed_rate は 20min 平均で ramp/restart 後に大きく遅れる (実 614/min が 175 表示等)。
+    # items_per_min = その分に捌いた実件数、 runs_per_min = 完了 run 数。 短tick workload は
+    # 毎分バケットが埋まるのでこれが最も実態に近い。 長tick で当該分に完了が無い slug は
+    # ここに出ないので下流で _last_tick_rate にフォールバックする。
+    from pipeline.repositories.flow_rate import FlowRateRepository as _FRR
+    _frr = _FRR(req.app.state.db)
     import datetime as _dt
+    # 直近 N 分の per-minute バケットを平均 = wall-clock の実 件数/分 (burst 誤りなし)。
+    # 単一分だけだと noisy かつ tick 完了分にスパイクするので N 分平均で均す。
+    # 窓は wall-clock でなく「実在する最新バケット」にアンカーする (aggregator の
+    # 書込ラグで floor(now)-N が実データとズレ N-1 分しか拾えず過小になるのを防ぐ)。
+    _RT_AVG_MIN = 3
+    # 少し広め(N+3分)に読み、 実在する直近 N 分だけを平均対象にする。
+    _rt_read_since = (_dt.datetime.now(_dt.timezone.utc)
+                      - _dt.timedelta(minutes=_RT_AVG_MIN + 3)).isoformat()
+
+    def _avg_1m(metric: str) -> dict[str, float]:
+        rows = _frr.read_series(_rt_read_since, metric=metric)
+        if not rows:
+            return {}
+        recent = sorted({r["ts_min"] for r in rows})[-_RT_AVG_MIN:]
+        recent_set = set(recent)
+        denom = len(recent) or 1
+        agg: dict[str, float] = {}
+        for r in rows:
+            if r["ts_min"] in recent_set:
+                agg[r["slug"]] = agg.get(r["slug"], 0.0) + float(r["value"] or 0.0)
+        return {s: v / denom for s, v in agg.items()}
+
+    rt_items_1m = _avg_1m("items_per_min")
+    rt_runs_1m = _avg_1m("runs_per_min")
+
     now_dt = _dt.datetime.now(_dt.timezone.utc)
     # latest_by_slug 用に広く取る。 long-running self_loop (image-pull は hub read_timeout で
     # 1 tick が 30min 超になることがある) の進行中 run を state 判定で拾えるよう 60min にする
@@ -398,15 +429,19 @@ def snapshot(req: Request) -> FlowSnapshot:
             r = latest_by_slug.get(slug)
             if r:
                 node.state = _classify_state(r)
-                # observed_rate (= 30s aggregator が runs.output_json から算出した
-                # 「捌いた件数/min」) を優先表示。 まだ 1 回も aggregate されてない
-                # 起動直後や、 1 run = 1 件で aggregator が runs/min fallback を
-                # 書いた slug でも整合する (= rate_by_slug は全 workload 網羅)。
-                # 0 のときは throughput_by_slug (= runs/min 直近 1min) で穴埋め。
+                # リアルタイム優先順 (2026-07-07): wall-clock の実 件数/分を出す。
+                # 20min 平均(observed_rate) と _last_tick_rate(burst率で dispatcher が桁跳ね) は
+                # 主表示から外す。
+                #  1. items_per_min 直近3分平均 = 宣言 metric(inserted/submitted/enqueued 等)の実 件数/分
+                #  2. runs_per_min 直近3分平均 = 未宣言(1 run=1件: hash/embed/person-link)の実 件数/分
+                #  3. _last_tick_rate = 上記に当分バケットが無い長tick/起動直後の保険 (最後の完了tick)
+                #  4. observed_rate(20min平均) / runs/min 直近1min の最終フォールバック
                 node.throughput_per_min = (
-                    rate_by_slug.get(slug)
+                    rt_items_1m.get(slug)
+                    or rt_runs_1m.get(slug)
+                    or _last_tick_rate(slug)
+                    or rate_by_slug.get(slug)
                     or throughput_by_slug.get(slug, 0.0)
-                    or _last_tick_rate(slug)   # 長tick: 最後に完了した tick の実レート
                 )
                 fin = r.get("finished_at")
                 if not fin:
