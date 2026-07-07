@@ -347,6 +347,31 @@ def snapshot(req: Request) -> FlowSnapshot:
         slug: float(cnt)
         for slug, cnt in runs_repo.throughput_counts(one_min.isoformat()).items()
     }
+    # 長 tick self_loop (image-pull/links-pull 等) は 1 tick が 20min 窓より長く、 現 tick が
+    # 進行中(未完了)のため observed_rate も 1min 窓も 0 になり「稼働中なのに 0/min」表示になる。
+    # 最後に完了した tick の output_json(inserted 等)/dispatch_secs から実レートを算定し fallback。
+    sixty_min = now_dt - _dt.timedelta(minutes=60)
+    last_completed_by_slug = runs_repo.latest_completed_by_slug(sixty_min.isoformat())
+    from pipeline.models.metric_fields import WORKLOAD_METRIC_FIELDS as _WMF
+
+    def _last_tick_rate(slug: str) -> float:
+        lc = last_completed_by_slug.get(slug)
+        oj = (lc or {}).get("output_json")
+        if not isinstance(oj, dict):
+            return 0.0
+        try:
+            ds = float(oj.get("dispatch_secs") or 0)
+        except Exception:
+            return 0.0
+        if ds <= 0:
+            return 0.0
+        total = 0.0
+        for f in (_WMF.get(slug) or []):
+            try:
+                total += float(oj.get(f) or 0)
+            except Exception:
+                pass
+        return round(total / ds * 60.0, 1) if total > 0 else 0.0
 
     # 2. tank SQL を一括評価
     tank_sqls: dict[str, str] = {}
@@ -382,8 +407,12 @@ def snapshot(req: Request) -> FlowSnapshot:
                 node.throughput_per_min = (
                     rate_by_slug.get(slug)
                     or throughput_by_slug.get(slug, 0.0)
+                    or _last_tick_rate(slug)   # 長tick: 最後に完了した tick の実レート
                 )
                 fin = r.get("finished_at")
+                if not fin:
+                    # 現 run が進行中(未完了)なら、 最後に完了した tick の finished_at を出す
+                    fin = (last_completed_by_slug.get(slug) or {}).get("finished_at")
                 if fin:
                     node.last_run_at = fin.isoformat() if hasattr(fin, "isoformat") else str(fin)
                 node.last_output = r.get("output_json")

@@ -278,6 +278,32 @@ class RunsRepository:
                 }
         return out
 
+    def latest_completed_by_slug(self, since_iso: str) -> dict[str, dict[str, Any]]:
+        """直近窓で slug ごとの「最後に完了した(success=1) run 1 件」を返す。
+
+        latest_by_slug は最新 run(= 進行中の未完了 self_loop tick)を返すので metric が無い。
+        長 tick workload (image-pull 等) の実レートは、 この最後に完了した tick の
+        output_json(inserted 等)/ dispatch_secs から算定できる (flow の throughput fallback 用)。
+        """
+        out: dict[str, dict[str, Any]] = {}
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "SELECT workload_slug, finished_at, output_json FROM ("
+                "  SELECT workload_slug, finished_at, output_json,"
+                "         ROW_NUMBER() OVER (PARTITION BY workload_slug"
+                "                            ORDER BY started_at DESC) AS rn"
+                "  FROM runs WHERE started_at >= :since AND success = 1"
+                ") t WHERE rn = 1",
+                {"since": str(since_iso)},
+            )
+            for r in cur.fetchall():
+                oj = r["output_json"]
+                out[r["workload_slug"]] = {
+                    "finished_at": r["finished_at"],
+                    "output_json": json.loads(oj) if oj else None,
+                }
+        return out
+
     def list_recent_failures(self, limit: int = 10) -> list[dict[str, Any]]:
         # list_recent(limit=300) で fold すると、 高スループット workload で recent window が
         # 数分しか無く成功で埋まり failure が見えなくなる (=ダッシュボード "失敗はありません"
