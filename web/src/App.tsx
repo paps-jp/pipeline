@@ -11,7 +11,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
-  IconAdjustmentsHorizontal,
+  IconChartLine,
   IconBook2,
   IconDashboard,
   IconLanguage,
@@ -36,7 +36,7 @@ import Dashboard from "./pages/Dashboard";
 import Deploy from "./pages/Deploy";
 import Flow from "./pages/Flow";
 import Hosts from "./pages/Hosts";
-import OrchestrationControl from "./pages/OrchestrationControl";
+import Throughput from "./pages/Throughput";
 import PluginPanel from "./pages/PluginPanel";
 import Settings from "./pages/Settings";
 import ServiceLog from "./pages/ServiceLog";
@@ -208,10 +208,10 @@ export default function App() {
           to="/flow"
         />
         <NavLink
-          label={t("nav.orchestration", "流量制御")}
-          leftSection={<IconAdjustmentsHorizontal size={18} />}
+          label={t("nav.throughput", "スループット")}
+          leftSection={<IconChartLine size={18} />}
           component={RouterNavLink}
-          to="/orchestration"
+          to="/throughput"
         />
         <NavLink
           label={t("nav.workloads")}
@@ -276,7 +276,7 @@ export default function App() {
           <Route element={<PageTransition />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/flow" element={<Flow />} />
-            <Route path="/orchestration" element={<OrchestrationControl />} />
+            <Route path="/throughput" element={<Throughput />} />
             <Route path="/workloads" element={<Workloads />} />
             <Route path="/workloads/:slug" element={<Workloads />} />
             <Route path="/workloads/:slug/runs" element={<Workloads />} />

@@ -296,6 +296,10 @@ export const api = {
       method: "POST",
       json: { positions },
     }),
+  flowRates: (sinceMin: number) =>
+    request<{ since: string; count: number; series: FlowRateRow[] }>(
+      `/api/v1/flow/rates?since_min=${sinceMin}`,
+    ),
 };
 
 export interface FlowNode {
@@ -326,6 +330,14 @@ export interface FlowEdge {
   metric_field?: string | null;
   dashed?: boolean;
   rate_per_min?: number | null;
+}
+
+// GET /api/v1/flow/rates の 1 行 (flow_rate_1m の long-format: 1 分バケット)。
+export interface FlowRateRow {
+  ts_min: string;
+  slug: string;
+  metric: string;
+  value: number;
 }
 
 // ---------------- settings + llm ----------------

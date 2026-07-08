@@ -9,7 +9,7 @@ const resources = {
       nav: {
         dashboard: "ダッシュボード",
         flow: "フロー図",
-        orchestration: "流量制御",
+        throughput: "スループット",
         workloads: "ワークロード",
         workers: "ワーカー",
         hosts: "ホスト",
@@ -360,7 +360,7 @@ const resources = {
       nav: {
         dashboard: "Dashboard",
         flow: "Flow diagram",
-        orchestration: "Flow control",
+        throughput: "Throughput",
         workloads: "Workloads",
         workers: "Workers",
         hosts: "Hosts",
