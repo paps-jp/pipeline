@@ -5,6 +5,7 @@ import {
   SegmentedControl,
   SimpleGrid,
   Stack,
+  Switch,
   Text,
   Title,
 } from "@mantine/core";
@@ -42,6 +43,8 @@ type NodeSeries = {
   slug: string;
   points: Point[];
   current: number;
+  prev: number;
+  delta: number;
   peak: number;
   metric: "items" | "runs";
 };
@@ -78,10 +81,14 @@ function perNodeSeries(series: FlowRateRow[]): NodeSeries[] {
       .map(([m, e]) => ({ m, value: e.items > 0 ? e.items : e.runs }));
     while (points.length > 1 && points[points.length - 1].value === 0) points.pop();
     if (points.length === 0) continue;
+    const current = points[points.length - 1].value;
+    const prev = points.length >= 2 ? points[points.length - 2].value : current;
     out.push({
       slug,
       points,
-      current: points[points.length - 1].value,
+      current,
+      prev,
+      delta: current - prev,
       peak: Math.max(...points.map((p) => p.value)),
       metric: declared ? "items" : "runs",
     });
@@ -148,9 +155,118 @@ function Spark({
   );
 }
 
+// 前回バケット比の増減矢印。増=緑▲ / 減=赤▼ / 変化なし=灰→。
+function DeltaArrow({ delta }: { delta: number }) {
+  if (delta > 0)
+    return (
+      <Text span size="xs" c="teal.6" style={{ whiteSpace: "nowrap" }} title={`+${fmtNum(delta)}/分`}>
+        ▲ {fmtNum(delta)}
+      </Text>
+    );
+  if (delta < 0)
+    return (
+      <Text span size="xs" c="red.6" style={{ whiteSpace: "nowrap" }} title={`${fmtNum(delta)}/分`}>
+        ▼ {fmtNum(-delta)}
+      </Text>
+    );
+  return (
+    <Text span size="xs" c="dimmed" title="変化なし">
+      →
+    </Text>
+  );
+}
+
+// 重ね表示用の色パレット(ノード順に割り当て)。
+const PALETTE = [
+  "var(--mantine-color-indigo-5)",
+  "var(--mantine-color-teal-5)",
+  "var(--mantine-color-orange-5)",
+  "var(--mantine-color-pink-5)",
+  "var(--mantine-color-lime-6)",
+  "var(--mantine-color-cyan-5)",
+  "var(--mantine-color-grape-5)",
+  "var(--mantine-color-red-5)",
+  "var(--mantine-color-yellow-6)",
+  "var(--mantine-color-blue-5)",
+  "var(--mantine-color-green-6)",
+  "var(--mantine-color-violet-5)",
+];
+const colorFor = (i: number) => PALETTE[i % PALETTE.length];
+
+// 全ノードの時系列を 1 枚の SVG に重ねる。normalize=true は各線を自ノード peak で
+// 0..1 に正規化(スケール差の大きいノードも形が見える)、false は全ノード共通の
+// 絶対軸(絶対量の比較用)。
+function OverlayChart({
+  nodes,
+  normalize,
+}: {
+  nodes: NodeSeries[];
+  normalize: boolean;
+}) {
+  const allMins = nodes.flatMap((n) => n.points.map((p) => p.m));
+  if (allMins.length === 0) return null;
+  const minM = Math.min(...allMins);
+  const maxM = Math.max(...allMins);
+  const spanM = Math.max(1, maxM - minM);
+  const globalPeak = Math.max(1, ...nodes.map((n) => n.peak));
+  const W = 900;
+  const H = 320;
+  const PADL = 8;
+  const PADR = 8;
+  const PADT = 10;
+  const PADB = 10;
+  const x = (m: number) => PADL + ((m - minM) / spanM) * (W - PADL - PADR);
+  const y = (v: number, peak: number) => {
+    const maxV = normalize ? Math.max(1, peak) : globalPeak;
+    return PADT + (1 - v / maxV) * (H - PADT - PADB);
+  };
+  return (
+    <svg
+      width="100%"
+      viewBox={`0 0 ${W} ${H}`}
+      preserveAspectRatio="none"
+      style={{ display: "block", height: 320 }}
+    >
+      {[0.25, 0.5, 0.75].map((f) => (
+        <line
+          key={f}
+          x1={PADL}
+          x2={W - PADR}
+          y1={PADT + f * (H - PADT - PADB)}
+          y2={PADT + f * (H - PADT - PADB)}
+          stroke="var(--mantine-color-default-border)"
+          strokeWidth={0.5}
+          strokeDasharray="3 4"
+        />
+      ))}
+      {nodes.map((n, i) => {
+        if (n.points.length < 2) return null;
+        let line = "";
+        n.points.forEach((p, j) => {
+          line += `${j ? "L" : "M"}${x(p.m).toFixed(1)},${y(p.value, n.peak).toFixed(1)}`;
+        });
+        return (
+          <path
+            key={n.slug}
+            d={line}
+            stroke={colorFor(i)}
+            strokeWidth={1.5}
+            fill="none"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            vectorEffect="non-scaling-stroke"
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
 export default function Throughput() {
   const { t } = useTranslation();
   const [range, setRange] = useState("60");
+  const [view, setView] = useState("grid");
+  const [normalize, setNormalize] = useState(true);
   const ratesQ = useQuery({
     queryKey: ["flow-rates", range],
     queryFn: () => api.flowRates(Number(range)),
@@ -179,12 +295,23 @@ export default function Throughput() {
               ` · ${nodes.length} ノード · 合計 ${fmtNum(totalCurrent)}/分`}
           </Text>
         </div>
-        <SegmentedControl
-          size="xs"
-          data={RANGES}
-          value={range}
-          onChange={setRange}
-        />
+        <Group gap="sm" wrap="nowrap">
+          <SegmentedControl
+            size="xs"
+            data={[
+              { label: t("throughput.view.grid", "並べる"), value: "grid" },
+              { label: t("throughput.view.overlay", "重ねる"), value: "overlay" },
+            ]}
+            value={view}
+            onChange={setView}
+          />
+          <SegmentedControl
+            size="xs"
+            data={RANGES}
+            value={range}
+            onChange={setRange}
+          />
+        </Group>
       </Group>
 
       {ratesQ.isLoading ? (
@@ -195,6 +322,46 @@ export default function Throughput() {
         <Text c="dimmed" size="sm">
           {t("throughput.collecting", "(データ収集中…)")}
         </Text>
+      ) : view === "overlay" ? (
+        <Stack gap="sm">
+          <Group justify="flex-end">
+            <Switch
+              size="xs"
+              checked={normalize}
+              onChange={(e) => setNormalize(e.currentTarget.checked)}
+              label={t("throughput.normalize", "各ノードを正規化 (形を揃える)")}
+            />
+          </Group>
+          <Card withBorder radius="md" p="sm">
+            <OverlayChart nodes={nodes} normalize={normalize} />
+          </Card>
+          <SimpleGrid cols={{ base: 2, xs: 3, md: 4, xl: 6 }} spacing="xs">
+            {nodes.map((n, i) => (
+              <Group key={n.slug} gap={6} wrap="nowrap">
+                <span
+                  style={{
+                    width: 10,
+                    height: 10,
+                    borderRadius: 2,
+                    background: colorFor(i),
+                    flex: "0 0 auto",
+                  }}
+                />
+                <Text size="xs" truncate title={n.slug} style={{ flex: 1 }}>
+                  {nameMap.get(n.slug) ?? n.slug}
+                </Text>
+                <Text
+                  size="xs"
+                  fw={600}
+                  style={{ fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}
+                >
+                  {fmtNum(n.current)}
+                </Text>
+                <DeltaArrow delta={n.delta} />
+              </Group>
+            ))}
+          </SimpleGrid>
+        </Stack>
       ) : (
         <SimpleGrid cols={{ base: 1, xs: 2, md: 3, xl: 4 }} spacing="sm">
           {nodes.map((n) => (
@@ -203,21 +370,24 @@ export default function Throughput() {
                 <Text size="sm" fw={600} truncate title={n.slug}>
                   {nameMap.get(n.slug) ?? n.slug}
                 </Text>
-                <Text
-                  size="sm"
-                  fw={700}
-                  c="indigo"
-                  style={{
-                    fontVariantNumeric: "tabular-nums",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {fmtNum(n.current)}
-                  <Text span size="xs" c="dimmed">
-                    {" "}
-                    /分
+                <Group gap={6} wrap="nowrap">
+                  <Text
+                    size="sm"
+                    fw={700}
+                    c="indigo"
+                    style={{
+                      fontVariantNumeric: "tabular-nums",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {fmtNum(n.current)}
+                    <Text span size="xs" c="dimmed">
+                      {" "}
+                      /分
+                    </Text>
                   </Text>
-                </Text>
+                  <DeltaArrow delta={n.delta} />
+                </Group>
               </Group>
               <Group gap={6} mb={4} wrap="nowrap">
                 <Text size="10px" c="dimmed">
@@ -236,7 +406,7 @@ export default function Throughput() {
       <Text size="xs" c="dimmed">
         {t(
           "throughput.note",
-          "flow_rate_1m の 1 分バケット。各ノードは items_per_min(宣言 metric)優先 / runs_per_min フォールバック。現在分・末尾0除外、10秒更新。"
+          "flow_rate_1m の 1 分バケット。各ノードは items_per_min(宣言 metric)優先 / runs_per_min フォールバック。▲/▼ は直前の 1 分バケット比の増減。現在分・末尾0除外、10秒更新。"
         )}
       </Text>
     </Stack>
