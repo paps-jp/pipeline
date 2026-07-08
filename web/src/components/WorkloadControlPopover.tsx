@@ -325,6 +325,42 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
           onUp={() => patchMut.mutate({ lease_secs: Math.min(86400, w.lease_secs + 30) })}
           disabled={pending}
         />
+        <Knob
+          icon={<IconUsers size={14} />}
+          label="最低常駐 (min_resident_workers)"
+          value={String(w.min_resident_workers ?? 0)}
+          hint="この workload に常に確保する worker 数の下限。 balancer が VRAM を優先予約し starvation を防ぐ (backlog>0 の時)"
+          onDown={() => patchMut.mutate({ min_resident_workers: Math.max(0, (w.min_resident_workers ?? 0) - 1) })}
+          onUp={() => patchMut.mutate({ min_resident_workers: Math.min(100, (w.min_resident_workers ?? 0) + 1) })}
+          disabled={pending}
+        />
+        <Knob
+          icon={<IconStack2 size={14} />}
+          label="host毎 同時実行 (max_concurrent_per_host)"
+          value={w.max_concurrent_per_host == null ? "既定" : String(w.max_concurrent_per_host)}
+          hint="1 host で同時に claim できる上限。 GPU workload の VRAM 過密/OOM を防ぐ主レバー"
+          onDown={() => patchMut.mutate({ max_concurrent_per_host: w.max_concurrent_per_host == null ? null : (w.max_concurrent_per_host <= 1 ? null : w.max_concurrent_per_host - 1) })}
+          onUp={() => patchMut.mutate({ max_concurrent_per_host: (w.max_concurrent_per_host ?? 0) + 1 })}
+          disabled={pending}
+        />
+        <Knob
+          icon={<IconUsers size={14} />}
+          label="最大 worker (max_workers)"
+          value={w.max_workers == null ? "∞" : String(w.max_workers)}
+          hint="elastic が spawn できる worker 数の上限。 ∞=無制限"
+          onDown={() => patchMut.mutate({ max_workers: w.max_workers == null ? null : (w.max_workers <= 1 ? null : w.max_workers - 1) })}
+          onUp={() => patchMut.mutate({ max_workers: (w.max_workers ?? 0) + 1 })}
+          disabled={pending}
+        />
+        <Knob
+          icon={<IconBolt size={14} />}
+          label="全体 同時実行 (max_concurrent_total)"
+          value={w.max_concurrent_total == null ? "∞" : String(w.max_concurrent_total)}
+          hint="fleet 全体で同時に claim できる上限。 単一 writer 保証等に使う。 ∞=無制限"
+          onDown={() => patchMut.mutate({ max_concurrent_total: w.max_concurrent_total == null ? null : (w.max_concurrent_total <= 1 ? null : w.max_concurrent_total - 1) })}
+          onUp={() => patchMut.mutate({ max_concurrent_total: (w.max_concurrent_total ?? 0) + 1 })}
+          disabled={pending}
+        />
       </Stack>
 
       {(patchMut.error || filterMut.error) && (

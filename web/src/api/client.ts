@@ -67,6 +67,13 @@ export interface Workload {
   batch_size: number;
   lease_secs: number;
   max_attempts: number;
+  // 並列/常駐制御 (WorkloadBase)。 balancer/elastic が参照。
+  max_concurrent_per_host: number | null;
+  max_concurrent_total: number | null;
+  min_resident_workers: number;
+  max_workers: number | null;
+  requires_gpu: boolean;
+  queue_backend: string;
   resources: Record<string, unknown>;
   host_affinity: unknown[];
   on_success: Record<string, unknown> | null;
