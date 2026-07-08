@@ -235,6 +235,53 @@ def create_app(settings: Settings) -> FastAPI:
                     pass
         flow_rate_task = _asyncio.create_task(_flow_rate_1m_loop())
 
+        # paprika-job-submit のフロー表示を、 pipeline の submitted 件数でなく hub の
+        # 「実際に queued→running へ遷移した数/直近60秒」に置換する (2026-07-08)。
+        # submitted は failed_other(hub timeout)/adopted 等のノイズを含み、 かつ legacy
+        # crawl fleet 分を含まない。 hub の started_at 遷移が「実効的に捌かれ始めた数」。
+        # リクエスト経路に hub 呼び出しを挟まないよう、 ここで 30s 毎に取得し flow_rate_1m
+        # の専用 metric 'hub_started_per_min' に upsert。 flow.py が paprika-job-submit で優先読み。
+        _hub_rate_stop = _asyncio.Event()
+        _hub_url = (os.environ.get("PAPRIKA_HUB")
+                    or "http://192.0.2.34:8000").rstrip("/")
+
+        async def _hub_submit_rate_loop() -> None:
+            import httpx as _httpx
+            from pipeline.repositories.flow_rate import FlowRateRepository as _FRR
+            frepo = _FRR(db)
+            while not _hub_rate_stop.is_set():
+                try:
+                    now = _dt.datetime.utcnow()  # hub の started_at は UTC naive
+                    cut = now - _dt.timedelta(seconds=60)
+                    async with _httpx.AsyncClient(timeout=15.0) as cli:
+                        run = await cli.get(f"{_hub_url}/jobs?status=running&limit=2000")
+                        done = await cli.get(f"{_hub_url}/jobs?status=completed,failed&limit=2000")
+
+                    def _count(resp) -> int:
+                        j = resp.json()
+                        jobs = j.get("jobs", j) if isinstance(j, dict) else j
+                        c = 0
+                        for job in (jobs or []):
+                            sa = job.get("started_at")
+                            if not sa:
+                                continue
+                            try:
+                                if _dt.datetime.fromisoformat(sa) >= cut:
+                                    c += 1
+                            except Exception:
+                                pass
+                        return c
+
+                    total = _count(run) + _count(done)
+                    frepo.upsert(now, "paprika-job-submit", "hub_started_per_min", total)
+                except Exception:
+                    log.exception("hub submit rate loop failed")
+                try:
+                    await _asyncio.wait_for(_hub_rate_stop.wait(), timeout=30)
+                except _asyncio.TimeoutError:
+                    pass
+        hub_rate_task = _asyncio.create_task(_hub_submit_rate_loop())
+
         try:
             yield
         finally:
@@ -244,8 +291,13 @@ def create_app(settings: Settings) -> FastAPI:
             _metric_stop.set()
             _maintenance_stop.set()
             _flow_rate_stop.set()
+            _hub_rate_stop.set()
             try:
                 await _asyncio.wait_for(flow_rate_task, timeout=3)
+            except Exception:
+                pass
+            try:
+                await _asyncio.wait_for(hub_rate_task, timeout=3)
             except Exception:
                 pass
             try:

@@ -356,6 +356,10 @@ def snapshot(req: Request) -> FlowSnapshot:
 
     rt_items_1m = _avg_1m("items_per_min")
     rt_runs_1m = _avg_1m("runs_per_min")
+    # paprika-job-submit は hub の「直近60秒に queued→running へ遷移した数」で置換する
+    # (server の _hub_submit_rate_loop が 30s 毎に upsert)。 submitted 件数は
+    # failed_other(hub timeout)/adopted のノイズを含み legacy fleet 分も欠くため。
+    rt_hub_started = _frr.latest_rates("hub_started_per_min")
 
     now_dt = _dt.datetime.now(_dt.timezone.utc)
     # latest_by_slug 用に広く取る。 long-running self_loop (image-pull は hub read_timeout で
@@ -436,13 +440,18 @@ def snapshot(req: Request) -> FlowSnapshot:
                 #  2. runs_per_min 直近3分平均 = 未宣言(1 run=1件: hash/embed/person-link)の実 件数/分
                 #  3. _last_tick_rate = 上記に当分バケットが無い長tick/起動直後の保険 (最後の完了tick)
                 #  4. observed_rate(20min平均) / runs/min 直近1min の最終フォールバック
-                node.throughput_per_min = (
-                    rt_items_1m.get(slug)
-                    or rt_runs_1m.get(slug)
-                    or _last_tick_rate(slug)
-                    or rate_by_slug.get(slug)
-                    or throughput_by_slug.get(slug, 0.0)
-                )
+                if slug in rt_hub_started:
+                    # paprika-job-submit: hub の queued→running 遷移数/直近60秒 で置換
+                    # (0 も正当な値なので明示分岐で採用)。
+                    node.throughput_per_min = rt_hub_started[slug]
+                else:
+                    node.throughput_per_min = (
+                        rt_items_1m.get(slug)
+                        or rt_runs_1m.get(slug)
+                        or _last_tick_rate(slug)
+                        or rate_by_slug.get(slug)
+                        or throughput_by_slug.get(slug, 0.0)
+                    )
                 fin = r.get("finished_at")
                 if not fin:
                     # 現 run が進行中(未完了)なら、 最後に完了した tick の finished_at を出す

@@ -87,6 +87,17 @@ class FlowRateRepository:
                 )
         return len(rows)
 
+    def upsert(self, ts_min: datetime, slug: str, metric: str, value: float) -> None:
+        """単一 (ts_min, slug, metric) の値を upsert。 外部ソース(hub 等)の rate を
+        flow_rate_1m に載せる用 (sample_minute の runs 集約とは別経路)。"""
+        ts = _floor_minute(ts_min).isoformat()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO flow_rate_1m (ts_min, slug, metric, value) "
+                "VALUES (:ts, :slug, :metric, :val)",
+                {"ts": ts, "slug": slug, "metric": metric, "val": float(value)},
+            )
+
     def read_series(
         self,
         since_iso: str,
