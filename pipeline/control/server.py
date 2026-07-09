@@ -235,12 +235,15 @@ def create_app(settings: Settings) -> FastAPI:
                     pass
         flow_rate_task = _asyncio.create_task(_flow_rate_1m_loop())
 
-        # paprika-job-submit のフロー表示を、 pipeline の submitted 件数でなく hub の
-        # 「実際に queued→running へ遷移した数/直近60秒」に置換する (2026-07-08)。
+        # paprika-job-submit のフロー表示を、 pipeline の submitted 件数でなく hub が
+        # 直近60秒に受け入れた job 数に置換する (2026-07-08)。
         # submitted は failed_other(hub timeout)/adopted 等のノイズを含み、 かつ legacy
-        # crawl fleet 分を含まない。 hub の started_at 遷移が「実効的に捌かれ始めた数」。
-        # リクエスト経路に hub 呼び出しを挟まないよう、 ここで 30s 毎に取得し flow_rate_1m
-        # の専用 metric 'hub_started_per_min' に upsert。 flow.py が paprika-job-submit で優先読み。
+        # crawl fleet 分を含まない。 hub の受入数が「実効的に捌かれ始めた数」。
+        # 2026-07-09: 旧実装は /jobs?status=running & completed,failed を limit=2000 で
+        # 引き started_at∈[now-60s] を手カウントしていたが、 2クエリの一方が単発 empty を
+        # 返すと後勝ち upsert で分バケットが 0 に化ける欠陥があった。 Paprika が権威 endpoint
+        # GET /jobs/throughput?window_s=60 (accepted_last_min, source=redis) を提供したので
+        # それを 1 回叩くだけに置換 (単発 empty→0 化・limit truncation を根絶)。
         _hub_rate_stop = _asyncio.Event()
         _hub_url = (os.environ.get("PAPRIKA_HUB")
                     or "http://192.0.2.34:8000").rstrip("/")
@@ -251,29 +254,17 @@ def create_app(settings: Settings) -> FastAPI:
             frepo = _FRR(db)
             while not _hub_rate_stop.is_set():
                 try:
-                    now = _dt.datetime.utcnow()  # hub の started_at は UTC naive
-                    cut = now - _dt.timedelta(seconds=60)
+                    now = _dt.datetime.utcnow()
                     async with _httpx.AsyncClient(timeout=15.0) as cli:
-                        run = await cli.get(f"{_hub_url}/jobs?status=running&limit=2000")
-                        done = await cli.get(f"{_hub_url}/jobs?status=completed,failed&limit=2000")
-
-                    def _count(resp) -> int:
-                        j = resp.json()
-                        jobs = j.get("jobs", j) if isinstance(j, dict) else j
-                        c = 0
-                        for job in (jobs or []):
-                            sa = job.get("started_at")
-                            if not sa:
-                                continue
-                            try:
-                                if _dt.datetime.fromisoformat(sa) >= cut:
-                                    c += 1
-                            except Exception:
-                                pass
-                        return c
-
-                    total = _count(run) + _count(done)
-                    frepo.upsert(now, "paprika-job-submit", "hub_started_per_min", total)
+                        r = await cli.get(f"{_hub_url}/jobs/throughput?window_s=60")
+                    r.raise_for_status()
+                    j = r.json()
+                    # accepted_last_min を主に、無ければ accepted_last_60s をフォールバック。
+                    total = j.get("accepted_last_min")
+                    if total is None:
+                        total = j.get("accepted_last_60s", 0)
+                    frepo.upsert(now, "paprika-job-submit",
+                                 "hub_started_per_min", float(total))
                 except Exception:
                     log.exception("hub submit rate loop failed")
                 try:
