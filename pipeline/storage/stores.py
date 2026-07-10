@@ -24,6 +24,28 @@ class HealthStatus:
     error: str | None = None
 
 
+def _minio_http_live(endpoint: str, secure: bool, timeout: float = 3.0) -> tuple[bool, int, str | None]:
+    """MinIO の `/minio/health/live`(無認証)を HTTP GET で叩く reachability プローブ。
+    `minio` パッケージ非依存 = control plane / 監視系の venv でも動く。
+    Connection refused / No route / タイムアウトを即 down として検出。
+    """
+    import time as _t
+    import urllib.error
+    import urllib.request
+    scheme = "https" if secure else "http"
+    url = f"{scheme}://{endpoint}/minio/health/live"
+    t0 = _t.monotonic()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=timeout) as r:
+            code = getattr(r, "status", 200)
+        return (200 <= code < 500), int((_t.monotonic() - t0) * 1000), None
+    except urllib.error.HTTPError as e:
+        # 4xx でも「サーバは応答している」= reachable 扱い
+        return (e.code < 500), int((_t.monotonic() - t0) * 1000), None
+    except Exception as e:  # noqa: BLE001
+        return False, int((_t.monotonic() - t0) * 1000), str(e)[:200]
+
+
 def _retry(fn: Callable[..., Any], *args: Any, retries: int = 2, **kwargs: Any) -> Any:
     """transient エラーに指数バックオフで retry。最後の例外を再送。"""
     last: Exception | None = None
@@ -81,7 +103,16 @@ class MinioStore:
 
     # ---- 死活 ----
     def healthy(self) -> HealthStatus:
-        """bucket 存在確認 = 軽量 reachability プローブ (Connection refused 等を即検出)。"""
+        """minio パッケージ有: bucket 存在確認(認証付き)。無(監視系 venv 等): HTTP
+        `/minio/health/live` で reachability のみ。どちらも Connection refused 等を即検出。"""
+        try:
+            import minio  # noqa: F401
+            has_minio = True
+        except ImportError:
+            has_minio = False
+        if not has_minio:
+            ok, ms, err = _minio_http_live(self.endpoint or "", self._secure)
+            return HealthStatus(self.name, "minio", ok, ms, self.endpoint, err)
         t0 = time.monotonic()
         try:
             _retry(self.client.bucket_exists, self.bucket, retries=0)
