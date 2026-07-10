@@ -1414,6 +1414,79 @@ function WorkerMatrixPanel({ isLight }: { isLight: boolean }) {
   );
 }
 
+// ---------- GPU 緊急エラー アラート ----------
+// フロー左上に常時固定の赤ボックス。 workload node の最新 run エラー(flow.py が
+// error/error_worker として載せる)を GPU 故障シグネチャで走査し、 該当があれば表示。
+// pan/zoom に依らず常に見える位置 (= 見落とし防止)。 DB 追加負荷なし(snapshot 再利用)。
+const GPU_ERR_RE =
+  /cudaGetDeviceCount|Error 80\d|MPS .*(daemon|server)|GPU (is |has )?(lost|fallen)|fell off the bus|No devices? (were )?found|Unable to determine the device handle|CUBLAS|no CUDA-capable device|CUDA error|Xid/i;
+
+function GpuAlertBox({ nodes }: { nodes: FlowNode[] }) {
+  const alerts = useMemo(
+    () =>
+      nodes.filter(
+        (n) => n.kind === "workload" && !!n.error && GPU_ERR_RE.test(n.error),
+      ),
+    [nodes],
+  );
+  if (alerts.length === 0) return null;
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 12,
+        left: 12,
+        zIndex: 20,
+        maxWidth: 380,
+        background: "#7f1d1d",
+        border: "2px solid #ef4444",
+        borderRadius: 8,
+        color: "#fff",
+        padding: "10px 12px",
+        animation: "gpuAlertPulse 1.6s ease-in-out infinite",
+      }}
+    >
+      <style>{`@keyframes gpuAlertPulse {
+        0%,100% { box-shadow: 0 0 0 3px rgba(239,68,68,0.35), 0 4px 16px rgba(0,0,0,0.45); }
+        50%     { box-shadow: 0 0 0 7px rgba(239,68,68,0.12), 0 4px 22px rgba(0,0,0,0.55); }
+      }`}</style>
+      <div
+        style={{
+          fontWeight: 900,
+          letterSpacing: "0.06em",
+          fontSize: 14,
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+      >
+        <span style={{ fontSize: 18, lineHeight: 1 }}>🛑</span>
+        GPU 緊急エラー ({alerts.length})
+      </div>
+      <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+        {alerts.map((a) => (
+          <div key={a.id} style={{ fontSize: 12, lineHeight: 1.35 }}>
+            <div style={{ fontWeight: 700 }}>
+              {a.label}
+              {a.error_worker ? ` · ${a.error_worker}` : ""}
+            </div>
+            <div
+              style={{
+                opacity: 0.85,
+                fontFamily: "ui-monospace, monospace",
+                fontSize: 11,
+                wordBreak: "break-word",
+              }}
+            >
+              {String(a.error).slice(0, 160)}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ---------- ページ ----------
 
 export default function Flow() {
@@ -1783,6 +1856,7 @@ export default function Flow() {
     <FlowControlContext.Provider value={ctrlValue}>
     <Box ref={rfBoxRef} style={{ height: "calc(100vh - 80px)", background: bg, borderRadius: 8, overflow: "hidden", position: "relative" }}>
       <WorkerMatrixPanel isLight={isLight} />
+      <GpuAlertBox nodes={snapQ.data?.nodes ?? []} />
       <AnnotationToolbar
         activeTool={activeTool}
         setActiveTool={setActiveTool}

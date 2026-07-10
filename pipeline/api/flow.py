@@ -58,6 +58,9 @@ class FlowNode(BaseModel):
     capacity_warn: int | None = None
     fill_ratio: float | None = None
     error: str | None = None
+    # workload の最新 run が失敗した時のエラー文言 + 実行 worker (= GPU故障等の緊急検知用)。
+    # tank と違い workload node ではこれまで未設定だった (state=failed だけ)。
+    error_worker: str | None = None
 
 
 class FlowEdge(BaseModel):
@@ -463,6 +466,13 @@ def snapshot(req: Request) -> FlowSnapshot:
                     a = node.last_output.get("adapt")
                     if isinstance(a, dict):
                         node.adapt = a
+                # 最新 run のエラー文言を workload node にも載せる (= 追加 SQL 無し、
+                # latest_by_slug は既に取得済)。 UI 側で GPU 故障等の緊急エラーを
+                # フロー左上の赤ボックスに集約表示するのに使う。
+                _err = r.get("error")
+                if _err:
+                    node.error = str(_err)[:400]
+                    node.error_worker = r.get("worker_id")
             else:
                 node.state = "idle"
             # enabled=0 (= operator が停止指定) は state idle + throughput 0 強制。

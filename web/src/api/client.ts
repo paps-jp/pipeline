@@ -327,6 +327,7 @@ export interface FlowNode {
   capacity_warn?: number | null;
   fill_ratio?: number | null;
   error?: string | null;
+  error_worker?: string | null;
 }
 
 export interface FlowEdge {
