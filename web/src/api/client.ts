@@ -381,10 +381,18 @@ export interface LlmCallDetail extends LlmCallSummary {
   actions_json?: unknown;
 }
 
+export interface InfraAlert {
+  name: string;
+  kind: string;
+  endpoint?: string | null;
+  error?: string | null;
+}
+
 export interface FlowSnapshot {
   canvas: { width?: number; height?: number; background?: string };
   nodes: FlowNode[];
   edges: FlowEdge[];
+  infra_alerts?: InfraAlert[];
 }
 
 export interface RunningRun {

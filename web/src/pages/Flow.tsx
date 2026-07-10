@@ -47,7 +47,7 @@ import {
   type IconProps,
 } from "@tabler/icons-react";
 
-import { api, type FlowEdge, type FlowNode } from "@/api/client";
+import { api, type FlowEdge, type FlowNode, type FlowRateRow, type InfraAlert } from "@/api/client";
 import WorkloadControlPopover from "@/components/WorkloadControlPopover";
 import { ParticleEdge } from "./FlowEdge";
 
@@ -105,6 +105,57 @@ function fmtNum(v: number | null | undefined): string {
   if (v >= 10_000) return (v / 1_000).toFixed(1) + "k";
   if (Number.isInteger(v)) return String(v);
   return v.toFixed(1);
+}
+
+// 各ノードに出す「投入数」= 直近 RATE_WINDOW_MIN 分の実件数合計。flow snapshot は
+// レート(件/分)しか持たないので、Throughput ページと同じ /flow/rates(flow_rate_1m の
+// 1 分バケット)を足し上げて件数にする。paprika-job-submit は hub 投入レート
+// (hub_started_per_min)、他は items_per_min 優先 / runs_per_min フォールバック。
+const RATE_WINDOW_MIN = 60;
+const PAPRIKA_SLUG = "paprika-job-submit";
+
+// flow_rate_1m は同じ分を tz なし("…15:05:00" = naive UTC)と +00:00 付きの 2 表現で
+// 持つため、naive を UTC とみなして epoch-分へ揃え、per-minute で max を取り重複を畳む。
+function rateTsToEpochMin(ts: string): number {
+  const hasTz = /(?:Z|[+-]\d\d:?\d\d)$/.test(ts);
+  const t = new Date(hasTz ? ts : `${ts}Z`).getTime();
+  return Number.isNaN(t) ? NaN : Math.floor(t / 60_000);
+}
+
+function windowTotalsBySlug(series: FlowRateRow[]): Map<string, number> {
+  const bySlug = new Map<
+    string,
+    Map<number, { items: number; runs: number; hub: number }>
+  >();
+  for (const r of series) {
+    const m = rateTsToEpochMin(r.ts_min);
+    if (Number.isNaN(m)) continue;
+    let mm = bySlug.get(r.slug);
+    if (!mm) {
+      mm = new Map();
+      bySlug.set(r.slug, mm);
+    }
+    let e = mm.get(m);
+    if (!e) {
+      e = { items: 0, runs: 0, hub: 0 };
+      mm.set(m, e);
+    }
+    if (r.metric === "items_per_min") e.items = Math.max(e.items, r.value);
+    else if (r.metric === "runs_per_min") e.runs = Math.max(e.runs, r.value);
+    else if (r.metric === "hub_started_per_min") e.hub = Math.max(e.hub, r.value);
+  }
+  const nowMin = Math.floor(Date.now() / 60_000);
+  const out = new Map<string, number>();
+  for (const [slug, mm] of bySlug) {
+    const isPaprika = slug === PAPRIKA_SLUG;
+    let sum = 0;
+    for (const [m, e] of mm) {
+      if (m >= nowMin) continue; // 進行中の分は部分値なので除外
+      sum += isPaprika ? e.hub : e.items > 0 ? e.items : e.runs;
+    }
+    out.set(slug, sum);
+  }
+  return out;
 }
 
 // node label を i18n キー (`flow.node.<id>`) で引く、 未定義なら yaml の
@@ -247,7 +298,15 @@ function NodeHandles({ active }: { active?: ReadonlySet<string> }) {
   );
 }
 
-function WorkloadNode({ data }: { data: FlowNode & { activeHandles?: string[] } }) {
+function WorkloadNode({
+  data,
+}: {
+  data: FlowNode & {
+    activeHandles?: string[];
+    submitted_window?: number;
+    submitted_window_min?: number;
+  };
+}) {
   const { t } = useTranslation();
   const { colorScheme } = useMantineColorScheme();
   const ctrl = useContext(FlowControlContext);
@@ -329,6 +388,18 @@ function WorkloadNode({ data }: { data: FlowNode & { activeHandles?: string[] } 
             {fmtNum(data.throughput_per_min)}{t("flow.per_min")}
           </Text>
         </Group>
+        {data.submitted_window_min !== undefined && (
+          <Group gap={4} wrap="nowrap">
+            <Text size="xs" c="dimmed">{t("flow.submitted", "投入")}</Text>
+            <Text size="xs" fw={600} style={{ fontFamily: "ui-monospace, monospace" }}>
+              {fmtNum(data.submitted_window)}
+            </Text>
+            <Text size="10px" c="dimmed">
+              ({data.submitted_window_min}
+              {t("flow.min_suffix", "分")})
+            </Text>
+          </Group>
+        )}
         <Group gap={4} wrap="nowrap">
           <Text size="xs" c="dimmed">{t("flow.last_tick")}</Text>
           <Text size="xs" style={{ fontFamily: "ui-monospace, monospace" }}>
@@ -1421,15 +1492,22 @@ function WorkerMatrixPanel({ isLight }: { isLight: boolean }) {
 const GPU_ERR_RE =
   /cudaGetDeviceCount|Error 80\d|MPS .*(daemon|server)|GPU (is |has )?(lost|fallen)|fell off the bus|No devices? (were )?found|Unable to determine the device handle|CUBLAS|no CUDA-capable device|CUDA error|Xid/i;
 
-function GpuAlertBox({ nodes }: { nodes: FlowNode[] }) {
-  const alerts = useMemo(
+function GpuAlertBox({
+  nodes,
+  infraAlerts = [],
+}: {
+  nodes: FlowNode[];
+  infraAlerts?: InfraAlert[];
+}) {
+  const gpu = useMemo(
     () =>
       nodes.filter(
         (n) => n.kind === "workload" && !!n.error && GPU_ERR_RE.test(n.error),
       ),
     [nodes],
   );
-  if (alerts.length === 0) return null;
+  const total = gpu.length + infraAlerts.length;
+  if (total === 0) return null;
   return (
     <div
       style={{
@@ -1437,7 +1515,7 @@ function GpuAlertBox({ nodes }: { nodes: FlowNode[] }) {
         top: 12,
         left: 12,
         zIndex: 20,
-        maxWidth: 380,
+        maxWidth: 400,
         background: "#7f1d1d",
         border: "2px solid #ef4444",
         borderRadius: 8,
@@ -1461,13 +1539,31 @@ function GpuAlertBox({ nodes }: { nodes: FlowNode[] }) {
         }}
       >
         <span style={{ fontSize: 18, lineHeight: 1 }}>🛑</span>
-        GPU 緊急エラー ({alerts.length})
+        緊急アラート ({total})
       </div>
       <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
-        {alerts.map((a) => (
+        {infraAlerts.map((a) => (
+          <div key={`infra-${a.name}`} style={{ fontSize: 12, lineHeight: 1.35 }}>
+            <div style={{ fontWeight: 700 }}>
+              🗄 ストレージ停止 · {a.name}
+              {a.endpoint ? ` (${a.endpoint})` : ""}
+            </div>
+            <div
+              style={{
+                opacity: 0.85,
+                fontFamily: "ui-monospace, monospace",
+                fontSize: 11,
+                wordBreak: "break-word",
+              }}
+            >
+              {String(a.error ?? "unreachable").slice(0, 160)}
+            </div>
+          </div>
+        ))}
+        {gpu.map((a) => (
           <div key={a.id} style={{ fontSize: 12, lineHeight: 1.35 }}>
             <div style={{ fontWeight: 700 }}>
-              {a.label}
+              🎛 GPU · {a.label}
               {a.error_worker ? ` · ${a.error_worker}` : ""}
             </div>
             <div
@@ -1548,6 +1644,17 @@ export default function Flow() {
     refetchInterval: 3_000,
     refetchOnWindowFocus: true,
   });
+  // 各ノードの「投入数」(直近 RATE_WINDOW_MIN 分の実件数合計) 用。snapshot と別系統の
+  // 1 分バケットなので更新頻度は控えめ (件数は分解能が粗く 3 秒更新は不要)。
+  const ratesQ = useQuery({
+    queryKey: ["flow-rates-window", RATE_WINDOW_MIN],
+    queryFn: () => api.flowRates(RATE_WINDOW_MIN),
+    refetchInterval: 15_000,
+  });
+  const submittedBySlug = useMemo(
+    () => (ratesQ.data ? windowTotalsBySlug(ratesQ.data.series) : new Map<string, number>()),
+    [ratesQ.data],
+  );
 
   // ドラッグで動かしたローカル座標を保持。 サーバ snapshot は metric を上書きするが
   // 座標は最新のローカルを優先 (= drag 中に snapshot 来ても飛ばない)。
@@ -1587,6 +1694,10 @@ export default function Flow() {
           : { ...n };
         const ah = prevActiveHandles.get(n.id);
         if (ah) base.activeHandles = ah;
+        if (n.kind === "workload") {
+          base.submitted_window = submittedBySlug.get(n.workload_slug || n.id) ?? 0;
+          base.submitted_window_min = RATE_WINDOW_MIN;
+        }
         return {
           id: n.id,
           type: n.kind,
@@ -1596,16 +1707,16 @@ export default function Flow() {
         };
       });
     });
-  }, [snapQ.data, setNodes]);
+  }, [snapQ.data, submittedBySlug, setNodes]);
 
   const edges: Edge[] = useMemo(() => {
     const snap = snapQ.data;
     if (!snap) return [];
     // node 中心座標 + サイズ map (= handle 自動選択用)
-    // kind ごとの実描画 width/height は WorkloadNode=220x130 / TankNode=180x110 /
+    // kind ごとの実描画 width/height は WorkloadNode=220x150 / TankNode=180x110 /
     // ExternalNode≒180x90。 ここで小さくズレても dominant-axis 判定はぶれない。
     const SIZE: Record<string, { w: number; h: number }> = {
-      workload: { w: 220, h: 130 },
+      workload: { w: 220, h: 150 },
       tank: { w: 180, h: 110 },
       external: { w: 180, h: 90 },
     };
@@ -1856,7 +1967,7 @@ export default function Flow() {
     <FlowControlContext.Provider value={ctrlValue}>
     <Box ref={rfBoxRef} style={{ height: "calc(100vh - 80px)", background: bg, borderRadius: 8, overflow: "hidden", position: "relative" }}>
       <WorkerMatrixPanel isLight={isLight} />
-      <GpuAlertBox nodes={snapQ.data?.nodes ?? []} />
+      <GpuAlertBox nodes={snapQ.data?.nodes ?? []} infraAlerts={snapQ.data?.infra_alerts ?? []} />
       <AnnotationToolbar
         activeTool={activeTool}
         setActiveTool={setActiveTool}

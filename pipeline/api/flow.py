@@ -73,10 +73,57 @@ class FlowEdge(BaseModel):
     rate_per_min: float | None = None
 
 
+class InfraAlert(BaseModel):
+    """ストレージ等インフラ接続の死活 down 通知 (= フロー赤ボックスに表示)。"""
+    name: str            # "minio:crawl" / "db:main"
+    kind: str            # "minio" | "db"
+    endpoint: str | None = None
+    error: str | None = None
+
+
 class FlowSnapshot(BaseModel):
     canvas: dict[str, Any]
     nodes: list[FlowNode]
     edges: list[FlowEdge]
+    # ストレージ死活 down のみ (= reg.health() の ok=False)。GPU/silent-hang と同じ赤ボックスへ。
+    infra_alerts: list[InfraAlert] = []
+
+
+# ── ストレージ死活キャッシュ (background refresh = snapshot リクエストを絶対にブロックしない) ──
+# MinIO は HTTP /minio/health/live、DB は SELECT 1 を pipeline.storage.StorageRegistry でプローブ。
+# down が一件でもあれば snapshot.infra_alerts に載る → UI 左上の赤ボックスに集約表示。
+_STORAGE_HEALTH_TTL_S = 30.0
+_storage_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
+_storage_health_lock = threading.Lock()
+
+
+def _refresh_storage_health() -> None:
+    alerts: list[dict[str, Any]] = []
+    try:
+        from pipeline.storage import StorageRegistry
+        env_path = os.environ.get("PAPRIKA_FLOW_DB_ENV") or str(_DEFAULT_DB_ENV)
+        reg = StorageRegistry.from_env_file(env_path)
+        for h in reg.health():
+            if not h.ok:
+                alerts.append({"name": h.name, "kind": h.kind,
+                               "endpoint": h.endpoint, "error": h.error})
+    except Exception as e:  # noqa: BLE001
+        log.warning("flow: storage health probe failed: %s", e)
+    with _storage_health_lock:
+        _storage_health["ts"] = time.monotonic()
+        _storage_health["alerts"] = alerts
+        _storage_health["refreshing"] = False
+
+
+def _storage_alerts() -> list[dict[str, Any]]:
+    """cache を即返す。stale ならバックグラウンド refresh を1本だけ起動 (request 非ブロック)。"""
+    now = time.monotonic()
+    with _storage_health_lock:
+        stale = (now - _storage_health["ts"]) >= _STORAGE_HEALTH_TTL_S
+        if stale and not _storage_health["refreshing"]:
+            _storage_health["refreshing"] = True
+            threading.Thread(target=_refresh_storage_health, daemon=True).start()
+        return list(_storage_health["alerts"])
 
 
 def _load_layout() -> dict[str, Any]:
@@ -538,7 +585,8 @@ def snapshot(req: Request) -> FlowSnapshot:
         edge.rate_per_min = rate
         edges.append(edge)
 
-    return FlowSnapshot(canvas=canvas, nodes=nodes, edges=edges)
+    infra_alerts = [InfraAlert(**a) for a in _storage_alerts()]
+    return FlowSnapshot(canvas=canvas, nodes=nodes, edges=edges, infra_alerts=infra_alerts)
 
 
 @router.get("/rates")

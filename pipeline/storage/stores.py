@@ -138,14 +138,27 @@ class Db:
     @property
     def conn(self) -> Any:
         if self._conn is None:
-            import mariadb  # lazy
-            self._conn = mariadb.connect(**self._cfg, reconnect=True)
-            self._conn.autocommit = True
+            # mariadb(C wrapper)優先、無ければ pure-python pymysql (flow.py と同方針)。
+            try:
+                import mariadb  # lazy
+                self._conn = mariadb.connect(**self._cfg, reconnect=True)
+                self._conn.autocommit = True
+            except ImportError:
+                import pymysql  # lazy
+                self._conn = pymysql.connect(
+                    host=self._cfg["host"], port=self._cfg["port"],
+                    user=self._cfg["user"], password=self._cfg["password"],
+                    database=self._cfg["database"],
+                    connect_timeout=3, read_timeout=30, autocommit=True,
+                )
         return self._conn
 
     def ping(self) -> None:
         try:
-            self.conn.ping()
+            try:
+                self.conn.ping(reconnect=True)   # pymysql
+            except TypeError:
+                self.conn.ping()                 # mariadb (引数なし)
         except Exception:
             self._conn = None  # 次アクセスで再接続
 
