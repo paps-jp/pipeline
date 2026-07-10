@@ -1492,6 +1492,10 @@ function WorkerMatrixPanel({ isLight }: { isLight: boolean }) {
 const GPU_ERR_RE =
   /cudaGetDeviceCount|Error 80\d|MPS .*(daemon|server)|GPU (is |has )?(lost|fallen)|fell off the bus|No devices? (were )?found|Unable to determine the device handle|CUBLAS|no CUDA-capable device|CUDA error|Xid/i;
 
+// supervisor の hang watchdog(silent-hang / hang-run)が stuck worker を
+// fail/restart した時のマーカー。flow.py が node.error に載せる → 赤ボックスに集約。
+const HANG_ERR_RE = /supervisor:(silent-hang|hang-run)|silent[- ]?hang|hang-run/i;
+
 function GpuAlertBox({
   nodes,
   infraAlerts = [],
@@ -1506,7 +1510,16 @@ function GpuAlertBox({
       ),
     [nodes],
   );
-  const total = gpu.length + infraAlerts.length;
+  const hang = useMemo(
+    () =>
+      nodes.filter(
+        (n) =>
+          n.kind === "workload" && !!n.error && HANG_ERR_RE.test(n.error) &&
+          !GPU_ERR_RE.test(n.error),
+      ),
+    [nodes],
+  );
+  const total = gpu.length + hang.length + infraAlerts.length;
   if (total === 0) return null;
   return (
     <div
@@ -1564,6 +1577,24 @@ function GpuAlertBox({
           <div key={a.id} style={{ fontSize: 12, lineHeight: 1.35 }}>
             <div style={{ fontWeight: 700 }}>
               🎛 GPU · {a.label}
+              {a.error_worker ? ` · ${a.error_worker}` : ""}
+            </div>
+            <div
+              style={{
+                opacity: 0.85,
+                fontFamily: "ui-monospace, monospace",
+                fontSize: 11,
+                wordBreak: "break-word",
+              }}
+            >
+              {String(a.error).slice(0, 160)}
+            </div>
+          </div>
+        ))}
+        {hang.map((a) => (
+          <div key={`hang-${a.id}`} style={{ fontSize: 12, lineHeight: 1.35 }}>
+            <div style={{ fontWeight: 700 }}>
+              ⏱ ハング検知/復旧 · {a.label}
               {a.error_worker ? ` · ${a.error_worker}` : ""}
             </div>
             <div
