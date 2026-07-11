@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Storage SDK — Pipeline Docs</title>
+<meta name="description" content="pipeline.storage — プラグイン向けの MinIO / DB 接続レジストリ、型付きラッパー、死活監視。" />
+<link rel="icon" type="image/x-icon" href="assets/favicon.ico" />
+<link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png" />
+<link rel="stylesheet" href="assets/site.css" />
+<link rel="stylesheet" href="assets/docs.css" />
+<script>try{var t=localStorage.getItem('pipeline-docs-theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+</head>
+<body class="docs" data-page="storage-sdk">
+
+<header class="docs-header">
+  <button class="icon-btn hamburger" aria-label="メニュー切替">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+  </button>
+  <a class="brand" href="./"><img src="assets/icon-64.png" alt="" /><span class="brand-text">Pipeline</span><span class="brand-tag">Docs</span></a>
+  <div class="spacer"></div>
+  <div class="docs-search"><input type="text" id="docs-search-input" placeholder="ドキュメントを絞り込み ( / )" autocomplete="off" aria-label="検索" /></div>
+  <a class="hlink labelled" href="https://github.com/paps-jp/pipeline" target="_blank" rel="noopener" aria-label="GitHub">
+    <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.76-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+    <span>GitHub</span>
+  </a>
+  <button class="icon-btn theme-toggle" aria-label="テーマ切替">
+    <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+  </button>
+</header>
+
+<div class="sb-backdrop"></div>
+<div class="docs-layout">
+  <aside class="docs-sidebar" id="docs-sidebar"></aside>
+  <main class="docs-main">
+    <article class="docs-article">
+
+      <div class="docs-breadcrumb"><a href="manual.html">Docs</a> / プラグイン開発 / Storage SDK</div>
+      <h1>Storage SDK</h1>
+      <p class="lead">
+        <code>pipeline.storage</code> は、各プラグインの <code>setup()</code> に散らばりがちな MinIO / DB 接続の生成・認証・死活監視を1箇所に集約するプラグイン向け SDK です。プラグインは<strong>接続を「名前」で参照</strong>し、認証情報をハードコードしません (Airflow Connections / Prefect Blocks に相当)。
+      </p>
+
+      <h2>公開 API</h2>
+      <pre><code>from pipeline.storage import StorageRegistry, MinioStore, Db, HealthStatus, load_env_file</code></pre>
+      <table>
+        <tr><th>シンボル</th><th>役割</th></tr>
+        <tr><td><code>StorageRegistry</code></td><td>名前付き接続を解決し、型付きラッパーを遅延生成 + キャッシュする接続レジストリ。</td></tr>
+        <tr><td><code>MinioStore</code></td><td>MinIO の型付きラッパー (リトライ・死活付き)。</td></tr>
+        <tr><td><code>Db</code></td><td>MariaDB の型付きラッパー (再接続・死活付き)。</td></tr>
+        <tr><td><code>HealthStatus</code></td><td>死活結果 (<code>name</code> / <code>kind</code> / <code>ok</code> / <code>latency_ms</code> / <code>endpoint</code> / <code>error</code>)。</td></tr>
+        <tr><td><code>load_env_file(path)</code></td><td><code>KEY=VALUE</code> の <code>.env</code> を dict に読み込むヘルパ。</td></tr>
+      </table>
+
+      <h2>プラグインからの使い方</h2>
+      <pre><code>from pipeline.storage import StorageRegistry
+
+def setup(**kwargs):
+    # .env ファイル (creds) + init_kwargs overrides から接続レジストリを作る
+    reg = StorageRegistry.from_env_file(kwargs.get("db_env_file"), overrides=kwargs)
+    return {
+        "reg": reg,
+        "db":  reg.db(),           # MariaDB (name="main")
+        "raw": reg.minio("raw"),   # MinIO 'raw' 接続
+    }
+
+def process(task, ctx, state):
+    # MinIO: put/get/exists/remove (リトライ内蔵)
+    state["raw"].put_file(key, tmp_path, content_type="image/jpeg")
+    if not state["raw"].exists(key):
+        return {"_error": "put failed"}
+    # DB: query / execute
+    rows = state["db"].query("SELECT ... WHERE id = %s", (task.pk,))
+    return {"rows": len(rows)}</code></pre>
+      <p>既知の接続名は <code>minio("raw")</code> / <code>minio("crawl")</code> と <code>db("main")</code> です。エンドポイント・バケット・認証情報は <code>.env</code> の <code>MINIO_*</code> / <code>DB_*</code> キーから解決されます (<a href="configuration.html#storage-sdk-の-env">設定リファレンス</a>)。未設定なら明確な例外を投げます。同じ <code>(kind, name)</code> は同一ラッパーがキャッシュ返却されます。</p>
+
+      <h3>MinioStore のメソッド</h3>
+      <table>
+        <tr><th>メソッド</th><th>説明</th></tr>
+        <tr><td><code>put_file(key, path, content_type=…)</code></td><td>ファイルをアップロード。</td></tr>
+        <tr><td><code>get_to_file(key, path)</code></td><td>オブジェクトをローカルへダウンロード。</td></tr>
+        <tr><td><code>exists(key)</code></td><td>存在確認 (stat)。</td></tr>
+        <tr><td><code>remove(key)</code></td><td>削除。</td></tr>
+      </table>
+      <p>いずれも指数バックオフのリトライ (既定2回) で包まれます。</p>
+
+      <h3>Db のメソッド</h3>
+      <table>
+        <tr><th>メソッド</th><th>説明</th></tr>
+        <tr><td><code>query(sql, params)</code></td><td><code>fetchall()</code> の結果を返す。</td></tr>
+        <tr><td><code>execute(sql, params)</code></td><td>INSERT/UPDATE 等を実行 (autocommit)。</td></tr>
+        <tr><td><code>ping()</code></td><td>接続確認 (失敗時は接続を破棄し次回再接続)。</td></tr>
+      </table>
+
+      <h2>死活監視 (healthy / health)</h2>
+      <pre><code># 単一接続
+if not state["raw"].healthy():
+    ...   # MinIO 落ち
+
+# レジストリ一括 (監視ループ向け)
+for h in reg.health():          # list[HealthStatus]
+    if not h.ok:
+        alert(f"{h.name} ({h.endpoint}) down: {h.error}")</code></pre>
+      <p><code>MinioStore.healthy()</code> は、<code>minio</code> パッケージがあれば認証付き <code>bucket_exists</code> で、無ければ <code>/minio/health/live</code> への素の HTTP GET で判定します。そのため <code>minio</code> ドライバの無い監視用 venv でも「接続拒否 / 到達不能 / タイムアウト」を検出できます。失敗時は壊れたクライアントを破棄し、次回再生成します。<code>Db.healthy()</code> は <code>ping()</code> → <code>SELECT 1</code> です。</p>
+
+      <div class="callout">
+        ドライバ (<code>minio</code> / <code>mariadb</code>) は各メソッド内で遅延 import されます。そのため制御プレーンやテスト用 venv にドライバが無くても、<code>pipeline.storage</code> の import 自体は失敗しません。
+      </div>
+
+      <nav class="docs-pager" id="docs-pager"></nav>
+      <div class="docs-foot">
+        <span>Pipeline — GUI-first batch fleet · <a href="https://paps-jp.github.io/" target="_blank" rel="noopener">ぱっぷすラボ</a></span>
+        <span><a href="https://github.com/paps-jp/pipeline">GitHub</a> · <a href="./">ホーム</a></span>
+      </div>
+    </article>
+  </main>
+  <aside class="docs-toc" id="docs-toc"></aside>
+</div>
+
+<script src="assets/docs.js" defer></script>
+</body>
+</html>
