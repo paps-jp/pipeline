@@ -67,6 +67,22 @@
         <li>単一プロセス mode (SQLite 1 ファイル) で動き、worker 追加でスケールアウトします。</li>
       </ul>
 
+      <h2>位置づけ — 何であって、何でないか</h2>
+      <p>Pipeline は「ループ処理 (1行 = 1タスク) を fleet で回す」ための最小限の土台です。エンジニアの直感に合わせると、次の位置にいます。</p>
+      <table>
+        <tr><th>ツール</th><th>役割</th><th>Pipeline との違い</th></tr>
+        <tr><td>cron + シェル</td><td>時刻起動</td><td>Pipeline は<em>キューと fleet</em>を持ち、並列度・リトライ・可視化が付く。</td></tr>
+        <tr><td>Celery / RQ</td><td>タスクキュー</td><td>思想は近い。Pipeline は<strong>GUI 第一</strong>で、ワークロード登録・監視・デプロイまで Web UI で完結。broker は SQLite/MariaDB。</td></tr>
+        <tr><td>Airflow</td><td>DAG スケジューラ</td><td>Pipeline は DAG/依存管理を持たない。「同種タスクを大量に捌く」一段の並列実行に特化して軽い。</td></tr>
+        <tr><td>Ray</td><td>分散実行 + actor</td><td>Pipeline は actor モデルを持たない。「Ray の単純な半分」= GPU 同居でスループットを稼ぐバッチ用途に絞る。</td></tr>
+      </table>
+      <p><strong>向いている:</strong> 同じ処理を大量の入力に対して回す (クロール・推論・変換)、1〜10 GPU の同居でアイドルを埋めたい、Python は書けなくても SQL は読めるオペレータに運用を渡したい。<br>
+      <strong>向いていない:</strong> タスク間に複雑な依存関係 (DAG) がある、ミリ秒級の低レイテンシ RPC、ステートフルな actor が要る — これらは Airflow / Ray などが適します。</p>
+
+      <div class="callout">
+        <strong>まず動かすなら:</strong> <a href="tutorial.html">チュートリアル</a>が最短です。起動 → 最初のジョブ → 自作プラグイン → dispatcher→consumer パイプラインまでを、手を動かして 20〜30 分で通せます。
+      </div>
+
       <h2>クイックスタート</h2>
       <p>評価やローカル開発では、単一プロセス mode が最短です。</p>
       <pre><code># 制御プレーン + in-process worker + Web UI を1プロセスで起動

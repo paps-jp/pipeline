@@ -51,6 +51,13 @@
   "timeout_secs": 60
 }</code></pre>
       <p>テンプレート変数 <code>{task.pk}</code> <code>{task.extra.KEY}</code> が展開されます。成否は <code>success_criteria</code> (既定 <code>{"type":"exit_code","expected":0}</code>) の通り、プロセスの exit code で判定されます。</p>
+      <table>
+        <tr><th>executor_config の鍵</th><th>意味</th></tr>
+        <tr><td><code>command</code></td><td>実行するコマンドの配列 (argv)。テンプレート変数を展開。</td></tr>
+        <tr><td><code>cwd</code></td><td>作業ディレクトリ (任意、null で既定)。</td></tr>
+        <tr><td><code>env</code></td><td>追加の環境変数 (任意)。</td></tr>
+        <tr><td><code>timeout_secs</code></td><td>プロセスのタイムアウト秒。</td></tr>
+      </table>
 
       <h2>python_module</h2>
       <p>プラグインを呼びます (<a href="plugin-sdk.html">プラグインSDK</a>)。instance は worker プロセスでキャッシュされるため、重い <code>setup()</code> は1回だけ実行されます。python_module では exit code が無いため、成否は <code>process()</code> の戻り値 / 例外で決まります。</p>
@@ -63,7 +70,15 @@
     "timeout_secs": 10
   }
 }</code></pre>
-      <p><code>callable</code> は既定で <code>process</code> です。<code>max_duration_ms</code> を指定すると、それを超えた <code>process()</code> は失敗扱いになります。</p>
+      <table>
+        <tr><th>executor_config の鍵</th><th>意味</th></tr>
+        <tr><td><code>source_path</code></td><td>プラグインのディレクトリ (例 <code>plugins/my_plugin</code> / <code>/opt/pipeline/plugins/my_plugin</code>)。</td></tr>
+        <tr><td><code>module</code></td><td>ディレクトリ内の <code>.py</code> ファイル名 (拡張子なし) or サブパッケージ名。</td></tr>
+        <tr><td><code>callable</code></td><td>呼ぶ関数名。既定 <code>process</code>。</td></tr>
+        <tr><td><code>init_kwargs</code></td><td><code>setup(**init_kwargs)</code> に渡す dict。フォームで組み立てられます。</td></tr>
+        <tr><td><code>max_duration_ms</code></td><td>(任意) <code>process()</code> がこれを超えたら失敗扱い。0/未指定で無効。</td></tr>
+      </table>
+      <p><code>callable</code> は既定で <code>process</code> です。モジュール解決の内部 (slug 込みキーによる同名衝突回避) は <a href="plugin-sdk.html#module-resolution">プラグインSDK</a> を参照してください。</p>
 
       <h2>success_criteria / on_success / on_failure</h2>
       <p><code>success_criteria</code> は <code>type: exit_code</code> のときだけ実ロジックを持ち、それ以外は <code>process()</code> の戻り値 (成功フラグ) がそのまま使われます。<code>on_success</code> / <code>on_failure</code> フィールドはモデル・DB に存在しますが、現状ランタイムでは消費されません (予約項目)。チェーン実行が要る場合は plugin 側か <a href="plugin-sdk.html#self-loop">self_loop</a> で組んでください。</p>

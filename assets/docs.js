@@ -11,6 +11,7 @@
     { title: "はじめに", items: [
       { key: "introduction", label: "Introduction", href: "manual.html" },
       { key: "setup",        label: "セットアップ",  href: "setup.html" },
+      { key: "tutorial",     label: "チュートリアル", href: "tutorial.html" },
     ]},
     { title: "コアコンセプト", items: [
       { key: "concepts", label: "用語とアーキテクチャ", href: "concepts.html" },

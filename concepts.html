@@ -93,6 +93,34 @@
         <a href="plugin-sdk.html#self-loop">プラグインSDK</a> を参照してください。
       </div>
 
+      <h2 id="タスクはどうやってキューに入るか">タスクはどうやってキューに入るか</h2>
+      <p>「ワーカーがキューから取り出す」側は分かりました。では<strong>そのキューには誰がタスクを入れる</strong>のでしょうか。Pipeline には入り口が3経路あります。用途に応じて選びます。</p>
+      <table>
+        <tr><th>経路</th><th>誰が</th><th>典型用途</th></tr>
+        <tr><td><strong>手動投入</strong></td><td>オペレータが Web UI の 📨、または <code>POST /workloads/{slug}/tasks</code></td><td>試験・再実行・アドホックな1件処理。</td></tr>
+        <tr><td><strong>外部システムから POST</strong></td><td>CI / cron / 別サービスが API を叩く</td><td>「アップロードされたら処理」等のイベント連携。バルクは <code>tasks/batch</code>。</td></tr>
+        <tr><td><strong>dispatcher プラグイン</strong></td><td><code>self_loop</code> 型プラグインが定期的に上流を見て自動 enqueue</td><td>常時流し続けるパイプライン本体。最も一般的。</td></tr>
+      </table>
+      <p>3つ目が Pipeline らしい形です。dispatcher (self_loop) が上流ソースを見て新規対象を見つけ、<strong>下流ワークロードのキューへ <code>tasks/batch</code> で流し込み</strong>、consumer がそれを1件ずつ処理します。「発見」と「重い処理」を別ワークロードに分けることで、後者だけを worker 追加で水平スケールできます。</p>
+      <pre><code>┌──────────┐  fetch     ┌─────────────┐  tasks/batch   ┌──────────────┐
+│  上流ソース │ ─────────▶ │ dispatcher   │ ─────────────▶ │ consumer     │ → process()
+│ (feed/DB…) │            │ (self_loop)  │  下流キューへ    │ (per-task)   │
+└──────────┘            └─────────────┘                └──────────────┘</code></pre>
+      <p>手を動かして体験するには <a href="tutorial.html#step6-pipeline">チュートリアルのステップ6</a> を、実装の詳細は <a href="plugin-sdk.html#self-loop">プラグインSDK</a> を参照してください。</p>
+
+      <div class="callout">
+        <strong>「入力ソース」機能について:</strong> README には DB / SQL / file glob / HTTP poll を入力ソースとして選ぶ構想が書かれていますが、これは将来の実装予定 (未実装) です。現状タスクを供給する正規の方法は上記3経路、とりわけ dispatcher プラグインです。
+      </div>
+
+      <h2>なぜ pull 型なのか</h2>
+      <p>制御プレーンがワーカーに仕事を「押し込む (push)」のではなく、ワーカーが「取りに行く (pull)」設計には理由があります。</p>
+      <ul>
+        <li><strong>スケールが自明</strong> — ワーカーは起動して heartbeat を送るだけで参加します。制御プレーン側にワーカー一覧の設定を持たなくてよい。</li>
+        <li><strong>障害に強い</strong> — ワーカーが落ちても、claim した lease が失効すれば他のワーカーが同じタスクを再 claim します。押し込み型のように「配ったのに相手が死んだ」状態を追跡する必要がありません。</li>
+        <li><strong>背圧が自然にかかる</strong> — 忙しいワーカーは次を取りに来ないだけ。過負荷ワーカーへ仕事が積み上がりません。</li>
+        <li><strong>NAT/FW を越えやすい</strong> — ワーカー → 制御プレーンの一方向 HTTP だけで動きます。</li>
+      </ul>
+
       <nav class="docs-pager" id="docs-pager"></nav>
       <div class="docs-foot">
         <span>Pipeline — GUI-first batch fleet · <a href="https://paps-jp.github.io/" target="_blank" rel="noopener">ぱっぷすラボ</a></span>

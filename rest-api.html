@@ -113,6 +113,58 @@
         <tr><td>GET</td><td><code>/api/v1/minio/{key}</code></td><td>許可プレフィックスの MinIO オブジェクトをプロキシ配信 (サムネ等)。</td></tr>
       </table>
 
+      <h2>リクエスト/レスポンス例</h2>
+      <p>代表的なボディの形です。正確な全フィールドは <code>/openapi.json</code> が権威です。</p>
+
+      <h3>ワークロードを作る (POST /workloads)</h3>
+      <p>ボディは <code>WorkloadCreate</code> (未知キーは拒否)。最小構成の例:</p>
+      <pre><code>curl -X POST http://localhost:8000/api/v1/workloads \
+  -H "Content-Type: application/json" \
+  -d '{
+    "slug": "url-check",
+    "name": "URL Check",
+    "enabled": true,
+    "executor_type": "python_module",
+    "executor_config": {
+      "source_path": "plugins/url_check",
+      "module": "main",
+      "init_kwargs": { "timeout_secs": 10 }
+    },
+    "priority": 100,
+    "batch_size": 10,
+    "lease_secs": 300,
+    "max_attempts": 5
+  }'</code></pre>
+      <p>成功は 201 で作成された workload を返します。slug が既存なら 409 です。</p>
+
+      <h3>キュー件数を見る (GET /workloads/{slug}/queue)</h3>
+      <pre><code>{ "pending": 3, "claimed": 1, "failed": 0, "total": 4 }</code></pre>
+
+      <h3>run 履歴を見る (GET /workloads/{slug}/runs)</h3>
+      <p>1件の run は概ね次の形です (成功なら <code>output_json</code>、失敗なら <code>error</code>/<code>stderr</code> が入ります)。</p>
+      <pre><code>{
+  "runs": [
+    {
+      "run_id": 1287,
+      "pk": "https://example.com",
+      "attempt": 1,
+      "success": true,
+      "worker_id": "host-a:12345",
+      "started_at": "2026-07-11T09:00:01Z",
+      "duration_ms": 83,
+      "output_json": { "url": "https://example.com", "status": 200, "bytes": 1256 },
+      "stdout": "", "stderr": "", "error": null
+    }
+  ]
+}</code></pre>
+
+      <h3>典型的な自動化フロー</h3>
+      <p>外部システムから使う場合の定番は「投入 → ポーリング」です。</p>
+      <pre><code>① POST /workloads/{slug}/tasks/batch   … 対象をまとめて投入
+② GET  /workloads/{slug}/queue         … pending が捌けるのを監視
+③ GET  /workloads/{slug}/runs?limit=N  … 結果 (output_json) を回収
+④ POST /workloads/{slug}/queue/reset-failed … 失敗分をまとめて再試行 (必要なら)</code></pre>
+
       <h2>タスク投入例</h2>
       <pre><code>curl -X POST http://localhost:8000/api/v1/workloads/echo-sample/tasks \
   -H "Content-Type: application/json" \

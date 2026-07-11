@@ -74,6 +74,27 @@ sudo systemctl restart pipeline-oss-control    # 制御プレーン
 sudo systemctl restart 'pipeline-worker-*'</code></pre>
       <p>プラグイン / コードの各ホストへの配信は Web UI の <a href="web-ui.html#deploy">Deploy 画面</a>から行えます。配信後は md5 突合で全ホストの一致を確認してから worker を再起動してください。Web UI を更新した場合は <code>cd web &amp;&amp; npm install &amp;&amp; npm run build</code> も実行します。</p>
 
+      <h2 id="トラブルシューティング">トラブルシューティング</h2>
+      <table>
+        <tr><th>症状</th><th>まず疑うところ</th></tr>
+        <tr><td>ワーカーが workload を claim しない</td><td>workload が <code>enabled</code> か / <code>host_affinity</code> がそのホスト名に一致するか / worker の filter が別 slug に絞られていないか (<a href="web-ui.html#flow-フロー図">Flow</a> のマトリクスで確認) / <code>max_concurrent_per_host</code>・<code>max_concurrent_total</code> の上限に達していないか / <code>executor_type</code> が <code>shell</code>/<code>python_module</code> か (他は claim されません)。</td></tr>
+        <tr><td>タスクが <code>pending</code> のまま増える</td><td>その workload を担当する worker がいない (Workers 画面) / 優先度の高い別 workload に処理が食われている (priority を見直す)。</td></tr>
+        <tr><td>プラグインが読み込めない (PluginConfigError)</td><td><code>source_path</code> と <code>module</code> 名が正しいか / 依存が worker の venv に入っているか (<a href="plugin-sdk.html#依存パッケージ-requirementstxt">requirements は自動 install されません</a>)。</td></tr>
+        <tr><td><code>setup()</code> で落ちる</td><td><code>init_kwargs</code> の不足 / モデル・DB 接続の失敗 / GPU OOM (同居数を <code>max_concurrent_per_host</code> で絞る)。</td></tr>
+        <tr><td>self_loop が止まった</td><td>tick の自己 enqueue 前に worker が死んだ。watchdog が 300 秒アイドルで自動復活します。多重起動していないか (<code>max_concurrent_total: 1</code>) も確認。</td></tr>
+        <tr><td>コード変更が反映されない</td><td>worker の再起動 + <code>__pycache__/*.pyc</code> 削除を忘れていないか。<code>process()</code> はプロセス内キャッシュです。</td></tr>
+        <tr><td>失敗が消えず溜まる</td><td><code>max_attempts</code> 超過の dead-letter。原因を直し <code>reset-failed</code> で再投入。</td></tr>
+      </table>
+
+      <h2>FAQ</h2>
+      <ul>
+        <li><strong>Q. 依存を入れたのに ModuleNotFoundError。</strong> A. <em>制御プレーン</em>ではなく、そのプラグインを動かす<em>ワーカーの venv</em> に入れてください。deploy の <code>setup_command</code> に <code>pip install</code> を書くのが確実です。</li>
+        <li><strong>Q. 同じ pk が2回処理されたようだ。</strong> A. 仕様です。lease 失効やリトライで再実行され得ます。<code>process()</code> は冪等に書いてください。</li>
+        <li><strong>Q. GPU を使う workload だと明示したい。</strong> A. <code>requires_gpu: true</code> を立て、<code>host_affinity</code> で GPU ホストに寄せます (ランタイム強制ではなく配置設計の目安)。</li>
+        <li><strong>Q. PostgreSQL は使える?</strong> A. 現状未実装です。SQLite (既定) か MariaDB を使ってください。</li>
+        <li><strong>Q. 認証は?</strong> A. 初回起動時の <code>PIPELINE_ADMIN_PASSWORD</code> で管理者ログインを有効化できます。内部エンドポイント (<code>/api/v1/_internal/*</code>) は nginx 等で遮断する前提です。</li>
+      </ul>
+
       <nav class="docs-pager" id="docs-pager"></nav>
       <div class="docs-foot">
         <span>Pipeline — GUI-first batch fleet · <a href="https://paps-jp.github.io/" target="_blank" rel="noopener">ぱっぷすラボ</a></span>

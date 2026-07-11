@@ -207,6 +207,52 @@ def cleanup(state: Any) -> None:
         <tr><td>例外を <code>raise</code></td><td>失敗 (traceback / stderr が記録され、attempt 増加)。</td></tr>
       </table>
 
+      <h2 id="module-resolution">モジュール解決 (module / source_path / callable)</h2>
+      <p><code>python_module</code> の <code>executor_config</code> は3つの鍵でプラグインを特定します。</p>
+      <table>
+        <tr><th>鍵</th><th>意味</th></tr>
+        <tr><td><code>source_path</code></td><td>プラグインのディレクトリ。dev は <code>plugins/url_check</code>、本番は <code>/opt/pipeline/plugins/url_check</code> 等。</td></tr>
+        <tr><td><code>module</code></td><td>そのディレクトリ内の <code>.py</code> ファイル名 (拡張子なし)。<code>__init__.py</code> を持つサブパッケージ名でも可。</td></tr>
+        <tr><td><code>callable</code></td><td>呼ぶ関数名。既定 <code>process</code>。</td></tr>
+      </table>
+      <p>内部では <code>source_path</code> が <code>sys.path</code> 先頭に加わり (<code>from .lib import x</code> のような相対 import が効く)、<code>module</code> は <strong>プラグイン slug 込みのユニークな <code>sys.modules</code> キー</strong>でロードされます。</p>
+      <div class="callout warn">
+        <strong>同名モジュールの衝突に注意 (と、その対策):</strong> 2つのプラグインが両方 <code>dispatch_main.py</code> のような同名ファイルを持つと、素の <code>import</code> では <code>sys.modules</code> キャッシュを共有し、<strong>片方のコードが両方の workload で動いてしまう</strong>事故が起きます (実際に発生しました)。Pipeline は <code>source_path</code> 指定時に <code>spec_from_file_location</code> + slug 入りキーでロードしてこれを物理的に隔離します。つまり <strong>ファイル名は他プラグインと被っても安全</strong>ですが、可読性のため <code>main.py</code> 等の分かりやすい名前を推奨します。
+      </div>
+
+      <h2>依存パッケージ (requirements.txt)</h2>
+      <p><code>requirements.txt</code> は「このプラグインが必要とする依存」を書くための<strong>ドキュメント</strong>です。Pipeline はこれを<strong>自動 install しません</strong>。プラグインが外部ライブラリを使うなら、<strong>ワーカーの venv に事前に入っている</strong>必要があります。方法は3つ。</p>
+      <ul>
+        <li>ワーカーの venv に手で <code>pip install -r requirements.txt</code>。</li>
+        <li><a href="web-ui.html#deploy">Deploy</a> の <code>setup_command</code> に <code>pip install</code> を書いて配信時に流す。</li>
+        <li>fleet 共通の venv を使い、依存をそこへ集約する。</li>
+      </ul>
+      <p>標準ライブラリだけで書ければ依存ゼロで最も楽です (チュートリアルの <code>url_check</code> は <code>urllib</code> のみ)。</p>
+
+      <h2>エラー処理とリトライ設計</h2>
+      <ul>
+        <li><strong>失敗の表明は2通り。</strong> 一時的な障害 (ネットワーク・5xx・タイムアウト) は<strong>例外を <code>raise</code></strong> して <code>max_attempts</code> のリトライに乗せます。恒久的にダメな入力 (不正 URL・存在しない ID 等) は <code>{"_error": "..."}</code> を返して<strong>早々に確定</strong>させ、無駄なリトライを避けます。</li>
+        <li><strong>冪等性を前提に書く。</strong> lease 失効やリトライで、<strong>同じ pk が2回以上 <code>process()</code> される</strong>ことがあります。出力の書き込みは upsert / <code>INSERT IGNORE</code> にする、成果物のキーに pk を使う等で、二重実行しても壊れないようにします。</li>
+        <li><strong>時間を意識する。</strong> 長い処理は <code>ctx.deadline</code> を目安に切り上げます。<code>max_duration_ms</code> を設定すると超過を自動で失敗にできます。</li>
+        <li><strong>OOM の自己申告。</strong> エラー文言に CUDA OOM 系のシグネチャが含まれると、ワーカーが VRAM ピークを自己申告して以後の同時実行を絞ります。</li>
+      </ul>
+
+      <h2>ロギング</h2>
+      <p><code>print(...)</code> や <code>logging</code> の出力はワーカーの stdout/stderr に出て、<a href="web-ui.html#servicelog">ServiceLog</a> 画面に集約されます。プラグインでは <code>logging.getLogger("pipeline.plugin.url-check")</code> のように名前を付けると追いやすくなります。例外は自動で traceback が <code>runs</code> と ServiceLog に残ります。</p>
+
+      <h2>開発ループとローカルテスト</h2>
+      <p><code>process()</code> の実体は<strong>ワーカープロセス内にキャッシュ</strong>されます (重い <code>setup()</code> を毎回走らせないため)。したがって<strong>コードを直したらワーカーを再起動</strong>してください。dev は <code>pipeline run --dev</code> を Ctrl-C して起動し直すだけ、本番は該当ホストの worker を restart し、<code>__pycache__/*.pyc</code> を消してから上げ直します。</p>
+      <p>fleet に載せる前に、<code>process()</code> は普通の関数として単体で叩けます。</p>
+      <pre><code>python3 - &lt;&lt;'PY'
+from types import SimpleNamespace
+import main                       # plugins/url_check/ で実行
+state = main.setup(timeout_secs=5)
+task  = SimpleNamespace(pk="https://example.com", extra={}, attempt=1, workload_slug="url-check")
+ctx   = SimpleNamespace(deadline=None, workdir="/tmp", env={}, workload_config={})
+print(main.process(task, ctx, state))
+PY</code></pre>
+      <p>手順を通しで体験するには <a href="tutorial.html#ステップ4-自作プラグインを書く">チュートリアルのステップ4〜5</a> をどうぞ。</p>
+
       <h2>バッチ処理 (任意)</h2>
       <p><code>process_batch(tasks, ctx, state)</code> を export すると、worker は <code>batch_size</code> に応じて複数タスクをまとめて渡します。戻り値の list 長は <code>len(tasks)</code> と一致させてください (不一致は全件失敗)。GPU 推論など、まとめた方が効率が良い plugin 向けです。</p>
       <pre><code>def process_batch(tasks: list, ctx: Any, state: Any) -> list[dict]:
