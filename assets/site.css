@@ -130,6 +130,26 @@ header .gh:hover { background: rgba(255, 255, 255, 0.25); }
   margin: 0 auto 28px; max-width: 640px;
 }
 .hero .cta-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.hero .hero-demo {
+  display: block;
+  width: 100%;
+  max-width: 780px;
+  margin: 44px auto 0;
+  border-radius: 12px;
+  background: #1c1a24;
+  aspect-ratio: 928 / 492;
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    0 12px 40px rgba(70, 60, 120, 0.18);
+  border: 1px solid var(--border-soft);
+}
+.hero .hero-demo-caption {
+  max-width: 780px;
+  margin: 12px auto 0;
+  font-size: 0.86rem;
+  color: var(--fg-dim);
+  text-align: center;
+}
 .btn {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 11px 22px; border-radius: 8px;
