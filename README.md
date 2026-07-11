@@ -1,6 +1,6 @@
 # Pipeline
 
-> 空きGPUをバッチで埋め尽くす軽量 batch fleet — MIG が使えない GPU (RTX 4090 / A6000 / L4 等)
+> アイドル中のGPUを余すところなく使う軽量 batch fleet — MIG が使えない GPU (RTX 4090 / A6000 / L4 等)
 > でも、 1 枚に複数 workload を同居させて、 単一ジョブでは 40-60% アイドルになる GPU を取り戻す。
 > 1-10 GPU の AI チーム向け。
 
