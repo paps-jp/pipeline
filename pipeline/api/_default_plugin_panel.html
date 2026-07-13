@@ -570,8 +570,25 @@ async function tick() {
   }
 }
 
-tick();
-setInterval(tick, POLL_MS);
+// Page Visibility: フォアグラウンドで開いてる間だけ polling する。
+// polling が worker plugin への「観察者いるよ」ハートビート = state/blob GET を
+// 送るタイミング。 タブ非表示 / 別タブ移動 / タブ close で polling を止めると、
+// サーバ側 TTL が切れて worker が live preview PUT を発火しなくなる (throughput 優先)。
+let pollTimer = null;
+function startPolling() {
+  if (pollTimer) return;
+  tick();
+  pollTimer = setInterval(tick, POLL_MS);
+}
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") startPolling();
+  else stopPolling();
+});
+window.addEventListener("pagehide", stopPolling);
+if (document.visibilityState === "visible") startPolling();
 </script>
 
 </body>

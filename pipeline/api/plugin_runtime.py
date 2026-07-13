@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,20 @@ from pydantic import BaseModel
 
 log = logging.getLogger("pipeline.api.plugin_runtime")
 router = APIRouter(prefix="/api/v1/plugins", tags=["plugin_runtime"])
+
+# ── presence tracking ─────────────────────────────────────────────
+# Panel HTML の GET (= 「今誰か見てる」 の代理シグナル) を受けた瞬間に
+# _observers[slug] = 期限 monotonic をセット。 worker plugin は
+# GET /preview_active で 「見てる観察者いる?」 を問い合わせて live preview
+# の PUT を発火するかどうか決める (= throughput 優先で押さえる)。
+# in-memory・プロセスローカル。 再起動で揮発 (= 起動直後は "見てない" 扱い)。
+_OBSERVER_TTL_S = 60.0
+_observers: dict[str, float] = {}
+
+
+def _touch_observer(slug: str) -> None:
+    """state/blob GET を受けたら呼ぶ。 slug は _canonical_slug 通過後を渡す。"""
+    _observers[slug] = time.monotonic() + _OBSERVER_TTL_S
 
 # key は英数 / _ / - / . / / のみ許可 (パストラバーサル防止)
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
@@ -97,6 +112,7 @@ def get_state(slug: str, key: str, request: Request) -> dict[str, Any]:
     _check_slug(slug)
     _check_key(key)
     slug = _canonical_slug(slug)
+    _touch_observer(slug)
     db = request.app.state.db
     with db.transaction() as conn:
         cur = conn.execute(
@@ -115,6 +131,7 @@ def list_state(slug: str, request: Request) -> dict[str, Any]:
     """slug 配下の全 state を { key: {value, updated_at} } で返す。"""
     _check_slug(slug)
     slug = _canonical_slug(slug)
+    _touch_observer(slug)
     db = request.app.state.db
     with db.transaction() as conn:
         cur = conn.execute(
@@ -187,6 +204,7 @@ def get_blob(slug: str, key: str, request: Request) -> Response:
     _check_slug(slug)
     _check_key(key)
     slug = _canonical_slug(slug)
+    _touch_observer(slug)
     db = request.app.state.db
     with db.transaction() as conn:
         cur = conn.execute(
@@ -219,6 +237,28 @@ def delete_blob(slug: str, key: str, request: Request) -> Response:
             {"s": slug, "k": key},
         )
     return Response(status_code=204)
+
+
+# ---------------- presence check (live preview 発火判定) ----------------
+
+
+@router.get("/{slug}/preview_active")
+def preview_active(slug: str) -> dict[str, Any]:
+    """worker plugin が「今 panel を見てる観察者がいるか?」を問い合わせる。
+
+    state/blob の GET を受けた瞬間から _OBSERVER_TTL_S 秒間 active=True。
+    タブが閉じられる/別タブに移ると panel HTML の polling が止まり、 TTL 切れで
+    active=False に戻る。 worker はこれを見て live preview の PUT を発火するかどうか
+    決める (= 見てない時は throughput 優先で SQLite 書込を減らす)。
+    """
+    _check_slug(slug)
+    slug = _canonical_slug(slug)
+    exp = _observers.get(slug)
+    now = time.monotonic()
+    if exp and now < exp:
+        return {"active": True, "remaining_s": round(exp - now, 1),
+                "ttl_s": _OBSERVER_TTL_S}
+    return {"active": False, "remaining_s": None, "ttl_s": _OBSERVER_TTL_S}
 
 
 # ---------------- web (静的配信) ----------------
