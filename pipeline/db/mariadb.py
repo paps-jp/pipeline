@@ -17,6 +17,9 @@ workload.queue_backend ('sqlite' or 'mariadb') で transaction を切替える�
 
 from __future__ import annotations
 
+import logging
+import os
+import queue
 import re
 import threading
 from contextlib import contextmanager
@@ -26,6 +29,8 @@ from typing import Any, Iterator
 from urllib.parse import unquote, urlparse
 
 from pipeline.db.base import Connection, Cursor, Database
+
+log = logging.getLogger("pipeline.db.mariadb")
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +170,20 @@ class MariadbConnection(Connection):
 
 
 class MariadbDatabase(Database):
-    def __init__(self, url: str) -> None:
+    """MariaDB connection pool (LifoQueue ベース、 thread safe)。
+
+    元は「単一 connection を RLock で直列化」だった。 これだと全 API request が
+    1 個の DB 接続を順番待ちで使い、 workers 16 台 + dispatcher 同時アクセス時に
+    2-3 秒の serialization latency が発生していた (POST /tasks/batch 実測 2.8s、
+    直 SQL は 0.4ms)。 pool 化で並列度を上げる。
+
+    - pool_size は env `PIPELINE_MARIADB_POOL_SIZE` で調整可 (既定 16)。
+    - LifoQueue: warm な接続を優先再利用 (idle timeout 対策)。
+    - transaction() の finally で必ず return_conn (broken=True で drop)。
+    - transaction 途中の例外 → rollback 試行 → 失敗なら broken 判定で drop & 新規作成。
+    """
+
+    def __init__(self, url: str, pool_size: int | None = None) -> None:
         self.url = url
         parsed = urlparse(url)
         self._host = parsed.hostname or "localhost"
@@ -176,9 +194,22 @@ class MariadbDatabase(Database):
         self._db = (parsed.path or "/").lstrip("/")
         if not self._db:
             raise ValueError(f"mariadb URL に database 名が無い: {url!r}")
-        # transaction 単位の lock (= 1 connection 共有 + thread safe)
-        self._lock = threading.RLock()
-        self._conn = self._make_conn()
+        # pool_size: default 16 (LAN + workers=16 + dispatcher + supervisor で 20 未満が典型)
+        env_size = os.environ.get("PIPELINE_MARIADB_POOL_SIZE")
+        if pool_size is None:
+            pool_size = int(env_size) if env_size and env_size.isdigit() else 16
+        self._pool_size = max(1, pool_size)
+        # LifoQueue: 直近使った warm 接続を優先取得 → idle-timeout で切られる確率が減る
+        self._pool: queue.LifoQueue = queue.LifoQueue(maxsize=self._pool_size)
+        self._created_lock = threading.Lock()
+        self._created = 0
+        # DDL 等の従来 self._conn 直叩き経路の後方互換のため 1 本を保持
+        # (ensure_workload_queue は起動時 1 回だけなので直列でも OK)
+        self._ddl_lock = threading.Lock()
+        self._ddl_conn = self._make_conn()
+        # 統計 (可視化用): pool 待ち回数と累計待ち時間
+        self._pool_stats = {"acquire_wait_count": 0, "acquire_wait_total_s": 0.0}
+        log.info("mariadb pool: size=%d host=%s db=%s", self._pool_size, self._host, self._db)
 
     def _make_conn(self):
         import pymysql
@@ -188,6 +219,68 @@ class MariadbDatabase(Database):
             database=self._db, autocommit=False,
             charset="utf8mb4",
         )
+
+    def _acquire(self, timeout: float = 30.0):
+        """pool から 1 本取得。 なければ pool_size 未満の間は新規作成、
+        pool 満杯 & 全部使用中なら timeout 秒待つ (= max_concurrent の役目)。"""
+        # (a) 空きがあれば即取得
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            pass
+        # (b) 上限未満なら新規作成
+        with self._created_lock:
+            if self._created < self._pool_size:
+                self._created += 1
+                try:
+                    return self._make_conn()
+                except Exception:
+                    self._created -= 1
+                    raise
+        # (c) 満杯 → 待つ
+        import time
+        t0 = time.monotonic()
+        try:
+            conn = self._pool.get(timeout=timeout)
+        finally:
+            elapsed = time.monotonic() - t0
+            self._pool_stats["acquire_wait_count"] += 1
+            self._pool_stats["acquire_wait_total_s"] += elapsed
+        return conn
+
+    def _release(self, conn, broken: bool = False) -> None:
+        """conn を pool へ戻す。 broken=True なら close + created counter を減らす。"""
+        if broken:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._created_lock:
+                self._created = max(0, self._created - 1)
+            return
+        try:
+            self._pool.put_nowait(conn)
+        except queue.Full:
+            # pool が満杯なら close (通常は起きない = _acquire で足したものが必ず戻る)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._created_lock:
+                self._created = max(0, self._created - 1)
+
+    def pool_stats(self) -> dict[str, Any]:
+        """pool 統計を返す (可視化・トラブルシュート用)。"""
+        with self._created_lock:
+            created = self._created
+        return {
+            "pool_size": self._pool_size,
+            "in_use": created - self._pool.qsize(),
+            "idle_in_pool": self._pool.qsize(),
+            "total_created": created,
+            "acquire_wait_count": self._pool_stats["acquire_wait_count"],
+            "acquire_wait_total_s": round(self._pool_stats["acquire_wait_total_s"], 3),
+        }
 
     def ensure_schema(self) -> None:
         """control plane schema は SQLite 側、 MariaDB は queue table のみ管理。
@@ -218,39 +311,74 @@ CREATE TABLE IF NOT EXISTS {queue_table} (
     KEY {queue_table}_idx_claim (state, claimed_at, attempt, pk)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
-        cur = self._conn.cursor()
-        try:
-            for stmt in ddl.split(";"):
-                stmt = stmt.strip()
-                if stmt:
-                    cur.execute(stmt)
-            self._conn.commit()
-        finally:
-            cur.close()
+        with self._ddl_lock:
+            try:
+                self._ddl_conn.ping(reconnect=True)
+            except Exception:
+                try:
+                    self._ddl_conn.close()
+                except Exception:
+                    pass
+                self._ddl_conn = self._make_conn()
+            cur = self._ddl_conn.cursor()
+            try:
+                for stmt in ddl.split(";"):
+                    stmt = stmt.strip()
+                    if stmt:
+                        cur.execute(stmt)
+                self._ddl_conn.commit()
+            finally:
+                cur.close()
 
     @contextmanager
     def transaction(self) -> Iterator[MariadbConnection]:
-        # 1 connection を thread lock で直列化。 sqlite.py と同型。
-        with self._lock:
-            # 接続切れ時は ping reconnect (= server timeout 8h 等 対策)
+        # pool から 1 接続を借りて、 finally で必ず返す。
+        # 例外時は rollback を試みて、 失敗したら broken 扱いで pool から除外。
+        conn = self._acquire()
+        # 接続切れ時は ping reconnect (= server timeout 8h 等 対策)
+        try:
+            conn.ping(reconnect=True)
+        except Exception:
             try:
-                self._conn.ping(reconnect=True)
+                conn.close()
             except Exception:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
-                self._conn = self._make_conn()
-            wrapper = MariadbConnection(self._conn)
+                pass
+            with self._created_lock:
+                self._created = max(0, self._created - 1)
+            conn = self._acquire()  # 新しく作られる (or 別の warm を取得)
             try:
-                yield wrapper
-                self._conn.commit()
+                conn.ping(reconnect=True)
             except Exception:
-                self._conn.rollback()
+                # 2 回目も失敗 = 深刻。 broken で返して例外伝播
+                self._release(conn, broken=True)
                 raise
+        wrapper = MariadbConnection(conn)
+        broken = False
+        try:
+            yield wrapper
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                # rollback 自体が失敗 = connection state 不定 → drop
+                broken = True
+            raise
+        finally:
+            self._release(conn, broken=broken)
 
     def close(self) -> None:
         try:
-            self._conn.close()
+            self._ddl_conn.close()
         except Exception:
             pass
+        # pool 内の全 idle connection を close
+        while True:
+            try:
+                c = self._pool.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                c.close()
+            except Exception:
+                pass
