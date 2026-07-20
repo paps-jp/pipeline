@@ -35,15 +35,15 @@ nodes:
   url: http://192.0.2.34:8000
 - id: paprika-image-pull
   kind: workload
-  x: 590
+  x: 578
   y: -235
   label: 画像 pull
   icon: photo
   workload_slug: paprika-image-pull
 - id: crawl_image
   kind: tank
-  x: 768
-  y: -62
+  x: 598
+  y: -69
   label: crawl_image (未hash)
   icon: photo
   metric_sql: SELECT COUNT(*) FROM crawl_image WHERE hash_id IS NULL AND ignore_reason
@@ -51,15 +51,15 @@ nodes:
   capacity_warn: 500000000
 - id: image-dispatcher
   kind: workload
-  x: 920
-  y: -287
+  x: 922
+  y: -245
   label: 画像 dispatch
   icon: arrows-split
   workload_slug: image-dispatcher
 - id: image_hash_extract_queue
   kind: tank
-  x: 938
-  y: -434
+  x: 942
+  y: -433
   label: img_hash_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM image_hash_extract_queue WHERE state='pending'
@@ -88,8 +88,8 @@ nodes:
   workload_slug: image-embed
 - id: paprika-video-pull
   kind: workload
-  x: 310
-  y: -56
+  x: 316
+  y: -58
   label: 動画 pull
   icon: video
   workload_slug: paprika-video-pull
@@ -183,8 +183,8 @@ nodes:
   capacity_warn: 500000000
 - id: image_dispatcher_queue
   kind: tank
-  x: 943
-  y: -143
+  x: 941
+  y: -65
   label: img_dispatch_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM image_dispatcher_queue WHERE state='pending'
@@ -215,16 +215,16 @@ nodes:
   capacity_warn: 50000
 - id: paprika_image_pull_queue
   kind: tank
-  x: 610
-  y: -401
+  x: 599
+  y: -426
   label: papri_img_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM paprika_image_pull_queue WHERE state='pending'
   capacity_warn: 50000
 - id: paprika_video_pull_queue
   kind: tank
-  x: 19
-  y: 112
+  x: 51
+  y: -64
   label: papri_video_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM paprika_video_pull_queue WHERE state='pending'
@@ -247,8 +247,8 @@ nodes:
   capacity_warn: 50000
 - id: minio-image-ram
   kind: tank
-  x: 550
-  y: -93
+  x: 609
+  y: 140
   label: 画像RAM (.47)
   icon: database
   metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
@@ -256,8 +256,8 @@ nodes:
   capacity_warn: 100
 - id: minio-video-ram
   kind: tank
-  x: 30
-  y: -108
+  x: 47
+  y: 141
   label: 動画RAM (.48)
   icon: database
   metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
