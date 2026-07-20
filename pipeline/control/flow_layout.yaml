@@ -374,23 +374,3 @@ edges:
   to: paprika_job_submit_queue
 - from: paprika_job_submit_queue
   to: paprika-job-submit
-- from: paprika-hub
-  to: minio-image-ram
-  label: MB/min
-  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(GREATEST(net_bytes_per_min,0)/1048576,1),
-    0) FROM storage_capacity WHERE name='image-ram-47'
-- from: minio-image-ram
-  to: paprika-image-pull
-  label: MB/min
-  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(GREATEST(-net_bytes_per_min,0)/1048576,1),
-    0) FROM storage_capacity WHERE name='image-ram-47'
-- from: paprika-hub
-  to: minio-video-ram
-  label: MB/min
-  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(GREATEST(net_bytes_per_min,0)/1048576,1),
-    0) FROM storage_capacity WHERE name='video-ram-48'
-- from: minio-video-ram
-  to: paprika-video-pull
-  label: MB/min
-  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(GREATEST(-net_bytes_per_min,0)/1048576,1),
-    0) FROM storage_capacity WHERE name='video-ram-48'
