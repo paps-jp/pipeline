@@ -273,6 +273,31 @@ def create_app(settings: Settings) -> FastAPI:
                     pass
         hub_rate_task = _asyncio.create_task(_hub_submit_rate_loop())
 
+        # ストレージ使用量 (2026-07-21): RAM ディスク MinIO (.47 画像 / .48 動画) と
+        # .17 raw の容量を 60s 毎に storage_capacity へ upsert する。 flow の tank ノードは
+        # metric_sql でこの表を引くだけなので、 snapshot API は MinIO を一切叩かない。
+        #
+        # ここを snapshot 内で同期呼び出しにしてはいけない: 2026-07-20 に .47 が
+        # 「TCP は受けるが HTTP 無応答」 のハングを起こしており、 その状態で snapshot が
+        # MinIO を待つとダッシュボード全体が固まる。 収集は必ず此処で隔離する。
+        _storage_stop = _asyncio.Event()
+
+        async def _storage_capacity_loop() -> None:
+            from pipeline.repositories.storage_capacity import (
+                StorageCapacityRepository as _SCR,
+            )
+            while not _storage_stop.is_set():
+                try:
+                    # MinIO SDK は同期 API なのでスレッドへ逃がす (event loop を塞がない)。
+                    await _asyncio.to_thread(_SCR.collect_and_upsert)
+                except Exception:
+                    log.exception("storage capacity loop failed")
+                try:
+                    await _asyncio.wait_for(_storage_stop.wait(), timeout=60)
+                except _asyncio.TimeoutError:
+                    pass
+        storage_task = _asyncio.create_task(_storage_capacity_loop())
+
         try:
             yield
         finally:
@@ -283,12 +308,17 @@ def create_app(settings: Settings) -> FastAPI:
             _maintenance_stop.set()
             _flow_rate_stop.set()
             _hub_rate_stop.set()
+            _storage_stop.set()
             try:
                 await _asyncio.wait_for(flow_rate_task, timeout=3)
             except Exception:
                 pass
             try:
                 await _asyncio.wait_for(hub_rate_task, timeout=3)
+            except Exception:
+                pass
+            try:
+                await _asyncio.wait_for(storage_task, timeout=3)
             except Exception:
                 pass
             try:

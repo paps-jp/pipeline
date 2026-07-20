@@ -252,6 +252,35 @@ nodes:
   icon: list
   metric_sql: SELECT COUNT(*) FROM paprika_job_submit_queue WHERE state='pending'
   capacity_warn: 50000
+# ---- RAM ディスク MinIO の容量 (2026-07-21 追加) ----
+# hub が書き pull が読んで消す一時素材置き場。 満杯になるとホストごと道連れになり
+# (2026-07-20: .47 が TCP は受けるが HTTP 無応答 → 画像取込が 300s 単位で全停止)、
+# しかも hub の /info や /jobs は MariaDB 由来で正常応答するため気付きにくい。
+# 値は control plane の _storage_capacity_loop が 60s 毎に storage_capacity へ upsert する
+# (snapshot API から MinIO を直接叩くと、 ハング時にダッシュボードごと固まるため隔離)。
+#
+# pct_used(0-100) を読み capacity_warn: 100 と組にする = 総容量が変わっても此処を直さずに済む。
+# 収集に失敗したストアは行が更新されないので、 stale(>5分) は 100 を返して overflow 表示に
+# 倒す。 黙って古い値を出すと「見えているのに死んでいる」 状態を再現してしまうため、
+# 応答不能はタンク満杯と同じ強さで警告する。
+- id: minio-image-ram
+  kind: tank
+  x: 839
+  y: -74
+  label: 画像RAM (.47)
+  icon: database
+  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
+    storage_capacity WHERE name='image-ram-47'
+  capacity_warn: 100
+- id: minio-video-ram
+  kind: tank
+  x: 100
+  y: 74
+  label: 動画RAM (.48)
+  icon: database
+  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
+    storage_capacity WHERE name='video-ram-48'
+  capacity_warn: 100
 edges:
 - from: paprika-links-pull
   to: crawl
