@@ -169,6 +169,30 @@ class RunsRepository:
             rows = cur.fetchall()
         return [self._row(r) for r in rows]
 
+    def list_running(self, limit: int = 300) -> list[dict[str, Any]]:
+        """実行中 (= finished_at IS NULL) の run だけを返す。
+
+        list_recent(limit) を取ってから finished_at で絞る方式だと、 高スループット
+        workload (= image-embed 等) の完了済み run が枠を食い尽くし、 低頻度
+        workload の実行中 run がダッシュボードから消える。 絞り込みを SQL 側に
+        寄せることで、 枠は 「実行中の run」 だけで共有される。
+        """
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, workload_slug, pk, worker_id, attempt,
+                       started_at, finished_at, success, exit_code, duration_ms,
+                       stdout, stderr, output_json, error
+                FROM runs
+                WHERE finished_at IS NULL
+                ORDER BY started_at DESC, id DESC
+                LIMIT :lim
+                """,
+                {"lim": int(limit)},
+            )
+            rows = cur.fetchall()
+        return [self._row(r) for r in rows]
+
     def list_since(self, started_after_iso: str) -> list[dict[str, Any]]:
         # 時刻ベース取得。 limit ベースだと高頻度 workload (= image-embed) が枠を
         # 食い尽くし、 長 interval workload (= paprika-links-pull) の最新 run を

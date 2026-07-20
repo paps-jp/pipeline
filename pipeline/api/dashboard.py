@@ -85,10 +85,9 @@ def overview(request: Request) -> OverviewResponse:
         # mariadb backend の queue は depth/count も secondary から取る
         queue_repo.wire_from_workloads(workloads_repo.list_all())
 
-    # 1. running は recent から、 failures は別 query (= 高スループット workload で
-    #    recent window が成功 run で埋まり failure が見えなくなるのを防ぐ)
-    recent = runs_repo.list_recent(limit=300)
-
+    # 1. running / failures はそれぞれ別 query。 まとめて recent window から
+    #    絞ると、 高スループット workload (= image-embed 等) の run が 300 枠を
+    #    食い尽くし、 他 workload の実行中 run と failure が表示から消える。
     running = [
         RunningRun(
             id=r["id"],
@@ -98,8 +97,7 @@ def overview(request: Request) -> OverviewResponse:
             attempt=r["attempt"],
             started_at=r["started_at"],
         )
-        for r in recent
-        if r.get("finished_at") is None
+        for r in runs_repo.list_running(limit=300)
     ]
 
     failures = [
