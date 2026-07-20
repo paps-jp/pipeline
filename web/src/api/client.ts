@@ -350,6 +350,8 @@ export interface FlowNode {
   pending?: number | null;
   capacity_warn?: number | null;
   fill_ratio?: number | null;
+  /** 件数以外の tank (= RAM ディスクの GB 等) の単位表記。値の後ろに付ける。 */
+  unit?: string | null;
   error?: string | null;
   error_worker?: string | null;
 }

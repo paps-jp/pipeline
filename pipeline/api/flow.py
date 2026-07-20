@@ -54,9 +54,11 @@ class FlowNode(BaseModel):
     last_run_at: str | None = None
     last_output: dict[str, Any] | None = None
     adapt: dict[str, Any] | None = None
-    pending: int | None = None
-    capacity_warn: int | None = None
+    pending: float | None = None
+    capacity_warn: float | None = None
     fill_ratio: float | None = None
+    # 件数以外の tank (= RAM ディスクの GB 等) の単位表記。 UI が値の後ろに付けるだけ。
+    unit: str | None = None
     error: str | None = None
     # workload の最新 run が失敗した時のエラー文言 + 実行 worker (= GPU故障等の緊急検知用)。
     # tank と違い workload node ではこれまで未設定だった (state=failed だけ)。
@@ -189,10 +191,16 @@ def _read_db_cfg() -> dict[str, Any] | None:
     return cfg
 
 
-def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[int | None, str | None]]:
+def _coerce_num(raw: Any) -> float | int:
+    """SQL の 1 セルを数値化する。 整数値は int、 小数は float (Decimal も通す)。"""
+    f = float(raw)
+    return int(f) if f.is_integer() else f
+
+
+def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[float | None, str | None]]:
     """tank_id → (value, error) を 1 接続でまとめて返す。 cache + DB 接続失敗時は全 tank に error。"""
     now = time.monotonic()
-    results: dict[str, tuple[int | None, str | None]] = {}
+    results: dict[str, tuple[float | None, str | None]] = {}
     to_query: dict[str, str] = {}
 
     # 1. cache から取れるものは取る
@@ -251,7 +259,9 @@ def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[int | None, str | 
                 pass  # 古い MariaDB / 権限なし でも続行
             cur.execute(sql)
             row = cur.fetchone()
-            v = int(row[0]) if row and row[0] is not None else 0
+            # COUNT(*) は int だが、 容量系 tank は GB 等の小数を返す。 整数なら int の
+            # まま返して既存 tank の表示 (= 桁区切り無しの件数) を変えない。
+            v = _coerce_num(row[0]) if row and row[0] is not None else 0
             results[tid] = (v, None)
             with _tank_cache_lock:
                 _tank_cache[tid] = (now, v, None)
@@ -466,6 +476,10 @@ def snapshot(req: Request) -> FlowSnapshot:
     for n in nodes_raw:
         if n.get("kind") == "tank" and n.get("metric_sql"):
             tank_sqls[n["id"]] = n["metric_sql"]
+        # 総容量も DB から引く tank (= RAM ディスクの total_bytes)。 yaml の
+        # capacity_warn に固定値を書くと、 ディスクを拡張した時に嘘の分母になる。
+        if n.get("kind") == "tank" and n.get("capacity_sql"):
+            tank_sqls[f"__cap{n['id']}"] = n["capacity_sql"]
     for i, e in enumerate(edges_raw):
         if e.get("metric_sql"):
             tank_sqls[f"__edge{i}"] = e["metric_sql"]
@@ -484,6 +498,7 @@ def snapshot(req: Request) -> FlowSnapshot:
             workload_slug=n.get("workload_slug"),
             url=n.get("url"),
             capacity_warn=n.get("capacity_warn"),
+            unit=n.get("unit"),
         )
         if node.kind == "workload":
             slug = node.workload_slug or node.id
@@ -538,6 +553,12 @@ def snapshot(req: Request) -> FlowSnapshot:
             v, err = tank_results.get(node.id, (None, "no metric"))
             node.pending = v
             node.error = err
+            # capacity_sql が取れた時だけ分母を差し替える。 失敗時は yaml の
+            # capacity_warn (= 保険の固定値) にフォールバックして液面を出し続ける。
+            if n.get("capacity_sql"):
+                cap, cap_err = tank_results.get(f"__cap{node.id}", (None, "no capacity"))
+                if cap_err is None and cap:
+                    node.capacity_warn = cap
             if v is not None and node.capacity_warn:
                 node.fill_ratio = min(1.0, v / float(node.capacity_warn))
         nodes.append(node)

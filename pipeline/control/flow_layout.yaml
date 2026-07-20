@@ -251,8 +251,11 @@ nodes:
   y: 140
   label: 画像RAM (.47)
   icon: database
-  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
-    storage_capacity WHERE name='image-ram-47'
+  unit: GB
+  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(used_bytes/1073741824,1),
+    ROUND(total_bytes/1073741824,1)) FROM storage_capacity WHERE name='image-ram-47'
+  capacity_sql: SELECT ROUND(total_bytes/1073741824,1) FROM storage_capacity WHERE
+    name='image-ram-47'
   capacity_warn: 100
 - id: minio-video-ram
   kind: tank
@@ -260,8 +263,11 @@ nodes:
   y: 141
   label: 動画RAM (.48)
   icon: database
-  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
-    storage_capacity WHERE name='video-ram-48'
+  unit: GB
+  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(used_bytes/1073741824,1),
+    ROUND(total_bytes/1073741824,1)) FROM storage_capacity WHERE name='video-ram-48'
+  capacity_sql: SELECT ROUND(total_bytes/1073741824,1) FROM storage_capacity WHERE
+    name='video-ram-48'
   capacity_warn: 100
 edges:
 - from: paprika-links-pull

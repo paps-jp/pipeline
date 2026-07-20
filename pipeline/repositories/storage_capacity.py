@@ -10,8 +10,12 @@
 エンドポイント (`/minio/v2/metrics/*`) は 403 で使えなかった。 admin API は通常の
 access/secret key で署名すれば通る。
 
-tank は `pct_used` (0-100) を読み、 `capacity_warn: 100` と組で使う想定。 総容量が
-変わっても YAML を直さずに済む。
+tank は `used_bytes` を GB に直して読み、 分母は `capacity_sql` (= `total_bytes`) から
+引く。 パーセントより実容量の方が 「あと何 GB 空いているか」 が直に読めるため。
+分母も DB 由来なので、 RAM ディスクを拡張しても YAML を直さずに済む。
+
+収集が止まった時 (= `updated_at` が 5 分以上前) は used に total を代入して満杯表示に
+倒す。 応答不能はタンク満杯と同じ強さで警告する ([[minio-47-ramdisk-hang]])。
 """
 from __future__ import annotations
 
