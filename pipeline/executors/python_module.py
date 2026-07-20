@@ -259,11 +259,20 @@ class PythonModuleExecutor:
         return results
 
     def close(self) -> None:
-        """worker shutdown / config 変更時に呼ぶ。plugin の cleanup() を呼ぶ。"""
-        cleanup_fn = getattr(self._module, "cleanup", None)
-        if callable(cleanup_fn):
-            try:
-                cleanup_fn(self._state)
-            except Exception:
-                log.exception("plugin %s.cleanup raised; ignored", self._module_name)
+        """worker shutdown / config 変更 (= filter 変更 / eviction) 時に呼ぶ。
+
+        plugin の後始末フックを呼ぶ。 プラグイン間で命名が割れており
+        (`cleanup` 派 = image_embed 等 / `teardown` 派 = paprika_* 全般)、
+        歴史的に executor は `cleanup` しか呼んでいなかったため、 `teardown` を
+        名乗る plugin (= paprika-image-pull 含む) は eviction しても常駐プール /
+        MariaDB 接続が閉じられず leak していた (2026-07-21 の "Too many connections"
+        インシデントの直接原因)。 両方を試して、 存在する方を呼ぶ。
+        """
+        for _hook in ("cleanup", "teardown"):
+            fn = getattr(self._module, _hook, None)
+            if callable(fn):
+                try:
+                    fn(self._state)
+                except Exception:
+                    log.exception("plugin %s.%s raised; ignored", self._module_name, _hook)
         self._state = None

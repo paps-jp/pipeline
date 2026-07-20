@@ -137,6 +137,24 @@ class WorkerRepository:
                 raise WorkerNotFound(worker_id)
         return self.get(worker_id)
 
+    def stamp_claim(self, worker_id: str, slug: str) -> None:
+        """claim 成功時に呼ぶ。 「この worker が今 slug を回している」耐久印を打つ。
+
+        current_workload は task 実行中しかセットされないため同時実行カウントに
+        使えない。 こちらは claim の度に更新され freshness window 内なら「稼働中」と
+        数えられる (= max_concurrent_per_host / _total の信頼できる根拠)。
+        best-effort: 失敗しても claim 自体は成立させたいので握り潰す。
+        """
+        now = _utcnow_iso()
+        try:
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE workers SET claimed_slug = :s, claimed_slug_at = :now WHERE id = :id",
+                    {"s": slug, "now": now, "id": worker_id},
+                )
+        except Exception:
+            pass
+
     def deregister(self, worker_id: str) -> None:
         with self.db.transaction() as conn:
             conn.execute("DELETE FROM workers WHERE id = :id", {"id": worker_id})

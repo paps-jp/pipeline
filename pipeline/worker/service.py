@@ -913,9 +913,20 @@ class WorkerDaemon:
                 log.info("preempt: higher-priority workload pending; yielding from %s (p=%d)",
                          w["slug"], current_priority)
                 break
-        # 削除/disable された workload の executor を解放
+        # server が今 cycle offer しなかった workload の executor を解放。
+        # 判定は「offer された slug 集合」を workloads から直接作る (= seen_slugs は
+        # preempt の early break で未完成になりうるため使わない)。
+        # offer されなくなる契機:
+        #   - workload の削除 / disable
+        #   - filter から外れた
+        #   - max_concurrent_per_host / _total の cap に他 worker が既に達している
+        #     (= 自分は非 holder。 2026-07-21 の二重稼働時、 free worker がここで
+        #      image-pull を手放せず常駐 MariaDB 接続を leak し続けた真因の片割れ)
+        # eviction は _close_executor → plugin の cleanup/teardown を呼び、 常駐プール
+        # と DB 接続を閉じる (= displaced self_loop worker の後始末)。
+        offered_slugs = {w["slug"] for w in workloads}
         for slug in list(self._executor_cache):
-            if slug not in seen_slugs:
+            if slug not in offered_slugs:
                 self._evict_if_cached(slug)
         return any_work
 

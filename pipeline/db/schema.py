@@ -99,6 +99,14 @@ WORKERS_ALTERS = [
     # NULL = env 未設定 (= 全 workload claim 可)。 LLM advisor が dual filter を作る
     # ときに「env 由来の slug を奪わない」 ための基盤。
     "ALTER TABLE workers ADD COLUMN env_filter TEXT",             # JSON list[str] or NULL
+    # 直近に claim した workload slug と、その時刻 (= 耐久的な「この worker が今この
+    # slug を回している」印)。 current_workload は task 実行中しかセットされず batch 間で
+    # None に戻る (= 過小カウント) ため、 max_concurrent_per_host / _total の同時実行
+    # ガードには使えない。 claim 成功時に stamp し、 freshness window 内なら「稼働中」と
+    # 数える。 これで per-host cap を GET /workloads(勧告)と POST /claim(強制)の
+    # 両方で信頼できる形に揃える (2026-07-21 二重稼働→接続 leak 対策)。
+    "ALTER TABLE workers ADD COLUMN claimed_slug TEXT",
+    "ALTER TABLE workers ADD COLUMN claimed_slug_at TEXT",        # ISO8601 UTC
 ]
 
 

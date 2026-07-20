@@ -261,11 +261,23 @@ def _host_matches_affinity(worker_host: str | None,
 
 
 def _host_family(worker_host: str) -> str:
-    """systemd instance suffix を剥がして "ai-gpu1-3" → "ai-gpu1" にする。
-    suffix が数字以外なら原文をそのまま返す (= "delian-prod" 等は触らない)。
+    """systemd instance suffix を剥がして物理ホスト単位にまとめる。
+    GPU instance  "ai-gpu1-3"    → "ai-gpu1"
+    CPU instance  "ai-gpu1-cpu4" → "ai-gpu1"
+    suffix がどちらでもなければ原文のまま (= "delian-prod" / "nas-c2-cpu" 等は触らない)。
+
+    注意: 以前は数字 suffix (`-3`) しか剥がしていなかったため、 CPU worker の
+    "ai-gpu1-cpu2" と "ai-gpu1-cpu4" が別 family 扱いになり、
+    `max_concurrent_per_host` が同一物理ホスト上の CPU workload (= image-pull 等) を
+    全く制限できていなかった (2026-07-21 に image-pull が ai-gpu1 で 2 台同時稼働し
+    MariaDB 接続が 300 上限に張り付いた根本原因)。 "-cpu<N>" も剥がして修正。
     """
     parts = worker_host.rsplit("-", 1)
-    return parts[0] if (len(parts) == 2 and parts[1].isdigit()) else worker_host
+    if len(parts) == 2:
+        suf = parts[1]
+        if suf.isdigit() or (suf.startswith("cpu") and suf[3:].isdigit()):
+            return parts[0]
+    return worker_host
 
 
 # --- worker restart (supervisor watchdog 用): hung worker を deploy key で SSH 再起動 ---
@@ -294,45 +306,83 @@ def _restart_target(worker_host: str) -> tuple[str, str] | None:
     return (ip, unit) if ip else None
 
 
-def _count_host_concurrency(db: Any, worker_host: str, slug: str) -> int:
-    """同じ host で current_workload=slug の worker 数 (= 自分自身も含む)。
+# 同時実行カウントの freshness window。 claimed_slug_at がこの秒数以内なら
+# 「今もその slug を回している」とみなす。 workload の lease_secs をベースにしつつ、
+# 停止した worker が延々とスロットを占有し続けないよう上限で頭打ちにする
+# (= handoff が最悪この秒数で成立する)。
+_CONCURRENCY_HOLD_CAP_S = 180
+_CONCURRENCY_HOLD_MIN_S = 30
+
+
+def _hold_window_s(lease_secs: int | None) -> int:
+    lease = int(lease_secs or 0)
+    if lease <= 0:
+        return _CONCURRENCY_HOLD_MIN_S
+    return max(_CONCURRENCY_HOLD_MIN_S, min(lease, _CONCURRENCY_HOLD_CAP_S))
+
+
+def _fresh_cutoff_iso(window_s: int) -> str:
+    """claimed_slug_at 比較用の下限 ISO 文字列。 _utcnow 系と同じ format
+    (isoformat microseconds, +00:00) なので辞書順比較=時刻順比較が成立する。"""
+    return (datetime.now(timezone.utc) - timedelta(seconds=max(1, window_s))).isoformat(
+        timespec="microseconds"
+    )
+
+
+def _count_host_concurrency(
+    db: Any, worker_host: str, slug: str, window_s: int, exclude_id: str | None = None
+) -> int:
+    """同じ host で「今 slug を回している」worker 数。
 
     `max_concurrent_per_host` ガード用。 worker のホスト名は systemd instance
     suffix 付き (ai-gpu1-1, ai-gpu1-2…) で、 同一物理 GPU を共有するため、
     suffix を剥がして家族単位で数える。
 
+    「稼働中」の判定は current_workload ではなく claimed_slug + claimed_slug_at を使う。
+    current_workload は task 実行中しかセットされず batch 間で None に戻るため
+    過小カウントし、 二重稼働の検知漏れ→接続 leak の原因になっていた (2026-07-21)。
+    claimed_slug は claim 毎に stamp され、 window 内なら稼働中と数える。
+
     "active" 系の state のみカウント (= idle/dead/connecting は除外、 false-block 防止)。
-    best-effort: race で多少超えても次 cycle で収束する想定。
+    exclude_id を渡すとその worker (= 自分) は除外する。
     """
     if not worker_host:
         return 0
     family = _host_family(worker_host)
     family_glob = family + "-%"
+    cutoff = _fresh_cutoff_iso(window_s)
     with db.transaction() as conn:
         cur = conn.execute(
             "SELECT COUNT(*) AS cnt FROM workers "
-            "WHERE current_workload = :s "
+            "WHERE claimed_slug = :s AND claimed_slug_at >= :cutoff "
             "  AND state IN ('active','running','claiming','draining') "
+            "  AND id IS NOT :self "
             "  AND (host = :exact OR host LIKE :glob)",
-            {"s": slug, "exact": family, "glob": family_glob},
+            {"s": slug, "cutoff": cutoff, "self": exclude_id,
+             "exact": family, "glob": family_glob},
         )
         row = cur.fetchone()
     # sqlite3.Row は string キーのみ、 数値 index は KeyError になる環境がある。
     return int(row["cnt"]) if row else 0
 
 
-def _count_total_concurrency(db: Any, slug: str) -> int:
-    """fleet 全体 (= 全 host) で current_workload=slug の active worker 数 (= 自分含む)。
+def _count_total_concurrency(
+    db: Any, slug: str, window_s: int, exclude_id: str | None = None
+) -> int:
+    """fleet 全体 (= 全 host) で「今 slug を回している」active worker 数。
 
     `max_concurrent_total` ガード用。 max_concurrent_per_host の host 制約を外した版。
-    best-effort: claim race で多少超えても次 cycle で収束する想定。
+    判定根拠は _count_host_concurrency と同じ claimed_slug + freshness window。
+    exclude_id を渡すとその worker (= 自分) は除外する。
     """
+    cutoff = _fresh_cutoff_iso(window_s)
     with db.transaction() as conn:
         cur = conn.execute(
             "SELECT COUNT(*) AS cnt FROM workers "
-            "WHERE current_workload = :s "
-            "  AND state IN ('active','running','claiming','draining')",
-            {"s": slug},
+            "WHERE claimed_slug = :s AND claimed_slug_at >= :cutoff "
+            "  AND state IN ('active','running','claiming','draining') "
+            "  AND id IS NOT :self",
+            {"s": slug, "cutoff": cutoff, "self": exclude_id},
         )
         row = cur.fetchone()
     return int(row["cnt"]) if row else 0
@@ -860,20 +910,24 @@ def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorker
         affinity = list(w.host_affinity or [])
         if not _host_matches_affinity(worker_host, affinity):
             continue
-        # 同一 host 上の同時実行ワーカー数を上限制御 (= 横方向、 簡易ガード)。
+        # 同一 host 上の同時実行ワーカー数を上限制御 (= 横方向)。
+        # 自分 (worker_id) は exclude_id で除外して「他に何台か」を数える。
+        hold_window = _hold_window_s(w.lease_secs)
         limit = w.max_concurrent_per_host
         if limit is not None and limit > 0 and worker_host:
-            active = _count_host_concurrency(request.app.state.db, worker_host, w.slug)
-            own = 1 if worker_current == w.slug else 0
-            if max(0, active - own) >= limit:
+            active = _count_host_concurrency(
+                request.app.state.db, worker_host, w.slug, hold_window, exclude_id=worker_id
+            )
+            if active >= limit:
                 continue
         # 横方向 (fleet 全体): max_concurrent_total で全 host 合計の同時実行数を制限。
         # 単一 writer (embed-write=1) 等、 host をまたいだ絶対上限を保証する。
         tlimit = w.max_concurrent_total
         if tlimit is not None and tlimit > 0:
-            tactive = _count_total_concurrency(request.app.state.db, w.slug)
-            town = 1 if worker_current == w.slug else 0
-            if max(0, tactive - town) >= tlimit:
+            tactive = _count_total_concurrency(
+                request.app.state.db, w.slug, hold_window, exclude_id=worker_id
+            )
+            if tactive >= tlimit:
                 continue
         # 縦方向: VRAM 予算チェック。 「他 active worker の avg 合計 + この workload
         # の p95」 が host capacity * safety を超える時 claim 候補から外す。
@@ -957,12 +1011,37 @@ def claim(worker_id: str, body: ClaimRequest, request: Request) -> ClaimResponse
             allowed = None
         if allowed is not None and w.slug not in allowed:
             return ClaimResponse(workload_slug=w.slug, tasks=[])
+    # 同時実行 cap を **claim 時点で強制** する (= GET /workloads の勧告フィルタを
+    # すり抜けた二重 claim をここで止める最後の砦)。 判定は claimed_slug + freshness
+    # window ベースの耐久カウント。 自分は exclude して「他に何台稼働中か」を数え、
+    # 上限以上なら空を返して claim させない。 これが無かったため 2026-07-21 に
+    # image-pull が同一 host で 2 台走り MariaDB 接続が 300 上限に張り付いた。
+    worker_host = worker.get("host") if isinstance(worker, dict) else None
+    hold_window = _hold_window_s(w.lease_secs)
+    limit = w.max_concurrent_per_host
+    if limit is not None and limit > 0 and worker_host:
+        others = _count_host_concurrency(
+            request.app.state.db, worker_host, w.slug, hold_window, exclude_id=worker_id
+        )
+        if others >= limit:
+            return ClaimResponse(workload_slug=w.slug, tasks=[])
+    tlimit = w.max_concurrent_total
+    if tlimit is not None and tlimit > 0:
+        tothers = _count_total_concurrency(
+            request.app.state.db, w.slug, hold_window, exclude_id=worker_id
+        )
+        if tothers >= tlimit:
+            return ClaimResponse(workload_slug=w.slug, tasks=[])
     tasks = _qrepo(request).claim(
         w.queue_table,
         worker_id=worker_id,
         limit=min(body.limit, w.batch_size),
         lease_secs=w.lease_secs,
     )
+    # 実際に task を取れた時だけ「稼働中」印を更新 (= 空 claim では holder にしない)。
+    # これで次 cycle 以降、 他の worker の同 slug claim は上の cap で弾かれ収束する。
+    if tasks:
+        _wrepo(request).stamp_claim(worker_id, w.slug)
     return ClaimResponse(
         workload_slug=w.slug,
         tasks=[
