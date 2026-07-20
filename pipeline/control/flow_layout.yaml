@@ -6,19 +6,16 @@ nodes:
 - id: paprika-links-pull
   kind: workload
   x: 6
-  y: -225
+  y: -235
   label: URL 発見
   icon: search
   workload_slug: paprika-links-pull
 - id: crawl
   kind: tank
-  x: 26
-  y: -441
+  x: 27
+  y: -432
   label: crawl (URL総数)
   icon: link
-  # 本来はキュー(未投入=submitted_at IS NULL の残数)を出したいが、 submitted_at は backfill
-  # 未実施で古い投入済み行も NULL のため正確に数えられない (crawl-submitted-at-column)。
-  # backfill + index 後に `WHERE submitted_at IS NULL` へ変更する。 現状は総数(TABLE_ROWS)。
   metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
     AND TABLE_NAME='crawl'
   capacity_warn: 500000000
@@ -38,58 +35,54 @@ nodes:
   url: http://192.0.2.34:8000
 - id: paprika-image-pull
   kind: workload
-  x: 589
-  y: -224
+  x: 590
+  y: -235
   label: 画像 pull
   icon: photo
   workload_slug: paprika-image-pull
 - id: crawl_image
   kind: tank
-  x: 609
-  y: -56
+  x: 610
+  y: -68
   label: crawl_image (未hash)
   icon: photo
-  # 実 backlog = 未hash かつ dead-mark されていない (dispatcher が実際に処理できる) 分のみ。
-  # ignore_reason(file_lost/not_in_minio/dead_link)を除外しないと、 入手不能な死蔵 29.3M を
-  # 偽 backlog として表示してしまう (2026-07-07 特定)。 idx_ci_hash_ignore(hash_id,ignore_reason)で高速。
-  metric_sql: SELECT COUNT(*) FROM crawl_image WHERE hash_id IS NULL AND ignore_reason IS NULL
+  metric_sql: SELECT COUNT(*) FROM crawl_image WHERE hash_id IS NULL AND ignore_reason
+    IS NULL
   capacity_warn: 500000000
 - id: image-dispatcher
   kind: workload
-  x: 600
-  y: 115
+  x: 920
+  y: -287
   label: 画像 dispatch
   icon: arrows-split
   workload_slug: image-dispatcher
 - id: image_hash_extract_queue
   kind: tank
-  x: 619
-  y: 317
+  x: 938
+  y: -434
   label: img_hash_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM image_hash_extract_queue WHERE state='pending'
   capacity_warn: 50000
 - id: image-hash-extract
   kind: workload
-  x: 757
-  y: -402
+  x: 919
+  y: -570
   label: hash + detect
   icon: scan
   workload_slug: image-hash-extract
 - id: crawl_face
   kind: tank
-  x: 1174
-  y: -393
+  x: 1243
+  y: -410
   label: crawl_face (未embed)
   icon: face
-  # キュー: 未embed の顔 (adaface_ready=0) の残数のみ。 総行数(TABLE_ROWS)だと 99.99% が
-  # embed 済(adaface_ready=1)の総数を偽 backlog 表示してしまう。 idx_cf_adaface で高速。
   metric_sql: SELECT COUNT(*) FROM crawl_face WHERE adaface_ready=0
   capacity_warn: 500000000
 - id: image-embed
   kind: workload
-  x: 1176
-  y: -218
+  x: 1222
+  y: -214
   label: embed 計算
   icon: brain
   workload_slug: image-embed
@@ -102,8 +95,8 @@ nodes:
   workload_slug: paprika-video-pull
 - id: crawl_video
   kind: tank
-  x: 330
-  y: 113
+  x: 329
+  y: 147
   label: crawl_video pending
   icon: video
   metric_sql: SELECT COUNT(*) FROM crawl_video WHERE download_status='pending'
@@ -117,30 +110,30 @@ nodes:
   workload_slug: video-dispatcher
 - id: video-face-extract
   kind: workload
-  x: 917
-  y: 420
+  x: 915
+  y: 412
   label: 動画→顔抽出
   icon: faces
   workload_slug: video-face-extract
 - id: embed-write
   kind: workload
-  x: 1178
-  y: -56
+  x: 1223
+  y: 159
   label: embed 書込
   icon: database-import
   workload_slug: embed-write
 - id: embed_write_queue
   kind: tank
-  x: 1200
-  y: 110
+  x: 1242
+  y: -36
   label: embed_write_q
   icon: database-import
   metric_sql: SELECT COUNT(*) FROM crawl_embedding_write_queue WHERE state='pending'
   capacity_warn: 20000
 - id: crawl_embedding_final
   kind: tank
-  x: 1503
-  y: -238
+  x: 1244
+  y: 401
   label: crawl_embedding_index (final)
   icon: database
   metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
@@ -148,23 +141,23 @@ nodes:
   capacity_warn: 500000000
 - id: face_person_link_queue
   kind: tank
-  x: 1503
-  y: 120
+  x: 1602
+  y: -55
   label: person_link_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM face_person_link_queue WHERE state='pending'
   capacity_warn: 50000
 - id: face-person-link
   kind: workload
-  x: 1739
-  y: 134
+  x: 1582
+  y: 190
   label: person 統合
   icon: users
   workload_slug: face-person-link
 - id: crawl_person
   kind: tank
-  x: 1865
-  y: 314
+  x: 1602
+  y: 408
   label: crawl_person (集約)
   icon: users-group
   metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
@@ -172,8 +165,8 @@ nodes:
   capacity_warn: 10000000
 - id: crawl_video_hash
   kind: tank
-  x: 937
-  y: 619
+  x: 935
+  y: 240
   label: crawl_video_hash (binary 集約)
   icon: fingerprint
   metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
@@ -181,8 +174,8 @@ nodes:
   capacity_warn: 500000
 - id: crawl_image_hash
   kind: tank
-  x: 778
-  y: -574
+  x: 610
+  y: -570
   label: crawl_image_hash (binary 集約)
   icon: fingerprint
   metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
@@ -190,56 +183,56 @@ nodes:
   capacity_warn: 500000000
 - id: image_dispatcher_queue
   kind: tank
-  x: 921
-  y: 103
+  x: 943
+  y: -143
   label: img_dispatch_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM image_dispatcher_queue WHERE state='pending'
   capacity_warn: 50000
 - id: image_embed_queue
   kind: tank
-  x: 925
-  y: -218
+  x: 1252
+  y: -573
   label: img_embed_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM image_embed_queue WHERE state='pending'
   capacity_warn: 50000
 - id: video_dispatcher_queue
   kind: tank
-  x: 58
-  y: 402
+  x: 37
+  y: 411
   label: video_dispatch_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM video_dispatcher_queue WHERE state='pending'
   capacity_warn: 50000
 - id: video_face_extract_queue
   kind: tank
-  x: 620
-  y: 540
+  x: 640
+  y: 412
   label: video_face_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM video_face_extract_queue WHERE state='pending'
   capacity_warn: 50000
 - id: paprika_image_pull_queue
   kind: tank
-  x: 567
-  y: -422
+  x: 610
+  y: -401
   label: papri_img_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM paprika_image_pull_queue WHERE state='pending'
   capacity_warn: 50000
 - id: paprika_video_pull_queue
   kind: tank
-  x: 18
-  y: -66
+  x: 21
+  y: -56
   label: papri_video_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM paprika_video_pull_queue WHERE state='pending'
   capacity_warn: 50000
 - id: paprika_links_pull_queue
   kind: tank
-  x: -297
-  y: -224
+  x: -293
+  y: -234
   label: papri_links_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM paprika_links_pull_queue WHERE state='pending'
@@ -252,21 +245,10 @@ nodes:
   icon: list
   metric_sql: SELECT COUNT(*) FROM paprika_job_submit_queue WHERE state='pending'
   capacity_warn: 50000
-# ---- RAM ディスク MinIO の容量 (2026-07-21 追加) ----
-# hub が書き pull が読んで消す一時素材置き場。 満杯になるとホストごと道連れになり
-# (2026-07-20: .47 が TCP は受けるが HTTP 無応答 → 画像取込が 300s 単位で全停止)、
-# しかも hub の /info や /jobs は MariaDB 由来で正常応答するため気付きにくい。
-# 値は control plane の _storage_capacity_loop が 60s 毎に storage_capacity へ upsert する
-# (snapshot API から MinIO を直接叩くと、 ハング時にダッシュボードごと固まるため隔離)。
-#
-# pct_used(0-100) を読み capacity_warn: 100 と組にする = 総容量が変わっても此処を直さずに済む。
-# 収集に失敗したストアは行が更新されないので、 stale(>5分) は 100 を返して overflow 表示に
-# 倒す。 黙って古い値を出すと「見えているのに死んでいる」 状態を再現してしまうため、
-# 応答不能はタンク満杯と同じ強さで警告する。
 - id: minio-image-ram
   kind: tank
-  x: 839
-  y: -74
+  x: 937
+  y: -19
   label: 画像RAM (.47)
   icon: database
   metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
@@ -274,8 +256,8 @@ nodes:
   capacity_warn: 100
 - id: minio-video-ram
   kind: tank
-  x: 100
-  y: 74
+  x: 112
+  y: 144
   label: 動画RAM (.48)
   icon: database
   metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM

@@ -33,6 +33,10 @@ dependencies = [
 postgres = ["psycopg[binary]>=3.1"]
 mysql = ["pymysql>=1.1", "mariadb>=1.1"]
 prometheus = ["prometheus-client>=0.17"]
+# storage_capacity の収集 (MinIO admin API) に必要。 pipeline.storage の
+# MinioStore は minio 不在でも HTTP の死活確認へ degrade するが、 容量取得は
+# 署名付き admin API なので SDK が要る。
+minio = ["minio>=7.2"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
