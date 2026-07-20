@@ -69,6 +69,10 @@ class FlowEdge(BaseModel):
     target: str
     label: str | None = None
     metric_field: str | None = None
+    # tank と同じ SELECT を edge にも許す。 送信元が workload でない pipe
+    # (例: RAM ディスク MinIO の流入出) は last_output も throughput_per_min も
+    # 持たないため、 metric_field / throughput 借用のどちらでも rate が出せない。
+    metric_sql: str | None = None
     dashed: bool = False
     rate_per_min: float | None = None
 
@@ -457,11 +461,14 @@ def snapshot(req: Request) -> FlowSnapshot:
                 pass
         return round(total / ds * 60.0, 1) if total > 0 else 0.0
 
-    # 2. tank SQL を一括評価
+    # 2. tank SQL を一括評価 (edge の metric_sql も同じ 1 接続に相乗りさせる)
     tank_sqls: dict[str, str] = {}
     for n in nodes_raw:
         if n.get("kind") == "tank" and n.get("metric_sql"):
             tank_sqls[n["id"]] = n["metric_sql"]
+    for i, e in enumerate(edges_raw):
+        if e.get("metric_sql"):
+            tank_sqls[f"__edge{i}"] = e["metric_sql"]
     tank_results = _exec_tanks(tank_sqls) if tank_sqls else {}
 
     # 3. nodes 組み立て
@@ -546,6 +553,7 @@ def snapshot(req: Request) -> FlowSnapshot:
             target=e["to"],
             label=e.get("label"),
             metric_field=e.get("metric_field"),
+            metric_sql=e.get("metric_sql"),
             dashed=bool(e.get("dashed", False)),
         )
         # rate 推定の優先順位:
@@ -560,6 +568,14 @@ def snapshot(req: Request) -> FlowSnapshot:
         src = nodes_by_id.get(edge.source)
         tgt = nodes_by_id.get(edge.target)
         rate: float | None = None
+        # 0. metric_sql (最優先)。 送信元が workload でない pipe 用。
+        #    0 も有効値として扱う (= 「流れていない」 を fallback で埋めない)。
+        if edge.metric_sql:
+            v, err = tank_results.get(f"__edge{i}", (None, None))
+            if err is None and v is not None:
+                edge.rate_per_min = float(v)
+                edges.append(edge)
+                continue
         if edge.metric_field and src and isinstance(src.last_output, dict):
             v = src.last_output.get(edge.metric_field)
             if isinstance(v, (int, float)):

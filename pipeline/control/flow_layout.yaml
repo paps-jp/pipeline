@@ -42,8 +42,8 @@ nodes:
   workload_slug: paprika-image-pull
 - id: crawl_image
   kind: tank
-  x: 610
-  y: -68
+  x: 768
+  y: -62
   label: crawl_image (未hash)
   icon: photo
   metric_sql: SELECT COUNT(*) FROM crawl_image WHERE hash_id IS NULL AND ignore_reason
@@ -223,8 +223,8 @@ nodes:
   capacity_warn: 50000
 - id: paprika_video_pull_queue
   kind: tank
-  x: 21
-  y: -56
+  x: 19
+  y: 112
   label: papri_video_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM paprika_video_pull_queue WHERE state='pending'
@@ -247,8 +247,8 @@ nodes:
   capacity_warn: 50000
 - id: minio-image-ram
   kind: tank
-  x: 937
-  y: -19
+  x: 550
+  y: -93
   label: 画像RAM (.47)
   icon: database
   metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
@@ -256,8 +256,8 @@ nodes:
   capacity_warn: 100
 - id: minio-video-ram
   kind: tank
-  x: 112
-  y: 144
+  x: 30
+  y: -108
   label: 動画RAM (.48)
   icon: database
   metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, pct_used, 100) FROM
@@ -374,3 +374,23 @@ edges:
   to: paprika_job_submit_queue
 - from: paprika_job_submit_queue
   to: paprika-job-submit
+- from: paprika-hub
+  to: minio-image-ram
+  label: MB/min
+  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(GREATEST(net_bytes_per_min,0)/1048576,1),
+    0) FROM storage_capacity WHERE name='image-ram-47'
+- from: minio-image-ram
+  to: paprika-image-pull
+  label: MB/min
+  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(GREATEST(-net_bytes_per_min,0)/1048576,1),
+    0) FROM storage_capacity WHERE name='image-ram-47'
+- from: paprika-hub
+  to: minio-video-ram
+  label: MB/min
+  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(GREATEST(net_bytes_per_min,0)/1048576,1),
+    0) FROM storage_capacity WHERE name='video-ram-48'
+- from: minio-video-ram
+  to: paprika-video-pull
+  label: MB/min
+  metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(GREATEST(-net_bytes_per_min,0)/1048576,1),
+    0) FROM storage_capacity WHERE name='video-ram-48'
