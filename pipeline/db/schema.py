@@ -235,6 +235,18 @@ CREATE INDEX IF NOT EXISTS plugins_idx_slug ON plugins (slug, created_at DESC);
 
 
 # --- settings (システム設定の key-value 永続化、 LLM 接続情報等) -----------
+FLEET_STOP_DDL = """
+CREATE TABLE IF NOT EXISTS fleet_stop_state (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    stopped_at   TEXT NOT NULL,
+    stopped_by   TEXT,
+    slugs_json   TEXT NOT NULL,   -- 全停止時に enabled=1 だった slug 一覧 (= 再開対象)
+    resumed_at   TEXT,            -- NULL の行が「現在停止中」を表す (同時に 1 行だけ)
+    resumed_by   TEXT
+);
+"""
+
+
 SETTINGS_DDL = """
 CREATE TABLE IF NOT EXISTS settings (
     key             TEXT PRIMARY KEY,
@@ -494,6 +506,7 @@ ALL_DDL = [
     SETTINGS_DDL,
     LLM_CALLS_DDL,
     VRAM_OBSERVATIONS_DDL,
+    FLEET_STOP_DDL,
 ]
 
 

@@ -31,6 +31,7 @@ import { useTranslation } from "react-i18next";
 import { Link as RouterLink, NavLink as RouterNavLink, Route, Routes } from "react-router-dom";
 
 import { api } from "@/api/client";
+import { FleetStopButton } from "@/components/FleetStopButton";
 import { PageTransition } from "@/components/PageTransition";
 import Dashboard from "./pages/Dashboard";
 import Deploy from "./pages/Deploy";
@@ -156,6 +157,7 @@ export default function App() {
             <HeaderStatus />
           </Group>
           <Group gap="xs">
+            <FleetStopButton />
             <Tooltip label={t("header.manual", "マニュアル (新しいタブで開く)")}>
               <ActionIcon
                 variant="subtle"

@@ -185,6 +185,23 @@ export interface AvailablePlugin {
   manifest?: PluginManifest | null;
 }
 
+export interface FleetState {
+  stopped: boolean;
+  stopped_at: string | null;
+  stopped_by: string | null;
+  recorded_slugs: string[];
+  enabled_now: string[];
+}
+
+export interface FleetActionResult {
+  ok: boolean;
+  stopped: boolean;
+  changed: string[];
+  failed: { slug: string; error: string }[];
+  recorded_slugs: string[];
+  message: string;
+}
+
 export const api = {
   status: () => request<SystemStatus>("/api/v1/status"),
   health: () => request<{ ok: boolean; version: string }>("/api/v1/health"),
@@ -208,6 +225,13 @@ export const api = {
     }),
   deleteWorkload: (slug: string) =>
     request<void>(`/api/v1/workloads/${slug}`, { method: "DELETE" }),
+
+  // --- フリート全停止 / 再開 ---
+  fleetState: () => request<FleetState>("/api/v1/fleet/state"),
+  fleetStop: (by?: string) =>
+    request<FleetActionResult>("/api/v1/fleet/stop", { method: "POST", json: { by } }),
+  fleetResume: (by?: string) =>
+    request<FleetActionResult>("/api/v1/fleet/resume", { method: "POST", json: { by } }),
 
   enqueueTask: (slug: string, pk: string, extra: Record<string, unknown> = {}) =>
     request<{ inserted: number; duplicates: number }>(
