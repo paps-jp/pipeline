@@ -415,6 +415,15 @@ def _host_vram_budget(
     """
     if not worker_host:
         return 0, 0
+    # 要求元が CPU instance なら GPU VRAM budget の対象外 (= fail-open で skip)。
+    # CPU worker は物理的に GPU VRAM を使わないので、 GPU workload の逼迫で
+    # CPU workload (image-pull 等) の claim 候補が外れるのは誤り。
+    # 以前は CPU worker の family が自分だけ (= capacity 0) で自然に skip されていたが、
+    # _host_family が物理ホスト単位に畳む修正 (2026-07-21 per-host cap 修正) の副作用で
+    # 同居 GPU worker の budget を被り、 image-pull が GPU VRAM 逼迫時に claim 候補から
+    # 外れて evict→rebuild churn (再接続 storm + setup コスト) を起こしていた。 明示 skip で修正。
+    if "cpu" in worker_host.lower():
+        return 0, 0
     family = _host_family(worker_host)
     family_glob = family + "-%"
     with db.transaction() as conn:
