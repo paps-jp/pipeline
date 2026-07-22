@@ -244,9 +244,9 @@ def create_app(settings: Settings) -> FastAPI:
         # 返すと後勝ち upsert で分バケットが 0 に化ける欠陥があった。 Paprika が権威 endpoint
         # GET /jobs/throughput?window_s=60 (accepted_last_min, source=redis) を提供したので
         # それを 1 回叩くだけに置換 (単発 empty→0 化・limit truncation を根絶)。
+        # hub の所在はサイト固有なので env 必須。 未設定ならこのループは起動しない。
         _hub_rate_stop = _asyncio.Event()
-        _hub_url = (os.environ.get("PAPRIKA_HUB")
-                    or "http://192.0.2.34:8000").rstrip("/")
+        _hub_url = (os.environ.get("PAPRIKA_HUB") or "").rstrip("/")
 
         async def _hub_submit_rate_loop() -> None:
             import httpx as _httpx
@@ -271,7 +271,10 @@ def create_app(settings: Settings) -> FastAPI:
                     await _asyncio.wait_for(_hub_rate_stop.wait(), timeout=30)
                 except _asyncio.TimeoutError:
                     pass
-        hub_rate_task = _asyncio.create_task(_hub_submit_rate_loop())
+        hub_rate_task = (_asyncio.create_task(_hub_submit_rate_loop())
+                         if _hub_url else None)
+        if not _hub_url:
+            log.info("PAPRIKA_HUB 未設定のため hub submit rate loop は起動しない")
 
         # ストレージ使用量 (2026-07-21): RAM ディスク MinIO (.47 画像 / .48 動画) と
         # .17 raw の容量を 60s 毎に storage_capacity へ upsert する。 flow の tank ノードは
@@ -314,7 +317,8 @@ def create_app(settings: Settings) -> FastAPI:
             except Exception:
                 pass
             try:
-                await _asyncio.wait_for(hub_rate_task, timeout=3)
+                if hub_rate_task is not None:
+                    await _asyncio.wait_for(hub_rate_task, timeout=3)
             except Exception:
                 pass
             try:

@@ -74,7 +74,13 @@
         <tr><td><code>PIPELINE_PLUGIN_ROOT</code></td><td>プラグインディレクトリのルート。</td><td><code>/opt/pipeline/plugins</code></td></tr>
         <tr><td><code>PIPELINE_SECONDARY_DB_URL</code></td><td>secondary MariaDB キューの URL (空で SQLite のみ)。</td><td>—</td></tr>
         <tr><td><code>PIPELINE_INPROC_WORKER</code></td><td>in-process worker を動かすか (dev 既定1)。</td><td>状況依存</td></tr>
+        <tr><td><code>PIPELINE_ENV_FILE</code></td><td>MinIO / MariaDB 認証情報を書いた <code>.env</code> の場所。</td><td><code>/etc/pipeline/.env</code></td></tr>
+        <tr><td><code>PIPELINE_DEPLOY_KEY</code></td><td>worker 箱へ SSH する deploy 秘密鍵。<code>.pub</code> は公開鍵 API が参照。</td><td><code>~/.ssh/id_ed25519</code></td></tr>
+        <tr><td><code>PIPELINE_WATCHDOG_HOSTS</code></td><td>watchdog が worker を SSH 再起動する際の <code>host=addr</code> 表 (カンマ区切り)。未設定なら再起動機能は無効。</td><td>—</td></tr>
+        <tr><td><code>PAPRIKA_HUB</code></td><td>投入率を引く外部 hub の URL。未設定ならその収集ループは起動しない。</td><td>—</td></tr>
       </table>
+      <p class="note">サイト固有のアドレス (control plane / worker / MinIO / hub) はコードに既定値を持ちません。
+      未設定の機能はエラーにならず、その収集・操作だけが無効になります。</p>
 
       <h3>Storage SDK の .env</h3>
       <p><a href="storage-sdk.html">Storage SDK</a> の認証情報は、<code>PIPELINE_</code> 接頭辞のプロセス環境ではなく <code>load_env_file</code> が読む <code>.env</code> ファイルから解決されます。</p>

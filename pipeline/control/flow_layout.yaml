@@ -32,7 +32,7 @@ nodes:
   y: -224
   label: paprika hub
   icon: server
-  url: http://192.0.2.34:8000
+  url: ""   # サイト固有の外部リンク (未設定可)
 - id: paprika-image-pull
   kind: workload
   x: 578

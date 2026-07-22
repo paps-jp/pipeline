@@ -58,7 +58,7 @@ def _env(key: str, file_env: dict[str, str]) -> str | None:
 @lru_cache(maxsize=1)
 def _client_and_bucket() -> tuple[object, str]:
     """boto3 client を遅延生成 (= モジュール import 時に env が無くても起動できるように)。
-    systemd unit に MINIO_* が無いケース用に `/opt/pipeline/.env` (or env で上書き)
+    systemd unit に MINIO_* が無いケース用に PIPELINE_ENV_FILE (既定 /etc/pipeline/.env)
     からの fallback 読み込みもする。"""
     try:
         import boto3  # type: ignore
@@ -66,7 +66,9 @@ def _client_and_bucket() -> tuple[object, str]:
     except ImportError as e:
         raise HTTPException(503, detail=f"boto3 not installed: {e}") from e
 
-    env_file = os.environ.get("PIPELINE_MINIO_ENV_FILE", "/opt/pipeline/.env")
+    env_file = os.environ.get(
+        "PIPELINE_MINIO_ENV_FILE",
+        os.environ.get("PIPELINE_ENV_FILE", "/etc/pipeline/.env"))
     fe = _load_env_file(env_file)
     endpoint = _env("MINIO_ENDPOINT_URL", fe) or _env("MINIO_ENDPOINT", fe)
     access = _env("MINIO_ACCESS_KEY", fe)

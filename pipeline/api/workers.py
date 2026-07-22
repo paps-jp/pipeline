@@ -281,17 +281,28 @@ def _host_family(worker_host: str) -> str:
 
 
 # --- worker restart (supervisor watchdog 用): hung worker を deploy key で SSH 再起動 ---
-_WATCHDOG_HOST_IP = {
-    "ai-gpu1": "192.0.2.23", "ai-gpu3": "192.0.2.28",
-    "ai-gpu4": "192.0.2.29", "ai-gpu5": "192.0.2.30",
-}
-_WATCHDOG_DEPLOY_KEY = os.environ.get("PIPELINE_DEPLOY_KEY", "/home/pipeline/.ssh/id_ed25519")
+# host family → SSH 接続先はサイト固有なので env で与える。
+#   PIPELINE_WATCHDOG_HOSTS="ai-gpu1=192.0.2.23,ai-gpu4=192.0.2.29"
+# 未設定なら watchdog による再起動は無効 (= _restart_target が None を返す)。
+def _parse_watchdog_hosts(spec: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in spec.split(","):
+        fam, _, addr = item.partition("=")
+        fam, addr = fam.strip(), addr.strip()
+        if fam and addr:
+            out[fam] = addr
+    return out
+
+
+_WATCHDOG_HOST_IP = _parse_watchdog_hosts(os.environ.get("PIPELINE_WATCHDOG_HOSTS", ""))
+_WATCHDOG_DEPLOY_KEY = os.environ.get(
+    "PIPELINE_DEPLOY_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
 
 
 def _restart_target(worker_host: str) -> tuple[str, str] | None:
-    """worker.host → (ssh_ip, systemd_unit)。未対応形式は None。
-    ai-gpu1-cpu3→(.23, pipeline-worker-cpu@3) / ai-gpu1-2→(.23, pipeline-worker-gpu@2)
-    / ai-gpu3→(.28, pipeline-worker-gpu)。"""
+    """worker.host → (ssh_ip, systemd_unit)。未対応形式・未登録 host は None。
+    ai-gpu1-cpu3→pipeline-worker-cpu@3 / ai-gpu1-2→pipeline-worker-gpu@2
+    / ai-gpu3→pipeline-worker-gpu。 接続先は PIPELINE_WATCHDOG_HOSTS から引く。"""
     import re
     m = re.fullmatch(r"(ai-gpu\d+)-cpu(\d+)", worker_host or "")
     if m:
@@ -555,8 +566,8 @@ def restart_worker(worker_id: str, request: Request) -> dict[str, Any]:
 
 
 # --- Elastic Workers: 制御プレーン側 systemctl primitives (2026-07-04) ---
-# supervisor は user www で動き root@他ホストへ SSH できない。 privileged な
-# systemctl (spawn/stop/inventory) は control plane (pipeline + deploy key) に集約
+# supervisor は非特権ユーザで動き root@他ホストへ SSH できない。 privileged な
+# systemctl (spawn/stop/inventory) は control plane (deploy key を持つユーザ) に集約
 # する (= restart_worker と同型)。 supervisor はこれらを HTTP で叩く。
 
 class ElasticOpRequest(BaseModel):

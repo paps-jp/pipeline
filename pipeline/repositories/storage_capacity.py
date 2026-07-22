@@ -26,16 +26,18 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_DB_ENV = "/opt/pipeline/.env"
+_DEFAULT_DB_ENV = os.environ.get("PIPELINE_ENV_FILE", "/etc/pipeline/.env")
 
 # 収集対象。 (name, endpoint を引く env key, 既定 endpoint, access/secret の env key)
 # name は flow_layout.yaml の metric_sql が参照するキーなので変えないこと。
+# endpoint はサイト固有なので既定値を持たない。 env (または PIPELINE_ENV_FILE の
+# env ファイル) に該当 key が無いストアは収集対象から外れる。
 _TARGETS = [
-    ("image-ram-47", "MINIO_HUB_ENDPOINT", "192.0.2.47:9000",
+    ("image-ram-47", "MINIO_HUB_ENDPOINT", "",
      "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY"),
-    ("video-ram-48", "PAPRIKA_MINIO_VIDEO_ENDPOINT", "192.0.2.48:9000",
+    ("video-ram-48", "PAPRIKA_MINIO_VIDEO_ENDPOINT", "",
      "PAPRIKA_MINIO_ACCESS_KEY", "PAPRIKA_MINIO_SECRET_KEY"),
-    ("raw-17", "MINIO_RAW_ENDPOINT", "192.0.2.17:9000",
+    ("raw-17", "MINIO_RAW_ENDPOINT", "",
      "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY"),
 ]
 

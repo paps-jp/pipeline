@@ -7,7 +7,7 @@
 - N+1 防止: tank の SQL は 1 接続で順次評価、 結果は 3s in-mem cache。
 - yaml の path は env `PAPRIKA_FLOW_LAYOUT_PATH` で上書き可。
 - tank metric_sql は SELECT のみ、 複数文 (`;`) を拒否。
-- MariaDB 接続情報は env `PAPRIKA_FLOW_DB_ENV` (デフォルト `/mnt/pipeline/ai/.env`)
+- MariaDB 接続情報は env `PAPRIKA_FLOW_DB_ENV` (デフォルト `PIPELINE_ENV_FILE` = `/etc/pipeline/.env`)
   から DB_HOST/DB_PORT/DB_USER/DB_PASS/DB_NAME を読み込み。 接続失敗時は
   各 tank に error を返すだけで snapshot 全体は壊さない。
 """
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/flow", tags=["flow"])
 
 _LAYOUT_PATH_DEFAULT = Path(__file__).resolve().parents[1] / "control" / "flow_layout.yaml"
-_DEFAULT_DB_ENV = "/opt/pipeline/.env"
+_DEFAULT_DB_ENV = os.environ.get("PIPELINE_ENV_FILE", "/etc/pipeline/.env")
 
 # tank metric cache (= 30 秒)
 # COUNT(*) on large tables can take 10-20s; poll every 30s to avoid query pile-up

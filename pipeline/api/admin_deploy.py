@@ -345,16 +345,21 @@ async def get_deploy(run_id: str) -> DeployRun:
 
 @router.get("/deploy-targets/pubkey", response_model=dict)
 def get_pubkey() -> dict:
-    """配信元 (pipeline) の SSH 公開鍵を返す。 各 GPU 箱の /root/.ssh/authorized_keys に追加する文字列。"""
-    candidates = [
-        Path("/home/pipeline/.ssh/id_ed25519.pub"),
-        Path("/home/pipeline/.ssh/id_rsa.pub"),
+    """配信元ユーザの SSH 公開鍵を返す。 各 worker 箱の /root/.ssh/authorized_keys に追加する文字列。
+
+    探索先は PIPELINE_DEPLOY_KEY (秘密鍵パス) の .pub、 無ければ実行ユーザの ~/.ssh/。"""
+    key_env = os.environ.get("PIPELINE_DEPLOY_KEY")
+    candidates = [Path(key_env + ".pub")] if key_env else []
+    candidates += [
+        Path(os.path.expanduser("~/.ssh/id_ed25519.pub")),
+        Path(os.path.expanduser("~/.ssh/id_rsa.pub")),
     ]
     for p in candidates:
         if p.exists():
             return {"pubkey": p.read_text().strip(), "source": str(p)}
     return {"pubkey": None, "source": None,
-            "hint": "pipeline ユーザに SSH 鍵未生成。 .7 上で `sudo -u pipeline ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519` を実行"}
+            "hint": "配信元ユーザに SSH 鍵が未生成。 control plane 上で "
+                    "`ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519` を実行"}
 
 
 @router.get("/deploy-targets", response_model=list[DeployTarget])
@@ -405,7 +410,7 @@ import tarfile
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 # project root は admin_deploy.py の位置 (= <root>/pipeline/api/admin_deploy.py) から導出
-# こうしておけば install パスが /opt/pipeline でも /opt/pipeline/pipeline でも動く
+# こうしておけば install パスが /opt/pipeline でも任意の checkout でも動く
 PIPELINE_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP_SCRIPT_PATH = PIPELINE_ROOT / "scripts" / "bootstrap.sh"
 PIPELINE_SOURCE_DIRS = ["pipeline", "scripts", "plugins"]   # tar.gz に含めるディレクトリ
