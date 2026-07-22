@@ -455,12 +455,20 @@ def get_bootstrap_source() -> StreamingResponse:
     )
 
 
+BOOTSTRAP_CTRL_PLACEHOLDER = "http://control-plane.example:8001"
+
+
 @bootstrap_router.get("/bootstrap.sh", response_class=PlainTextResponse)
-def get_bootstrap_script() -> str:
-    """新規 GPU 箱で `curl -sSL .../bootstrap.sh | sudo bash` 用のシェルスクリプト。"""
+def get_bootstrap_script(request: Request) -> str:
+    """新規 GPU 箱で `curl -sSL .../bootstrap.sh | sudo bash` 用のシェルスクリプト。
+
+    CTRL_URL の既定値は配信時にこの control plane 自身の URL へ差し替える
+    (= スクリプトにサイト固有アドレスを焼き込まないため)。"""
     if not BOOTSTRAP_SCRIPT_PATH.exists():
         raise HTTPException(500, f"bootstrap.sh not found: {BOOTSTRAP_SCRIPT_PATH}")
-    return BOOTSTRAP_SCRIPT_PATH.read_text(encoding="utf-8")
+    text = BOOTSTRAP_SCRIPT_PATH.read_text(encoding="utf-8")
+    base = str(request.base_url).rstrip("/")
+    return text.replace(BOOTSTRAP_CTRL_PLACEHOLDER, base)
 
 
 # ========== 配信パス (deploy_paths) CRUD ==========

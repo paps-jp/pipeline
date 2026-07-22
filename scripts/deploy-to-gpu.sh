@@ -7,7 +7,6 @@
 # 環境変数:
 #   GPU_HOSTS="192.0.2.23 192.0.2.29"  配信先 host (default: deploy_targets.enabled=1)
 #   PATHS_JSON='[{src,dst,setup_command,...}]'  配信パス (default: deploy_paths.enabled=1)
-#   CTRL_URL=http://control-plane.example:8001  control plane API
 #   SKIP_RESTART=1  service restart せず (= rsync + setup_command のみ)
 #   DRY_RUN=1       rsync --dry-run
 #
@@ -21,7 +20,6 @@
 
 set -euo pipefail
 
-CTRL_URL="${CTRL_URL:-http://control-plane.example:8001}"
 SKIP_RESTART="${SKIP_RESTART:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
