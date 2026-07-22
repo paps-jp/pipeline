@@ -169,34 +169,83 @@ class QueueRepository:
             datetime.now(timezone.utc) - timedelta(seconds=max(1, lease_secs))
         ).isoformat(timespec="microseconds")
 
+        # MariaDB (secondary) backend は 2 段 SELECT ... FOR UPDATE SKIP LOCKED で claim する。
+        # 旧実装の UPDATE-WHERE-pk-IN-(SELECT ... ORDER BY LIMIT) は並行 worker が同一候補行
+        # (ORDER BY enqueued_at の先頭) を奪い合い Deadlock(1213) を頻発させる (= 並行 claim が
+        # 増えると claim が 500 で失敗しスループット天井になる)。 SKIP LOCKED で互いに素な行を
+        # 掴めば deadlock が構造的に消える (dispatcher._claim_pending_videos と同じパターン)。
+        # SQLite は SKIP LOCKED 非対応なので従来の CAS 風 UPDATE-WHERE を維持する。
+        secondary = (
+            self._backend_map.get(queue_table) == "secondary"
+            and self.secondary_db is not None
+        )
         with self._get_db(queue_table).transaction() as conn:
-            conn.execute(
-                f"""
-                UPDATE {queue_table}
-                SET state='claimed',
-                    claimed_at=:now,
-                    claimed_by=:wid,
-                    updated_at=:now
-                WHERE pk IN (
+            if secondary:
+                sel = conn.execute(
+                    f"""
                     SELECT pk FROM {queue_table}
                     WHERE state='pending'
                        OR (state='claimed' AND claimed_at < :cutoff)
                     ORDER BY enqueued_at, pk
                     LIMIT :lim
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    {"cutoff": lease_cutoff, "lim": int(limit)},
                 )
-                """,
-                {"now": now_iso, "wid": worker_id, "cutoff": lease_cutoff, "lim": int(limit)},
-            )
-            cur = conn.execute(
-                f"""
-                SELECT pk, attempt, extra, enqueued_at
-                FROM {queue_table}
-                WHERE state='claimed' AND claimed_by=:wid AND claimed_at=:now
-                ORDER BY enqueued_at, pk
-                """,
-                {"wid": worker_id, "now": now_iso},
-            )
-            rows = cur.fetchall()
+                pks = [r["pk"] for r in sel.fetchall()]
+                if not pks:
+                    return []
+                ph = ", ".join(f":p{i}" for i in range(len(pks)))
+                pk_params = {f"p{i}": pk for i, pk in enumerate(pks)}
+                conn.execute(
+                    f"""
+                    UPDATE {queue_table}
+                    SET state='claimed',
+                        claimed_at=:now,
+                        claimed_by=:wid,
+                        updated_at=:now
+                    WHERE pk IN ({ph})
+                    """,
+                    {"now": now_iso, "wid": worker_id, **pk_params},
+                )
+                cur = conn.execute(
+                    f"""
+                    SELECT pk, attempt, extra, enqueued_at
+                    FROM {queue_table}
+                    WHERE pk IN ({ph})
+                    ORDER BY enqueued_at, pk
+                    """,
+                    pk_params,
+                )
+                rows = cur.fetchall()
+            else:
+                conn.execute(
+                    f"""
+                    UPDATE {queue_table}
+                    SET state='claimed',
+                        claimed_at=:now,
+                        claimed_by=:wid,
+                        updated_at=:now
+                    WHERE pk IN (
+                        SELECT pk FROM {queue_table}
+                        WHERE state='pending'
+                           OR (state='claimed' AND claimed_at < :cutoff)
+                        ORDER BY enqueued_at, pk
+                        LIMIT :lim
+                    )
+                    """,
+                    {"now": now_iso, "wid": worker_id, "cutoff": lease_cutoff, "lim": int(limit)},
+                )
+                cur = conn.execute(
+                    f"""
+                    SELECT pk, attempt, extra, enqueued_at
+                    FROM {queue_table}
+                    WHERE state='claimed' AND claimed_by=:wid AND claimed_at=:now
+                    ORDER BY enqueued_at, pk
+                    """,
+                    {"wid": worker_id, "now": now_iso},
+                )
+                rows = cur.fetchall()
 
         return [
             ClaimedTask(
