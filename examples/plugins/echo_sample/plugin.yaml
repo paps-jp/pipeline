@@ -1,0 +1,32 @@
+name: echo-sample
+description: |
+  プラグインの最小サンプル。 入力 task の pk と extra をそのまま echo して
+  output_json に返すだけ。
+
+  - setup() / process() / cleanup() の 3 関数を export する以外に決まりは無い
+  - init_kwargs は workload 作成時に Web UI でフォーム入力できる (= type + default)
+  - hidden_kwargs は workload_slug など 制御プレーンが自動で注入するもの
+
+init_kwargs:
+  - key: prefix
+    type: str
+    default: "[echo]"
+    label: 出力 prefix
+    help: process() が echo するときに各行の頭に付ける文字列
+
+  - key: sleep_secs
+    type: float
+    default: 0
+    label: 1 タスク毎に sleep (秒)
+    help: 0 で即返却。 並列度の調整テストに便利。
+    min: 0
+    max: 60
+
+  - key: fail_pk_substr
+    type: str
+    default: ""
+    label: 失敗トリガー pk 部分文字列
+    help: pk にこの文字列を含む場合は失敗扱いにする (= リトライ / dead-letter のテスト用)。 空文字なら常に成功。
+
+hidden_kwargs:
+  - workload_slug

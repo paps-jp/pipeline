@@ -231,7 +231,7 @@ def process(task, ctx, state):
     _post_json(f"{control}/api/v1/workloads/{state['workload_slug']}/tasks",
                {"pk": f"tick-{state['counter']+1}"})
     return {"enqueued": len(items)}</code></pre>
-      <p>実際に動く完全な実装は同梱の <a href="https://github.com/paps-jp/pipeline/tree/main/plugins/rss_news_dispatcher"><code>plugins/rss_news_dispatcher/</code></a> (RSS を集めて <code>rss-news-summarize</code> に流す) が参考になります。self_loop の詳細・watchdog・singleton 化は <a href="plugin-sdk.html#self-loop">プラグインSDK</a>で解説しています。</p>
+      <p>実際に動く完全な実装は同梱の <a href="https://github.com/paps-jp/pipeline/tree/main/examples/plugins/rss_news_dispatcher"><code>examples/plugins/rss_news_dispatcher/</code></a> (RSS を集めて <code>rss-news-summarize</code> に流す) が参考になります。self_loop の詳細・watchdog・singleton 化は <a href="plugin-sdk.html#self-loop">プラグインSDK</a>で解説しています。</p>
 
       <div class="callout">
         <strong>なぜ2段に分けるのか:</strong> 「対象の発見 (I/O・低頻度)」と「重い処理 (GPU・高並列)」を別ワークロードにすると、後者だけを worker 追加で水平スケールでき、優先度も別々に付けられます。dispatcher は1台に固定 (<code>max_concurrent_total: 1</code>)、consumer は GPU ホストに複数、という配置が典型です。

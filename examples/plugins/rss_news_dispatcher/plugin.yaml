@@ -1,0 +1,64 @@
+name: rss-news-dispatcher
+description: |
+  登録した RSS / Atom フィードを 定期 fetch し、 まだ要約していない 新エントリだけを
+  `rss-news-summarize` の queue に batch enqueue する。 self-loop 方式 (= 1 tick 完了
+  → sleep → 次 tick を self-enqueue) で 1 ワーカーを 専有する。
+
+  dedup は URL 単位で per-plugin SQLite (state_db_path) に永続化する。 同じ URL は
+  二度 enqueue されない (= 同じ記事を 二度要約しない)。
+
+  feeds_path は YAML / TXT どちらでも OK:
+  - YAML: `feeds: [{name: HN, url: https://...}, ...]`  または  `[url1, url2, ...]`
+  - TXT : 1 行 1 URL (# 行頭の コメントは スキップ)
+
+workload_type: self_loop
+
+init_kwargs:
+  - key: feeds_path
+    type: path
+    default: /opt/pipeline/plugins/rss_news_dispatcher/feeds.example.yaml
+    label: フィード一覧ファイル
+    help: YAML or TXT。 各エントリの URL を 列挙したファイル
+
+  - key: target_workload
+    type: str
+    default: rss-news-summarize
+    label: enqueue 先 workload slug
+
+  - key: state_db_path
+    type: path
+    default: /opt/pipeline/plugins/rss_news_dispatcher/seen.sqlite
+    label: 既見 URL の永続化 SQLite パス
+    help: dispatcher がこのファイルに seen_url を貯める
+
+  - key: interval_s
+    type: int
+    default: 1800
+    label: ループ間隔 (秒)
+    help: 全フィード fetch + enqueue 1 周期。 デフォルト 30 分
+    min: 60
+    max: 21600
+
+  - key: max_entries_per_feed
+    type: int
+    default: 30
+    label: 1 フィードあたり最大エントリ
+    help: 上限を超える分は古い順に切り捨て
+    min: 1
+    max: 200
+
+  - key: per_feed_timeout_s
+    type: int
+    default: 15
+    label: 1 フィード fetch タイムアウト (秒)
+    min: 3
+    max: 120
+
+  - key: control_url
+    type: str
+    default: http://localhost:8001
+    label: pipeline-oss control plane URL
+    help: tick + entry の enqueue 先
+
+hidden_kwargs:
+  - workload_slug
