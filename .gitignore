@@ -34,6 +34,11 @@ scratch/
 # 公開サンプルは examples/plugins/ にある (先頭 / でリポジトリ直下のみを指す)。
 /plugins/
 
+# CLAUDE.md = 自社運用のランブック (内部ホスト・デプロイ手順)。
+# 実体は paps-jp/pipeline-plugins の .ops/CLAUDE.md で管理し、 作業ツリーには
+# 置くが公開はしない。
+/CLAUDE.md
+
 # docs/ = ワークロード内部設計 (= operator 判断で OSS リポジトリには載せない、 ローカルにだけ残す)
 docs/
 
