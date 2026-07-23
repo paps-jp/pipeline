@@ -445,6 +445,14 @@ class WorkerDaemon:
         self._gpu_temp_c: float | None = None
         self._gpu_hot_c = float(os.environ.get("PAPRIKA_GPU_HOT_C", "70"))
         self._gpu_cool_c = float(os.environ.get("PAPRIKA_GPU_COOL_C", "50"))
+        # ---- proportional (soft) throttle: hot の手前で徐々に減速する減速バンド ----
+        # WARM..HOT の間は温度が上がるほど GPU batch 後に休止を挿入し throughput を絞る。
+        # これにより全開↔全停止の振動 (duty-cycle) でなく WARM 付近で平衡してホバリングする。
+        # WARM 未満は無効 (全開)。 HOT に達したら従来の hard latch (claim 拒否) がバックストップ。
+        # WARM=0 で機能 OFF (= 従来の二値挙動)。
+        self._gpu_warm_c = float(os.environ.get("PAPRIKA_GPU_WARM_C", "72"))
+        self._gpu_soft_max_pause_s = float(os.environ.get("PAPRIKA_GPU_SOFT_MAX_PAUSE_S", "1.5"))
+        self._gpu_soft_pause_s = 0.0   # _update_thermal が毎 cycle 更新
         # GPU 非搭載レーン判定: CUDA_VISIBLE_DEVICES が空 or "-1" の worker (= cpu@ instance)
         # は requires_gpu workload を claim しない。 server 側は物理 GPU を申告してしまい
         # cpu/gpu を区別できないため、 worker 自身の CVD が唯一の確実な signal。
@@ -789,6 +797,21 @@ class WorkerDaemon:
             self._gpu_throttle = False
             log.info("GPU thermal throttle OFF (temp=%.1fC ≤ %.1fC): resuming",
                      t, self._gpu_cool_c)
+        # proportional throttle: WARM..HOT を 0..max_pause に線形マッピング。
+        prev = self._gpu_soft_pause_s
+        if self._gpu_warm_c > 0 and self._gpu_hot_c > self._gpu_warm_c:
+            frac = (t - self._gpu_warm_c) / (self._gpu_hot_c - self._gpu_warm_c)
+            frac = min(1.0, max(0.0, frac))
+            self._gpu_soft_pause_s = round(frac * self._gpu_soft_max_pause_s, 3)
+        else:
+            self._gpu_soft_pause_s = 0.0
+        # 減速の開始/解除だけログ (毎 cycle は出さない)
+        if prev == 0.0 and self._gpu_soft_pause_s > 0.0:
+            log.info("GPU soft throttle ON (temp=%.1fC ≥ warm %.1fC): pausing %.2fs/batch",
+                     t, self._gpu_warm_c, self._gpu_soft_pause_s)
+        elif prev > 0.0 and self._gpu_soft_pause_s == 0.0:
+            log.info("GPU soft throttle OFF (temp=%.1fC < warm %.1fC): full speed",
+                     t, self._gpu_warm_c)
 
     @staticmethod
     def _workload_needs_gpu(w: dict[str, Any]) -> bool:
@@ -899,6 +922,14 @@ class WorkerDaemon:
                         await self._execute_one(w, executor, t)
             finally:
                 self._current_workload = None
+            # proportional thermal throttle: GPU workload を処理した直後、 温度に応じた
+            # 休止を挿入して発熱を平衡させる (WARM 付近でホバリング → hard latch まで行かない)。
+            if self._gpu_soft_pause_s > 0.0 and self._workload_needs_gpu(w):
+                try:
+                    await asyncio.wait_for(self._stop_evt.wait(),
+                                           timeout=self._gpu_soft_pause_s)
+                except asyncio.TimeoutError:
+                    pass
             # task 実行後 (= ピーク VRAM 含む)。 rate limit 内で控えめに POST
             if w["executor_type"] == "python_module":
                 await self._maybe_report_vram(w["slug"], first_run=False)
