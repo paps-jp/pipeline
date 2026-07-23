@@ -16,8 +16,11 @@ nodes:
   y: -432
   label: crawl (URL総数)
   icon: link
-  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
-    AND TABLE_NAME='crawl'
+  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
+  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
+  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
+  metric_sql: SELECT COUNT(*) FROM crawl
+  metric_ttl_s: 900
   capacity_warn: 500000000
 - id: paprika-job-submit
   kind: workload
@@ -136,8 +139,11 @@ nodes:
   y: 401
   label: crawl_embedding_index (final)
   icon: database
-  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
-    AND TABLE_NAME='crawl_embedding_index'
+  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
+  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
+  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
+  metric_sql: SELECT COUNT(*) FROM crawl_embedding_index
+  metric_ttl_s: 900
   capacity_warn: 500000000
 - id: face_person_link_queue
   kind: tank
@@ -160,8 +166,11 @@ nodes:
   y: 408
   label: crawl_person (集約)
   icon: users-group
-  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
-    AND TABLE_NAME='crawl_person'
+  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
+  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
+  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
+  metric_sql: SELECT COUNT(*) FROM crawl_person
+  metric_ttl_s: 900
   capacity_warn: 10000000
 - id: crawl_video_hash
   kind: tank
@@ -169,8 +178,11 @@ nodes:
   y: 240
   label: crawl_video_hash (binary 集約)
   icon: fingerprint
-  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
-    AND TABLE_NAME='crawl_video_hash'
+  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
+  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
+  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
+  metric_sql: SELECT COUNT(*) FROM crawl_video_hash
+  metric_ttl_s: 300
   capacity_warn: 500000
 - id: crawl_image_hash
   kind: tank
@@ -178,8 +190,11 @@ nodes:
   y: -570
   label: crawl_image_hash (binary 集約)
   icon: fingerprint
-  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='delian'
-    AND TABLE_NAME='crawl_image_hash'
+  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
+  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
+  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
+  metric_sql: SELECT COUNT(*) FROM crawl_image_hash
+  metric_ttl_s: 900
   capacity_warn: 500000000
 - id: image_dispatcher_queue
   kind: tank

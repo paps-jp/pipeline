@@ -35,8 +35,15 @@ _DEFAULT_DB_ENV = os.environ.get("PIPELINE_ENV_FILE", "/etc/pipeline/.env")
 # tank metric cache (= 30 秒)
 # COUNT(*) on large tables can take 10-20s; poll every 30s to avoid query pile-up
 _TANK_CACHE_TTL_S = 30.0
+# これを超える TTL を宣言した tank は「重い」とみなし、 **リクエストパスで実行しない**
+# (2026-07-23)。 1.8億行の COUNT(*) は 30-40s かかるため、 同期実行すると snapshot API が
+# その間ブロックし、 過去に起きた「重いクエリで event loop が固まりフリート全体の
+# heartbeat が滞留」を再現してしまう。 重い tank は stale 値を返しつつ裏で更新する。
+_TANK_SYNC_MAX_TTL_S = 120.0
+_TANK_BG_STMT_TIMEOUT_MS = 120000   # 2min — 1.8億行 COUNT(*) 用 (背景実行のみ)
 _tank_cache: dict[str, tuple[float, int | None, str | None]] = {}
 _tank_cache_lock = threading.Lock()
+_tank_refresh_inflight: set[str] = set()
 _db_cfg_cache: tuple[float, dict[str, Any] | None] = (0.0, None)
 
 
@@ -197,22 +204,65 @@ def _coerce_num(raw: Any) -> float | int:
     return int(f) if f.is_integer() else f
 
 
-def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[float | None, str | None]]:
-    """tank_id → (value, error) を 1 接続でまとめて返す。 cache + DB 接続失敗時は全 tank に error。"""
+def _exec_tanks(tank_sqls: dict[str, str],
+                ttls: dict[str, float] | None = None,
+                ) -> dict[str, tuple[float | None, str | None]]:
+    """tank_id → (value, error) を 1 接続でまとめて返す。 cache + DB 接続失敗時は全 tank に error。
+
+    ttls は tank_id → TTL 秒 (未指定は _TANK_CACHE_TTL_S)。 TTL が _TANK_SYNC_MAX_TTL_S を
+    超える tank は「重い COUNT(*)」とみなし、 **リクエストパスでは実行せず** stale 値を
+    返してバックグラウンドスレッドで更新する (初回のみ値なし=None)。
+    """
+    ttls = ttls or {}
     now = time.monotonic()
     results: dict[str, tuple[float | None, str | None]] = {}
     to_query: dict[str, str] = {}
+    to_bg: dict[str, str] = {}
 
     # 1. cache から取れるものは取る
     with _tank_cache_lock:
         for tid, sql in tank_sqls.items():
+            ttl = float(ttls.get(tid) or _TANK_CACHE_TTL_S)
             cached = _tank_cache.get(tid)
-            if cached and (now - cached[0]) < _TANK_CACHE_TTL_S:
+            if cached and (now - cached[0]) < ttl:
                 results[tid] = (cached[1], cached[2])
+                continue
+            if ttl > _TANK_SYNC_MAX_TTL_S:
+                # 重い tank: stale を返して裏で更新 (リクエストは絶対にブロックしない)
+                results[tid] = (cached[1], cached[2]) if cached else (None, None)
+                if tid not in _tank_refresh_inflight:
+                    _tank_refresh_inflight.add(tid)
+                    to_bg[tid] = sql
             else:
                 to_query[tid] = sql
+    if to_bg:
+        threading.Thread(target=_tank_refresh_bg, args=(to_bg,),
+                         name="tank-refresh", daemon=True).start()
     if not to_query:
         return results
+    results.update(_tank_query(to_query))
+    return results
+
+
+def _tank_refresh_bg(to_query: dict[str, str]) -> None:
+    """重い tank をリクエストパス外で実行して cache を温める (daemon thread)。"""
+    try:
+        # 1.8億行の COUNT(*) は 30-40s かかる。 リクエストパス外なので余裕を持たせる。
+        _tank_query(to_query, stmt_timeout_ms=_TANK_BG_STMT_TIMEOUT_MS)
+    except Exception as e:                       # スレッドを絶対に落とさない
+        log.warning("tank background refresh failed: %s", e)
+    finally:
+        with _tank_cache_lock:
+            for tid in to_query:
+                _tank_refresh_inflight.discard(tid)
+
+
+def _tank_query(to_query: dict[str, str],
+                stmt_timeout_ms: int | None = None,
+                ) -> dict[str, tuple[float | None, str | None]]:
+    """SQL を実行して cache を更新し tank_id → (value, error) を返す。"""
+    now = time.monotonic()
+    results: dict[str, tuple[float | None, str | None]] = {}
 
     # 2. DB 接続
     cfg = _read_db_cfg()
@@ -222,10 +272,13 @@ def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[float | None, str 
             results[tid] = (None, err)
         return results
 
+    # ドライバ側の read_timeout は SQL の max_statement_time より少し長く取る
+    # (SQL 側で先に打ち切らせ、 ソケットを途中で切らない)。
+    _read_to = int((stmt_timeout_ms or 25000) / 1000) + 5
     # mariadb (C wrapper) があれば優先、 無ければ pure-python pymysql。
     try:
         import mariadb  # type: ignore
-        connect = lambda c: mariadb.connect(**{**c, "read_timeout": 28})  # noqa: E731
+        connect = lambda c: mariadb.connect(**{**c, "read_timeout": _read_to})  # noqa: E731
     except ImportError:
         try:
             import pymysql  # type: ignore
@@ -233,7 +286,7 @@ def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[float | None, str 
                 host=c["host"], port=c["port"], user=c["user"],
                 password=c["password"], database=c["database"],
                 connect_timeout=c.get("connect_timeout", 3),
-                read_timeout=30, autocommit=True,
+                read_timeout=_read_to, autocommit=True,
             )
         except ImportError:
             err = "no mysql driver (install pymysql)"
@@ -243,7 +296,7 @@ def _exec_tanks(tank_sqls: dict[str, str]) -> dict[str, tuple[float | None, str 
 
     # tank ごとに独立した短命接続を張る (= 1 query の失敗が他 tank を巻き込まない)。
     # 大きな表の COUNT が timeout しても他 tank の water level は読める。
-    _STMT_TIMEOUT_MS = 25000  # 25s — 大テーブル COUNT の上限
+    _STMT_TIMEOUT_MS = int(stmt_timeout_ms or 25000)  # 既定 25s — 大テーブル COUNT の上限
     for tid, sql in to_query.items():
         if not _safe_sql(sql):
             results[tid] = (None, "unsafe sql")
@@ -473,9 +526,13 @@ def snapshot(req: Request) -> FlowSnapshot:
 
     # 2. tank SQL を一括評価 (edge の metric_sql も同じ 1 接続に相乗りさせる)
     tank_sqls: dict[str, str] = {}
+    tank_ttls: dict[str, float] = {}
     for n in nodes_raw:
         if n.get("kind") == "tank" and n.get("metric_sql"):
             tank_sqls[n["id"]] = n["metric_sql"]
+            # 重い COUNT(*) は yaml で metric_ttl_s を長めに宣言する (背景更新に回る)
+            if n.get("metric_ttl_s"):
+                tank_ttls[n["id"]] = float(n["metric_ttl_s"])
         # 総容量も DB から引く tank (= RAM ディスクの total_bytes)。 yaml の
         # capacity_warn に固定値を書くと、 ディスクを拡張した時に嘘の分母になる。
         if n.get("kind") == "tank" and n.get("capacity_sql"):
@@ -483,7 +540,7 @@ def snapshot(req: Request) -> FlowSnapshot:
     for i, e in enumerate(edges_raw):
         if e.get("metric_sql"):
             tank_sqls[f"__edge{i}"] = e["metric_sql"]
-    tank_results = _exec_tanks(tank_sqls) if tank_sqls else {}
+    tank_results = _exec_tanks(tank_sqls, tank_ttls) if tank_sqls else {}
 
     # 3. nodes 組み立て
     nodes: list[FlowNode] = []
