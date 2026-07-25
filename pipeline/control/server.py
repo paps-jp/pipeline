@@ -143,6 +143,16 @@ def create_app(settings: Settings) -> FastAPI:
                     if updated or pruned:
                         log.info("vram aggregator: updated=%d pruned=%d",
                                  updated, pruned)
+                    # observed_vram_mb_peak の poison-pill 自己修復 (2026-07-26):
+                    # robust 再推定 + stale 減衰 + hard ceiling で「化けた peak が居座り
+                    # workload を全 host から締め出す」 現象を毎周期補正する。
+                    reconciled = wlrepo.reconcile_vram_peaks()
+                    if reconciled:
+                        log.warning(
+                            "vram peak reconcile: %s",
+                            [(c["slug"], c["from"], c["to"], c["reason"])
+                             for c in reconciled],
+                        )
                 except Exception:
                     log.exception("vram aggregator failed")
                 try:

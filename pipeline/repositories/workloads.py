@@ -14,6 +14,14 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# observed_vram_mb_peak の write 時クランプ係数。 単一サンプル (arena 過大確保 / OOM
+# ×1.2 ラチェット / 一時 spike) が peak を declared の K 倍超へ暴走させるのを源流で止める。
+# 精密な host 容量ベース上限と robust 再推定は reconcile_vram_peaks (60s loop) が行う。
+# K は reconcile の hard ceiling (= min(declared*4, 最小GPU容量*0.6)) を必ず下回る値にする
+# こと。 上回ると write が peak を ceiling 超へ押し上げ、 loop が毎周期押し戻して振動する。
+_VRAM_WRITE_CLAMP_K = 3
+
+
 def _row_to_workload(row: dict[str, Any]) -> Workload:
     """SQLite row → Pydantic Workload。JSON 列をパースする。"""
     parsed = dict(row)
@@ -234,6 +242,11 @@ class WorkloadRepository:
             return None
         prev = current.observed_vram_mb_peak or 0
         new_peak = max(int(prev * 0.95), int(used_mb))
+        # 単一サンプルによる peak 暴走 (arena 過大確保 / OOM ラチェット) を write 時点で
+        # 粗くクランプ。 host 容量ベースの精密上限と robust 再推定は 60s loop が行う。
+        declared = int((current.resources or {}).get("vram_mb") or 0)
+        if declared > 0:
+            new_peak = min(new_peak, declared * _VRAM_WRITE_CLAMP_K)
         ts = _utcnow()
         with self.db.transaction() as conn:
             conn.execute(
@@ -312,6 +325,107 @@ class WorkloadRepository:
                 except Exception:
                     continue
         return updated
+
+    def _smallest_gpu_capacity_mb(self) -> int:
+        """active な GPU worker が resources.gpu_vram_mb で申告した最小の物理 VRAM 容量。
+        hard ceiling (= どの GPU にも必ず載る絶対上限) の算定に使う。 申告が無ければ 0。"""
+        smallest = 0
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT resources FROM workers "
+                "WHERE state IN ('active','running','claiming','draining')"
+            ).fetchall()
+        for r in rows:
+            raw = r["resources"] if hasattr(r, "keys") else r[0]
+            try:
+                res = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except Exception:
+                continue
+            mb = int(res.get("gpu_vram_mb") or 0)
+            if mb > 0 and (smallest == 0 or mb < smallest):
+                smallest = mb
+        return smallest
+
+    def reconcile_vram_peaks(
+        self,
+        *,
+        obs_window_min: int = 30,
+        ceil_declared_k: int = 4,
+        ceil_capacity_frac: float = 0.6,
+        stale_decay: float = 0.90,
+        rel_change_min: float = 0.02,
+    ) -> list[dict[str, Any]]:
+        """observed_vram_mb_peak の poison-pill を毎周期補正する (2026-07-26)。
+
+        真因: 混雑 GPU の arena 過大確保 / OOM ×1.2 ラチェット / 一時 spike が peak を
+        実需の数倍へ吊り上げ、 その peak は「新観測が来た時だけ ×0.95 減衰」 する仕様の
+        ため、 VRAM 予算ゲート (workloads_for_worker) が workload を全 host から締め出すと
+        新観測が途絶えて peak が永久固着 → image-hash-extract 全停止。
+
+        v1 の方針は **peak を下げる方向のみ** (over-provision 回帰を作らない):
+          1. hard ceiling = max(1, min(declared*K, smallest_gpu_capacity*frac)):
+             観測が壊れていても・全滅していても、 どの GPU にも必ず載る絶対上限。 これ 1 つで
+             「全 host 除外」 は構造的に起きなくなる。
+          2. stale 減衰: 窓内に観測が無い (= starve 疑い) slug の高すぎる peak を declared に
+             向けて ×stale_decay で下げ、 凍結を解く。
+        観測が正常に流れている間の accurate な追従は record_vram_observation の max(prev*0.95,
+        used) に任せる (= v1 は触らない)。 両端 outlier を棄却する robust 再推定 (cross-host
+        統計) は onnxruntime arena の実上限固定と対でないと OOM/密度いずれかを回帰させるため
+        v2 に回す。
+
+        返り値 = 変更した workload の {slug, from, to, reason, ...} のリスト。
+        """
+        import datetime as _dt
+
+        cutoff = (_dt.datetime.now(_dt.timezone.utc)
+                  - _dt.timedelta(minutes=obs_window_min)).isoformat()
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT slug FROM vram_observations WHERE ts >= :c",
+                {"c": cutoff},
+            ).fetchall()
+        fresh_slugs = {(r["slug"] if hasattr(r, "keys") else r[0]) for r in rows}
+        smallest_cap = self._smallest_gpu_capacity_mb()
+
+        changes: list[dict[str, Any]] = []
+        for w in self.list_all():
+            declared = int((w.resources or {}).get("vram_mb") or 0)
+            if not (w.requires_gpu or declared > 0):
+                continue
+            peak = int(w.observed_vram_mb_peak or 0)
+            if peak <= 0:
+                continue
+            # hard ceiling (絶対上限)。 算定材料が無ければ None (= ceiling 無効)。
+            ceil_cands: list[int] = []
+            if declared > 0:
+                ceil_cands.append(declared * ceil_declared_k)
+            if smallest_cap > 0:
+                ceil_cands.append(int(smallest_cap * ceil_capacity_frac))
+            ceiling = max(1, min(ceil_cands)) if ceil_cands else None
+
+            new_peak = peak
+            reason: str | None = None
+            # 1) stale 減衰: 観測が無く、 かつ declared より高い peak を declared 方向へ下げる。
+            if w.slug not in fresh_slugs and declared > 0 and peak > declared:
+                decayed = max(declared, int(peak * stale_decay))
+                if decayed < new_peak:
+                    new_peak, reason = decayed, "stale-decay"
+            # 2) hard ceiling: 常に絶対上限でクランプ。
+            if ceiling is not None and new_peak > ceiling:
+                new_peak, reason = ceiling, "ceiling"
+
+            # v1 は下げ方向のみ (record_vram_observation の上げ追従を邪魔しない)。
+            if new_peak < peak and (peak - new_peak) >= max(1, int(peak * rel_change_min)):
+                with self.db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE workloads SET observed_vram_mb_peak = :p WHERE slug = :s",
+                        {"p": int(new_peak), "s": w.slug},
+                    )
+                changes.append({
+                    "slug": w.slug, "from": peak, "to": int(new_peak),
+                    "reason": reason, "declared": declared, "ceiling": ceiling,
+                })
+        return changes
 
     def update_observed_rates(self, rates: dict[str, float]) -> int:
         """slug → 件数/min を workloads.observed_rate に一括 UPDATE (= 既存列流用)。
