@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -26,6 +27,22 @@ log = logging.getLogger(__name__)
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _is_deadlock(exc: BaseException) -> bool:
+    """MariaDB/InnoDB の deadlock(1213) / lock wait timeout(1205) を判定。
+
+    どちらも「トランザクションを rollback して再実行すれば解消する」種類 (MySQL 公式:
+    17.7.5.3 How to Minimize and Handle Deadlocks)。 claim はこれを握って retry する。
+    """
+    code = None
+    args = getattr(exc, "args", None)
+    if args:
+        code = args[0]
+    if code in (1213, 1205):
+        return True
+    msg = str(exc).lower()
+    return "deadlock" in msg or "try restarting transaction" in msg or "lock wait timeout" in msg
 
 
 def _validate_queue_table(name: str) -> None:
@@ -170,82 +187,98 @@ class QueueRepository:
         ).isoformat(timespec="microseconds")
 
         # MariaDB (secondary) backend は 2 段 SELECT ... FOR UPDATE SKIP LOCKED で claim する。
-        # 旧実装の UPDATE-WHERE-pk-IN-(SELECT ... ORDER BY LIMIT) は並行 worker が同一候補行
-        # (ORDER BY enqueued_at の先頭) を奪い合い Deadlock(1213) を頻発させる (= 並行 claim が
-        # 増えると claim が 500 で失敗しスループット天井になる)。 SKIP LOCKED で互いに素な行を
-        # 掴めば deadlock が構造的に消える (dispatcher._claim_pending_videos と同じパターン)。
-        # SQLite は SKIP LOCKED 非対応なので従来の CAS 風 UPDATE-WHERE を維持する。
+        # SKIP LOCKED は「行ロック」の奪い合いは避けるが、 既定 REPEATABLE READ では範囲スキャン
+        # (ORDER BY enqueued_at ...) が gap/next-key lock を取り、 並行 enqueue(INSERT) と衝突して
+        # なお Deadlock(1213) を起こす。 恒久対策は 2 段構え (DB-backed job queue の定石):
+        #   ① queue 接続を READ COMMITTED にして gap lock を無効化 (pipeline/db/mariadb.py)。
+        #   ② それでも残る稀な deadlock/lock-wait は victim を rollback して retry する (下記)。
+        # SQLite は SKIP LOCKED 非対応なので従来の CAS 風 UPDATE-WHERE を維持する
+        # (SQLite の BUSY は別機構でハンドリング)。
         secondary = (
             self._backend_map.get(queue_table) == "secondary"
             and self.secondary_db is not None
         )
-        with self._get_db(queue_table).transaction() as conn:
-            if secondary:
-                sel = conn.execute(
-                    f"""
-                    SELECT pk FROM {queue_table}
-                    WHERE state='pending'
-                       OR (state='claimed' AND claimed_at < :cutoff)
-                    ORDER BY enqueued_at, pk
-                    LIMIT :lim
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    {"cutoff": lease_cutoff, "lim": int(limit)},
-                )
-                pks = [r["pk"] for r in sel.fetchall()]
-                if not pks:
-                    return []
-                ph = ", ".join(f":p{i}" for i in range(len(pks)))
-                pk_params = {f"p{i}": pk for i, pk in enumerate(pks)}
-                conn.execute(
-                    f"""
-                    UPDATE {queue_table}
-                    SET state='claimed',
-                        claimed_at=:now,
-                        claimed_by=:wid,
-                        updated_at=:now
-                    WHERE pk IN ({ph})
-                    """,
-                    {"now": now_iso, "wid": worker_id, **pk_params},
-                )
-                cur = conn.execute(
-                    f"""
-                    SELECT pk, attempt, extra, enqueued_at
-                    FROM {queue_table}
-                    WHERE pk IN ({ph})
-                    ORDER BY enqueued_at, pk
-                    """,
-                    pk_params,
-                )
-                rows = cur.fetchall()
-            else:
-                conn.execute(
-                    f"""
-                    UPDATE {queue_table}
-                    SET state='claimed',
-                        claimed_at=:now,
-                        claimed_by=:wid,
-                        updated_at=:now
-                    WHERE pk IN (
-                        SELECT pk FROM {queue_table}
-                        WHERE state='pending'
-                           OR (state='claimed' AND claimed_at < :cutoff)
-                        ORDER BY enqueued_at, pk
-                        LIMIT :lim
-                    )
-                    """,
-                    {"now": now_iso, "wid": worker_id, "cutoff": lease_cutoff, "lim": int(limit)},
-                )
-                cur = conn.execute(
-                    f"""
-                    SELECT pk, attempt, extra, enqueued_at
-                    FROM {queue_table}
-                    WHERE state='claimed' AND claimed_by=:wid AND claimed_at=:now
-                    ORDER BY enqueued_at, pk
-                    """,
-                    {"wid": worker_id, "now": now_iso},
-                )
-                rows = cur.fetchall()
+        max_attempts = 5
+        rows: list = []
+        for attempt in range(max_attempts):
+            try:
+                with self._get_db(queue_table).transaction() as conn:
+                    if secondary:
+                        sel = conn.execute(
+                            f"""
+                            SELECT pk FROM {queue_table}
+                            WHERE state='pending'
+                               OR (state='claimed' AND claimed_at < :cutoff)
+                            ORDER BY enqueued_at, pk
+                            LIMIT :lim
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            {"cutoff": lease_cutoff, "lim": int(limit)},
+                        )
+                        pks = [r["pk"] for r in sel.fetchall()]
+                        if not pks:
+                            return []
+                        ph = ", ".join(f":p{i}" for i in range(len(pks)))
+                        pk_params = {f"p{i}": pk for i, pk in enumerate(pks)}
+                        conn.execute(
+                            f"""
+                            UPDATE {queue_table}
+                            SET state='claimed',
+                                claimed_at=:now,
+                                claimed_by=:wid,
+                                updated_at=:now
+                            WHERE pk IN ({ph})
+                            """,
+                            {"now": now_iso, "wid": worker_id, **pk_params},
+                        )
+                        cur = conn.execute(
+                            f"""
+                            SELECT pk, attempt, extra, enqueued_at
+                            FROM {queue_table}
+                            WHERE pk IN ({ph})
+                            ORDER BY enqueued_at, pk
+                            """,
+                            pk_params,
+                        )
+                        rows = cur.fetchall()
+                    else:
+                        conn.execute(
+                            f"""
+                            UPDATE {queue_table}
+                            SET state='claimed',
+                                claimed_at=:now,
+                                claimed_by=:wid,
+                                updated_at=:now
+                            WHERE pk IN (
+                                SELECT pk FROM {queue_table}
+                                WHERE state='pending'
+                                   OR (state='claimed' AND claimed_at < :cutoff)
+                                ORDER BY enqueued_at, pk
+                                LIMIT :lim
+                            )
+                            """,
+                            {"now": now_iso, "wid": worker_id, "cutoff": lease_cutoff, "lim": int(limit)},
+                        )
+                        cur = conn.execute(
+                            f"""
+                            SELECT pk, attempt, extra, enqueued_at
+                            FROM {queue_table}
+                            WHERE state='claimed' AND claimed_by=:wid AND claimed_at=:now
+                            ORDER BY enqueued_at, pk
+                            """,
+                            {"wid": worker_id, "now": now_iso},
+                        )
+                        rows = cur.fetchall()
+                break  # claim 成功
+            except Exception as e:
+                if _is_deadlock(e) and attempt < max_attempts - 1:
+                    # victim は既に rollback 済 (transaction() が rollback して re-raise)。
+                    # 短い exponential backoff を挟んで別 now_iso で再試行する。
+                    time.sleep(0.01 * (2 ** attempt))
+                    now_iso = _utcnow_iso()
+                    log.debug("claim deadlock on %s (attempt %d) — retrying", queue_table, attempt + 1)
+                    continue
+                raise
 
         return [
             ClaimedTask(

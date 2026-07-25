@@ -213,12 +213,25 @@ class MariadbDatabase(Database):
 
     def _make_conn(self):
         import pymysql
-        return pymysql.connect(
+        conn = pymysql.connect(
             host=self._host, port=self._port,
             user=self._user, password=self._password,
             database=self._db, autocommit=False,
             charset="utf8mb4",
         )
+        # この DB は業務 queue 専用 (QueueRepository のみが使う)。 既定 REPEATABLE READ だと
+        # claim の範囲スキャン (ORDER BY enqueued_at ... FOR UPDATE SKIP LOCKED) が gap/next-key
+        # lock を取り、 並行 enqueue(INSERT) と衝突して SKIP LOCKED でも Deadlock(1213) を起こす。
+        # READ COMMITTED は gap lock を無効化するため、 この種の deadlock を構造的に解消する
+        # (DB-backed job queue の定石。 queue 操作は PK 単位 or SKIP LOCKED claim なので
+        #  phantom read 保護は不要)。
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            conn.commit()
+        except Exception:
+            log.warning("failed to set READ COMMITTED on queue connection", exc_info=False)
+        return conn
 
     def _acquire(self, timeout: float = 30.0):
         """pool から 1 本取得。 なければ pool_size 未満の間は新規作成、
