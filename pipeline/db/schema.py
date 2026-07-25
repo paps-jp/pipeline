@@ -490,7 +490,32 @@ CREATE TABLE IF NOT EXISTS agent_desired (
 # 既存 DB (先に template 無しで作成済) に列を後付けする idempotent ALTER。
 AGENT_DESIRED_ALTERS = [
     "ALTER TABLE agent_desired ADD COLUMN template_json TEXT",
+    # agent が nvidia-smi で自動検出する GPU 型番 (= host capability の auto 面)。
+    "ALTER TABLE agent_desired ADD COLUMN last_gpu_model TEXT",
 ]
+
+
+# --- host_policy (ホスト単位の能力/配置ポリシー: operator の手動上書き) -----
+# 目的: 異機種フリート (10GB 民生 3080 と 16GB Blackwell 混在) で supervisor が
+# ホストを均一に扱えない問題への対処。 agent が自動検出した VRAM/型番 (agent_desired.
+# last_vram_total_mb / last_gpu_model) を "auto 面"、 この表を operator の "手動上書き面"
+# とし、 supervisor が両者を merge して配置判断する。 手動値が NULL の項目は auto に従う。
+#   - tier             : 'gpu-16g-pro' 等の分類ラベル (NULL=vram_total から自動推定)
+#   - max_gpu_workers  : 同時 GPU worker 上限 (10GB は少なく。 NULL=無制限)
+#   - vram_override_mb : VRAM budget の手動上書き (NULL=agent 実測 last_vram_total_mb)
+HOST_POLICY_DDL = """
+CREATE TABLE IF NOT EXISTS host_policy (
+    host             TEXT PRIMARY KEY,
+    tier             TEXT,
+    max_gpu_workers  INTEGER,
+    vram_override_mb INTEGER,
+    labels           TEXT NOT NULL DEFAULT '[]',
+    notes            TEXT,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    updated_at       TEXT,
+    updated_by       TEXT
+);
+"""
 
 
 ALL_DDL = [
@@ -515,6 +540,7 @@ ALL_DDL = [
     LLM_CALLS_DDL,
     VRAM_OBSERVATIONS_DDL,
     FLEET_STOP_DDL,
+    HOST_POLICY_DDL,
 ]
 
 
