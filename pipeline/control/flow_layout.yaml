@@ -16,9 +16,6 @@ nodes:
   y: -432
   label: crawl (URL総数)
   icon: link
-  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
-  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
-  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
   metric_sql: SELECT COUNT(*) FROM crawl
   metric_ttl_s: 900
   capacity_warn: 500000000
@@ -31,11 +28,11 @@ nodes:
   workload_slug: paprika-job-submit
 - id: paprika-hub
   kind: external
-  x: 330
-  y: -224
+  x: 331
+  y: -213
   label: paprika hub
   icon: server
-  url: ""   # サイト固有の外部リンク (未設定可)
+  url: ''
 - id: paprika-image-pull
   kind: workload
   x: 578
@@ -45,24 +42,17 @@ nodes:
   workload_slug: paprika-image-pull
 - id: crawl_image
   kind: tank
-  x: 598
-  y: -69
+  x: 772
+  y: -83
   label: crawl_image (未hash)
   icon: photo
   metric_sql: SELECT COUNT(*) FROM crawl_image WHERE hash_id IS NULL AND ignore_reason
     IS NULL
   capacity_warn: 500000000
-- id: image-dispatcher
-  kind: workload
-  x: 922
-  y: -245
-  label: 画像 dispatch
-  icon: arrows-split
-  workload_slug: image-dispatcher
 - id: image_hash_extract_queue
   kind: tank
-  x: 942
-  y: -433
+  x: 872
+  y: -418
   label: img_hash_q
   icon: list
   metric_sql: SELECT COUNT(*) FROM image_hash_extract_queue WHERE state='pending'
@@ -74,6 +64,9 @@ nodes:
   label: hash + detect
   icon: scan
   workload_slug: image-hash-extract
+  # supervisor 需要ベース配分: 上流タンクにまだ在庫があれば動かす。
+  # crawl_image の filter は「downloaded_at is not null AND hash_id is null」= 未hash画像実残数。
+  demand_from: [image_hash_extract_queue, crawl_image]
 - id: crawl_face
   kind: tank
   x: 1243
@@ -89,10 +82,14 @@ nodes:
   label: embed 計算
   icon: brain
   workload_slug: image-embed
+  # supervisor 需要ベース配分: crawl_face の filter は adaface_ready=0 (=未embed実残数)。
+  # dispatcher-elimination 後、 embed は crawl_face から直 claim するため
+  # image_embed_queue はほぼ 0 = 自 backlog では真の需要 (~74M) が見えない。
+  demand_from: [image_embed_queue, crawl_face]
 - id: paprika-video-pull
   kind: workload
-  x: 316
-  y: -58
+  x: 310
+  y: -63
   label: 動画 pull
   icon: video
   workload_slug: paprika-video-pull
@@ -118,6 +115,8 @@ nodes:
   label: 動画→顔抽出
   icon: faces
   workload_slug: video-face-extract
+  # supervisor 需要ベース配分。 video_face_extract_queue が自 queue (dispatcher が enqueue)。
+  demand_from: [video_face_extract_queue]
 - id: embed-write
   kind: workload
   x: 1223
@@ -139,9 +138,6 @@ nodes:
   y: 401
   label: crawl_embedding_index (final)
   icon: database
-  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
-  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
-  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
   metric_sql: SELECT COUNT(*) FROM crawl_embedding_index
   metric_ttl_s: 900
   capacity_warn: 500000000
@@ -166,44 +162,27 @@ nodes:
   y: 408
   label: crawl_person (集約)
   icon: users-group
-  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
-  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
-  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
   metric_sql: SELECT COUNT(*) FROM crawl_person
   metric_ttl_s: 900
-  capacity_warn: 10000000
+  capacity_warn: 500000000
 - id: crawl_video_hash
   kind: tank
-  x: 935
-  y: 240
+  x: 934
+  y: 218
   label: crawl_video_hash (binary 集約)
   icon: fingerprint
-  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
-  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
-  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
   metric_sql: SELECT COUNT(*) FROM crawl_video_hash
   metric_ttl_s: 300
-  capacity_warn: 500000
+  capacity_warn: 500000000
 - id: crawl_image_hash
   kind: tank
   x: 610
   y: -570
   label: crawl_image_hash (binary 集約)
   icon: fingerprint
-  # TABLE_ROWS は InnoDB の推定値で実数と 10% ずれ、 統計再計算のたびに上下する
-  # (2026-07-23: embedding が 72.9M→69.2M と「減った」ように見えた誤報の原因)。
-  # 実カウントに変更。 重いので metric_ttl_s で背景更新に回す。
   metric_sql: SELECT COUNT(*) FROM crawl_image_hash
   metric_ttl_s: 900
   capacity_warn: 500000000
-- id: image_dispatcher_queue
-  kind: tank
-  x: 941
-  y: -65
-  label: img_dispatch_q
-  icon: list
-  metric_sql: SELECT COUNT(*) FROM image_dispatcher_queue WHERE state='pending'
-  capacity_warn: 50000
 - id: image_embed_queue
   kind: tank
   x: 1252
@@ -308,25 +287,18 @@ edges:
   to: crawl_image
   label: img/tick
   metric_field: inserted
-- from: crawl_image
-  to: image-dispatcher
-- from: image-dispatcher
+- from: paprika-image-pull
   to: image_hash_extract_queue
-  label: enq
-  metric_field: hash_detect_enqueued
 - from: image_hash_extract_queue
   to: image-hash-extract
 - from: image-hash-extract
   to: crawl_face
-  label: face
 - from: image-hash-extract
   to: crawl_image_hash
   label: hash
 - from: crawl_image_hash
   to: image-hash-extract
   dashed: true
-- from: crawl_face
-  to: image-embed
 - from: image-embed
   to: embed_write_queue
   label: write_q
@@ -345,6 +317,8 @@ edges:
   label: face/run
   metric_field: face_ids_inserted
 - from: video-face-extract
+  to: image_embed_queue
+- from: video-face-extract
   to: crawl_video_hash
   label: hash
 - from: crawl_video_hash
@@ -355,7 +329,7 @@ edges:
 - from: embed-write
   to: crawl_embedding_final
   label: final
-  metric_field: claimed
+  metric_field: deleted_from_queue
 - from: embed-write
   to: face_person_link_queue
   label: enq
@@ -366,15 +340,10 @@ edges:
   label: person
 - from: image-hash-extract
   to: image_embed_queue
-  label: enq
 - from: image_embed_queue
   to: image-embed
 - from: video_face_extract_queue
   to: video-face-extract
-- from: image-dispatcher
-  to: image_dispatcher_queue
-- from: image_dispatcher_queue
-  to: image-dispatcher
 - from: video-dispatcher
   to: video_dispatcher_queue
 - from: video_dispatcher_queue

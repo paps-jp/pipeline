@@ -70,6 +70,11 @@ class FlowNode(BaseModel):
     # workload の最新 run が失敗した時のエラー文言 + 実行 worker (= GPU故障等の緊急検知用)。
     # tank と違い workload node ではこれまで未設定だった (state=failed だけ)。
     error_worker: str | None = None
+    # 需要ベース配分の宣言 (2026-07-28): この workload が「食う」上流 tank id 集合。
+    # supervisor が /api/v1/flow/snapshot 経由でここ宣言のタンク残量を集計し、
+    # elastic scaler の pending (=want算定入力) に注入する。 dispatcher-elimination 後、
+    # 自 queue が push-drain 済で 0 の workload の真の需要はここでしか見えない。
+    demand_from: list[str] | None = None
 
 
 class FlowEdge(BaseModel):
@@ -556,6 +561,7 @@ def snapshot(req: Request) -> FlowSnapshot:
             url=n.get("url"),
             capacity_warn=n.get("capacity_warn"),
             unit=n.get("unit"),
+            demand_from=n.get("demand_from"),
         )
         if node.kind == "workload":
             slug = node.workload_slug or node.id
