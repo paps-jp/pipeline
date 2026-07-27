@@ -33,11 +33,8 @@ WORKLOAD_METRIC_FIELDS: dict[str, list[str]] = {
     # を混ぜず、 純粋な「hub 発生数」を出す。
     "paprika-job-submit": ["submitted"],
     # dispatcher (= 自己 tick で N 件を後段 queue に enqueue)
-    "image-dispatcher": [
-        "hash_detect_enqueued",
-        "embed_image_enqueued",
-        "embed_movie_enqueued",
-    ],
+    # image-dispatcher は 2026-07-28 完全廃止 (hot path は直 claim、safety net は
+    # pipeline_supervisor の _orphan_reconcile_run に統合)。 metric field 定義も削除。
     "video-dispatcher": ["enqueued"],
     # embed-write (= 1 tick で N 行 shard に書込み)。
     # 注意: output_json["written"] は {"image": N} の dict なので JSON_EXTRACT の SUM が
