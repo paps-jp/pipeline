@@ -305,14 +305,16 @@ def main() -> int:
             if old != nk:
                 items.append((fid, old, nk))
         if not items:
-            _save_state(state_file, last_id, done, total)
+            if args.apply:
+                _save_state(state_file, last_id, done, total)
             continue
 
         if not args.apply:
+            # DRY-RUN は state を書かない (書くと後続の --apply が
+            # 進めた位置から再開して未移行行を skip する)
             for fid, old, nk in items[:5]:
                 print("  %s\n    -> %s" % (old, nk), flush=True)
             done += len(items)
-            _save_state(state_file, last_id, done, total)
             if args.limit and done >= args.limit:
                 break
             continue
