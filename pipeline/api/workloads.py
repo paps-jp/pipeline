@@ -58,6 +58,11 @@ class EnableRequest(BaseModel):
     enabled: bool
 
 
+class HostAffinityRequest(BaseModel):
+    """host_affinity の部分更新 (ホスト設定画面の「許可ホスト」トグル)。"""
+    hosts: list[str] = Field(default_factory=list, max_length=200)
+
+
 class EnqueueRequest(BaseModel):
     pk: str = Field(min_length=1, description="task の primary key")
     extra: dict[str, Any] = Field(default_factory=dict)
@@ -186,6 +191,20 @@ def patch_supervisor_enabled(slug: str, body: EnableRequest, request: Request) -
     """
     try:
         return _repo(request).set_supervisor_enabled(slug, body.enabled)
+    except WorkloadNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.patch("/{slug}/host_affinity", response_model=Workload)
+def patch_host_affinity(slug: str, body: HostAffinityRequest, request: Request) -> Workload:
+    """この workload を動かして良いホストの集合を差し替える (空 = 制約なし)。
+
+    ホスト設定画面から「ai-gpu8 でも image-hash-extract を動かす」を 1 クリックで
+    行うための部分更新。 supervisor の elastic/planner は affinity を絶対制約として
+    扱うので、 ここに入っていないホストには何台 desired を積んでも claim できない。
+    """
+    try:
+        return _repo(request).set_host_affinity(slug, body.hosts)
     except WorkloadNotFound as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 

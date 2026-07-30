@@ -213,6 +213,21 @@ class WorkloadRepository:
             )
         return self.get(slug)
 
+    def set_host_affinity(self, slug: str, hosts: list[str]) -> Workload:
+        """host_affinity だけを差し替える (他列は不変)。
+
+        UI の「このホストでこの workload を許可する」トグル用。 PUT /workloads/{slug} は
+        WorkloadUpdate 全体置換なので、 affinity だけ変えたい呼び出しで他列 (executor_config
+        や lease_secs 等) を取りこぼす事故が起きる。 専用の部分更新にする。
+        """
+        self.get(slug)  # raises if not found
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE workloads SET host_affinity = :ha, updated_at = :ts WHERE slug = :slug",
+                {"ha": json.dumps(list(hosts)), "ts": _utcnow(), "slug": slug},
+            )
+        return self.get(slug)
+
     def set_supervisor_enabled(self, slug: str, enabled: bool) -> Workload:
         """supervisor の自動介入を許可するか個別 toggle。"""
         self.get(slug)  # raises if not found

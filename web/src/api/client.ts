@@ -321,6 +321,12 @@ export const api = {
     );
   },
 
+  setWorkloadHostAffinity: (slug: string, hosts: string[]) =>
+    request<Workload>(`/api/v1/workloads/${slug}/host_affinity`, {
+      method: "PATCH",
+      json: { hosts },
+    }),
+
   flowSnapshot: () => request<FlowSnapshot>("/api/v1/flow/snapshot"),
   saveFlowLayout: (positions: Array<{ id: string; x: number; y: number }>) =>
     request<{ updated: number; skipped: number }>("/api/v1/flow/layout", {
@@ -529,6 +535,92 @@ export const deployApi = {
     request<DeployPath>(`/api/v1/admin/deploy-paths/${id}`, { method: "PUT", json: body }),
   deletePath: (id: number) =>
     request<void>(`/api/v1/admin/deploy-paths/${id}`, { method: "DELETE" }),
+};
+
+// ---------------- ホスト設定 (host_policy + agent desired) ----------------
+
+/** GET /api/v1/host-policy の 1 行。 auto 面 (agent の nvidia-smi 検出) と
+ *  manual 面 (operator の上書き) を merge した effective 込み。 */
+export interface HostPolicy {
+  host: string;
+  // auto 面
+  gpu_model: string | null;
+  vram_total_mb: number | null;
+  vram_free_mb: number | null;
+  gpu_children_alive: number | null;
+  last_seen_at: string | null;
+  // manual 面
+  tier: string | null;
+  max_gpu_workers: number | null;
+  vram_override_mb: number | null;
+  labels: string[];
+  notes: string | null;
+  enabled: number;
+  updated_at: string | null;
+  updated_by: string | null;
+  // merge 結果
+  tier_effective: string | null;
+  vram_effective_mb: number | null;
+}
+
+export interface HostPolicyUpdate {
+  tier?: string | null;
+  max_gpu_workers?: number | null;
+  vram_override_mb?: number | null;
+  labels?: string[];
+  notes?: string | null;
+  enabled?: boolean;
+  updated_by?: string;
+}
+
+/** agent template / effective の 1 workload エントリ。 */
+export interface AgentWorkloadEntry {
+  count: number;
+  gpu?: boolean;
+  vram_mb?: number;
+  cvd?: string | null;
+  /** operator 固定。 true の間 supervisor の elastic は増減させない。 */
+  pin?: boolean;
+}
+
+export interface AgentChildStatus {
+  child_id: string;
+  workload: string;
+  gpu: boolean;
+  alive: boolean;
+}
+
+/** GET /api/v1/agents の 1 行。 */
+export interface AgentRecord {
+  host: string;
+  /** operator/elastic が置く目標値 (上限テンプレ)。 */
+  template: { workloads: Record<string, AgentWorkloadEntry> } | null;
+  /** planner が VRAM 実測で丸めた実配布値。 agent はこれを reconcile する。 */
+  desired: { workloads: Record<string, AgentWorkloadEntry> } | null;
+  last_children: AgentChildStatus[] | null;
+  last_seen_at: string | null;
+  last_vram_total_mb: number | null;
+  last_vram_free_mb: number | null;
+  last_gpu_model: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+export const hostApi = {
+  listPolicy: () => request<{ hosts: HostPolicy[] }>("/api/v1/host-policy"),
+  updatePolicy: (host: string, body: HostPolicyUpdate) =>
+    request<HostPolicy>(`/api/v1/host-policy/${encodeURIComponent(host)}`, {
+      method: "PUT",
+      json: { updated_by: "ui", ...body },
+    }),
+
+  listAgents: () => request<{ agents: AgentRecord[] }>("/api/v1/agents"),
+  /** template を全置換する (= このホストの workload 別 目標台数)。 effective も同値で埋まる。 */
+  setAgentDesired: (host: string, workloads: Record<string, AgentWorkloadEntry>) =>
+    request<{ host: string; ok: boolean }>(
+      `/api/v1/agents/${encodeURIComponent(host)}/desired`,
+      { method: "PUT", json: { workloads } },
+    ),
 };
 
 export interface DeployPath {
