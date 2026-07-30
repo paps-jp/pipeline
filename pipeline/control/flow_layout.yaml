@@ -141,6 +141,31 @@ nodes:
   metric_sql: SELECT COUNT(*) FROM crawl_embedding_index
   metric_ttl_s: 900
   capacity_warn: 500000000
+- id: faiss_unindexed
+  kind: tank
+  x: 1930
+  y: 401
+  # 検索 index に未反映のベクトル数 = faiss_ready=0 の shard に入っている分。
+  # 再構築が終われば書き込み中の現用 shard 分 (数十万) だけが残る。
+  label: FAISS 未反映 (vec)
+  icon: database
+  metric_sql: SELECT COALESCE(SUM(used_count),0) FROM crawl_embedding_shard WHERE faiss_ready=0
+  metric_ttl_s: 300
+  capacity_warn: 15000000
+- id: faiss-index-build
+  kind: workload
+  x: 1910
+  y: 190
+  label: FAISS 再構築
+  icon: cpu
+  workload_slug: faiss-index-build
+- id: faiss-api
+  kind: external
+  x: 1930
+  y: -55
+  label: FAISS 検索 API
+  icon: search
+  url: ''
 - id: face_person_link_queue
   kind: tank
   x: 1602
@@ -338,6 +363,15 @@ edges:
 - from: face-person-link
   to: crawl_person
   label: person
+# FAISS: shard に積まれた未反映ベクトル → 週次 (条件駆動) 再構築 → 検索 API へ reload
+- from: crawl_embedding_final
+  to: faiss_unindexed
+  dashed: true
+- from: faiss_unindexed
+  to: faiss-index-build
+- from: faiss-index-build
+  to: faiss-api
+  label: reload
 - from: image-hash-extract
   to: image_embed_queue
 - from: image_embed_queue
