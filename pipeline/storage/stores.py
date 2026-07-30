@@ -88,6 +88,21 @@ class MinioStore:
         return _retry(self.client.fput_object, self.bucket, key, str(path),
                       content_type=content_type, retries=self._retries)
 
+    def put_bytes(self, key: str, data: bytes,
+                  content_type: str = "application/octet-stream") -> Any:
+        """メモリ上の bytes を put (= tmp ファイルを経由しない外部投入経路用)。
+
+        `fput_object` と違い retry 毎に BytesIO を作り直す (= 1 度読み切った
+        stream を再利用すると 2 回目が 0 バイトで成功してしまう)。
+        """
+        from io import BytesIO
+
+        def _put() -> Any:
+            return self.client.put_object(self.bucket, key, BytesIO(data), len(data),
+                                          content_type=content_type)
+
+        return _retry(_put, retries=self._retries)
+
     def get_to_file(self, key: str, path: str) -> Any:
         return _retry(self.client.fget_object, self.bucket, key, str(path), retries=self._retries)
 

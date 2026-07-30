@@ -396,6 +396,12 @@ def create_app(settings: Settings) -> FastAPI:
     # MinIO プロキシ (= プラグイン UI が顔サムネ等を <img> で見るため)
     from pipeline.api import minio_proxy as _mp
     app.include_router(_mp.router)
+    # 外部投入 API (= Paprika クローラー以外からの画像/動画投入)。 /api/v1/create だけが
+    # API キー必須で、 /api/v1/api-keys は他の管理 API と同じ LAN 信頼扱い。
+    from pipeline.api_public import api_keys as _ak
+    from pipeline.api_public import create as _cr
+    app.include_router(_cr.router)
+    app.include_router(_ak.router)
 
     # 静的アセット (React build が存在する時のみマウント)
     if _WEB_STATIC_DIR.exists() and any(_WEB_STATIC_DIR.iterdir()):

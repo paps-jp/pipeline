@@ -7,6 +7,7 @@ lazy 生成・cache する。プラグインは **名前で参照するだけ**�
 既知の接続 (env キーは現行プラグイン準拠):
   minio:raw   → MINIO_RAW_ENDPOINT / MINIO_RAW_BUCKET(既定 raw) / MINIO_ACCESS_KEY / MINIO_SECRET_KEY   (.17 PANTRY)
   minio:crawl → MINIO_ENDPOINT / MINIO_BUCKET(既定 crawl) / MINIO_ACCESS_KEY / MINIO_SECRET_KEY / MINIO_VERIFY_TLS  (.16 ATTIC)
+  minio:paprika → PAPRIKA_MINIO_ENDPOINT / PAPRIKA_MINIO_BUCKET(既定 paprika) / PAPRIKA_MINIO_ACCESS_KEY / PAPRIKA_MINIO_SECRET_KEY
   db:main     → DB_HOST / DB_PORT(既定 3306) / DB_USER / DB_PASS / DB_NAME
 """
 
@@ -61,8 +62,19 @@ class StorageRegistry:
                 bucket=self._e("MINIO_BUCKET", default="crawl"),
                 secure=str(self._e("MINIO_VERIFY_TLS", default="0")).lower() in ("1", "true", "yes"),
             )
+        elif name == "paprika":
+            # video-face-extract が crawl_video.storage_url を fget する先 (= paprika hub)。
+            # 外部投入した動画もこのバケットに置かないと vfe が拾えない。
+            store = MinioStore(
+                "minio:paprika",
+                endpoint=self._e("PAPRIKA_MINIO_ENDPOINT"),
+                access_key=self._e("PAPRIKA_MINIO_ACCESS_KEY"),
+                secret_key=self._e("PAPRIKA_MINIO_SECRET_KEY"),
+                bucket=self._e("PAPRIKA_MINIO_BUCKET", default="paprika"),
+                secure=False,
+            )
         else:
-            raise KeyError(f"unknown minio connection: {name!r} (known: raw, crawl)")
+            raise KeyError(f"unknown minio connection: {name!r} (known: raw, crawl, paprika)")
         if not store.endpoint:
             raise RuntimeError(f"storage: minio:{name} endpoint 未設定 (env 不足)")
         self._cache[("minio", name)] = store
