@@ -228,10 +228,16 @@ def delete_workload(slug: str, request: Request) -> None:
 def enqueue_task(slug: str, body: EnqueueRequest, request: Request) -> EnqueueResponse:
     w = _get_or_404(request, slug)
     repo = _queue_repo(request)
-    # self_loop coalesce: 既に cap 件 pending なら tick 積み増しをスキップ(= fan-out 抑止)。
+    # self_loop coalesce: 既に cap 件 積まれていれば tick 積み増しをスキップ(= fan-out 抑止)。
+    # pending だけでなく claimed も数える。 claimed は lease 失効で再 claim される
+    # (= 消化待ちの仕事) なので「積まれている」に含めないと、 lease が長い workload で
+    # claimed 側に無限に溜まる。 2026-08-02 の faiss-index-build は lease_secs=86400 の
+    # まま worker 世代交代を繰り返し、 pending は cap 通り 8 なのに claimed が 522 まで
+    # 膨れて停止しているように見えていた。
     if _SELFLOOP_MAX_PENDING > 0 and _is_self_loop(w):
-        pending = int(repo.count_by_state(w.queue_table).get("pending", 0))
-        if pending >= _SELFLOOP_MAX_PENDING:
+        st = repo.count_by_state(w.queue_table)
+        queued = int(st.get("pending", 0)) + int(st.get("claimed", 0))
+        if queued >= _SELFLOOP_MAX_PENDING:
             return EnqueueResponse(inserted=0, duplicates=1)   # coalesced
     inserted = repo.enqueue(w.queue_table, body.pk, body.extra)
     return EnqueueResponse(inserted=1 if inserted else 0, duplicates=0 if inserted else 1)
