@@ -23,6 +23,12 @@ class WorkloadDesired:
     count: int
     gpu: bool = False
     vram_mb: int = 1500  # GPU workload の 1 子あたり VRAM 見積り (spawn ゲート用)
+    # CUDA_VISIBLE_DEVICES の明示 override。 None = 従来 (gpu なら gpu_index、 CPU なら "-1")。
+    # 用途: 物理 GPU 無しホストで CPU 実行するが requires_gpu workload を claim する必要が
+    # ある子 (= vfe-cpu 等)。 gpu=False (VRAM spawn ゲートは通さない) のまま cvd="0" を渡すと、
+    # worker daemon が has_gpu=True と判定し requires_gpu を claim できる (旧 systemd vfe-cpu@
+    # が CVD=0 + FORCE_CPU=1 で満たしていた「GPU レーン資格を持つ CPU 子」を再現)。
+    cvd: str | None = None
 
 
 @dataclass
@@ -42,6 +48,7 @@ def _parse_workloads(raw_workloads: dict) -> list[WorkloadDesired]:
                 count=int(spec.get("count", 0)),
                 gpu=bool(spec.get("gpu", False)),
                 vram_mb=int(spec.get("vram_mb", 1500)),
+                cvd=(str(spec["cvd"]) if spec.get("cvd") is not None else None),
             )
         )
     return wls

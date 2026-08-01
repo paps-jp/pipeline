@@ -101,14 +101,19 @@ class AgentSupervisor:
 
     # ---------------- 子プロセス lifecycle ----------------
 
-    def _spawn(self, workload: str, gpu: bool) -> str:
+    def _spawn(self, workload: str, gpu: bool, cvd: str | None = None) -> str:
         self._seq += 1
         child_id = f"w_{self.host.replace('-', '_')}_a{self._seq}"
         cache_dir = f"{self.cache_root}-{child_id}"
         env = dict(os.environ)
         env["PIPELINE_WORKLOAD_FILTER"] = workload
         env["PIPELINE_PLUGIN_CACHE_DIR"] = cache_dir
-        env["CUDA_VISIBLE_DEVICES"] = self.gpu_index if gpu else "-1"
+        # cvd 明示指定を最優先 (= CPU 実行だが GPU レーン資格が要る子: cvd="0")。
+        # 未指定なら従来: gpu なら gpu_index、 CPU なら "-1" (= GPU 非搭載レーン)。
+        if cvd is not None:
+            env["CUDA_VISIBLE_DEVICES"] = cvd
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = self.gpu_index if gpu else "-1"
         if gpu:
             # systemd gpu@ の drop-in (mps.conf / dynamo-disable.conf) 相当を子に付与。
             # MPS を経由させないと単一 GPU で複数子が排他 CUDA context を作り init が stuck する
@@ -220,11 +225,11 @@ class AgentSupervisor:
                             break  # 次 tick で続き (前 spawn のロードが free に反映されてから)
                         if not self._vram_room_for(wd.vram_mb):
                             break
-                        self._spawn(wd.slug, wd.gpu)
+                        self._spawn(wd.slug, wd.gpu, wd.cvd)
                         gpu_spawned_this_tick = True
                         break
                     else:
-                        self._spawn(wd.slug, wd.gpu)  # CPU は制限なし
+                        self._spawn(wd.slug, wd.gpu, wd.cvd)  # CPU は制限なし
             elif cur > wd.count:
                 # 超過 → graceful kill (新しい方 = 高 seq から)
                 victims = sorted(active[wd.slug], key=lambda c: c.started_at, reverse=True)
