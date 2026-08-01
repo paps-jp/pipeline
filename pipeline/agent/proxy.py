@@ -24,12 +24,30 @@ import logging
 import threading
 import time
 import urllib.request
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("pipeline.agent")
 
 # worker_id 毎にキャッシュする GET パスの suffix (control plane 実装に合わせる)
 _CACHE_SUFFIXES = ("/workloads", "/config")
+
+# executor build 失敗を示す run の error 前置き (worker/service.py と合わせる)
+_BUILD_ERROR_PREFIX = "executor build error"
+
+
+@dataclass
+class ChildHealth:
+    """子が上流へ流した run の結果から組み立てる健全性。
+
+    agent は子の中身を知らないが、 proxy が全通信を中継しているので
+    「build error を出し続けて成功 run が 1 件も無い」子 (= wedged) を
+    worker 無改修で外から判定できる。
+    """
+    build_errors: int = 0
+    last_build_error_at: float | None = None
+    last_success_at: float | None = None
+    runs_seen: int = 0
 
 
 class _Cache:
@@ -74,6 +92,8 @@ class AggregatorProxy:
         self._cache = _Cache()
         self._hb_last: dict[str, float] = {}   # worker_id → 最終上流 heartbeat monotonic
         self._hb_lock = threading.Lock()
+        self._health: dict[str, ChildHealth] = {}   # worker_id → 健全性 (wedged 判定用)
+        self._health_lock = threading.Lock()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         # 統計 (観測用)
@@ -106,7 +126,67 @@ class AggregatorProxy:
 
     # ---------------- リクエスト処理 (ハンドラから呼ぶ) ----------------
 
+    # ---------------- 子の健全性観測 (wedged 判定の材料) ----------------
+
+    @staticmethod
+    def _worker_id_of(path: str) -> str | None:
+        if "/workers/" not in path:
+            return None
+        tail = path.split("/workers/", 1)[1]
+        wid = tail.split("/", 1)[0].split("?", 1)[0]
+        return wid or None
+
+    def _observe_run(self, path: str, body: bytes | None) -> None:
+        """run 記録 (record_run / finish_run) を覗いて子の健全性を更新する。
+
+        中継そのものには一切影響させない (例外は握り潰す)。
+        """
+        if not body:
+            return
+        wid = self._worker_id_of(path)
+        if not wid:
+            return
+        try:
+            payload = json.loads(body)
+        except Exception:
+            return
+        if not isinstance(payload, dict) or "success" not in payload:
+            return
+        now = time.monotonic()
+        err = payload.get("error") or ""
+        with self._health_lock:
+            h = self._health.setdefault(wid, ChildHealth())
+            h.runs_seen += 1
+            if payload.get("success"):
+                h.last_success_at = now
+                # 1 件でも通れば build は成立している = 過去の失敗は引きずらない
+                h.build_errors = 0
+                h.last_build_error_at = None
+            elif isinstance(err, str) and err.startswith(_BUILD_ERROR_PREFIX):
+                h.build_errors += 1
+                h.last_build_error_at = now
+
+    def health(self, worker_id: str) -> ChildHealth | None:
+        with self._health_lock:
+            h = self._health.get(worker_id)
+            # 呼び出し側 (supervisor) が別スレッドなのでコピーを返す
+            return ChildHealth(**vars(h)) if h else None
+
+    def forget(self, worker_id: str) -> None:
+        """子が消えたら健全性も捨てる (child_id は再利用されないが念のため)。"""
+        with self._health_lock:
+            self._health.pop(worker_id, None)
+        with self._hb_lock:
+            self._hb_last.pop(worker_id, None)
+
     def handle(self, method: str, path: str, body: bytes | None, headers: dict) -> tuple[int, bytes]:
+        # run 記録は透過転送しつつ内容を観測する (wedged 判定の唯一の材料)
+        if method == "POST" and ("/runs" in path):
+            try:
+                self._observe_run(path, body)
+            except Exception:
+                log.debug("[proxy] observe_run failed", exc_info=False)
+
         # heartbeat: refresh_s に 1 回だけ上流へ、 それ以外はローカル ACK
         if self.coalesce_heartbeat and method == "PUT" and path.endswith("/heartbeat"):
             wid = path.rsplit("/", 2)[-2] if "/workers/" in path else path

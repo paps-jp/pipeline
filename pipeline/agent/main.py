@@ -28,6 +28,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--interval", type=float, default=10.0, help="reconcile 周期 (秒)")
     p.add_argument("--vram-safety-mult", type=float, default=1.3)
     p.add_argument("--vram-floor-mb", type=int, default=500)
+    p.add_argument("--drain-grace-s", type=float, default=60.0,
+                   help="graceful kill (SIGTERM) 後この秒数で死ななければ SIGKILL へ昇格")
+    p.add_argument("--wedged-min-age-s", type=float, default=180.0,
+                   help="この秒数より若い子は wedged 判定しない (モデルロード中の誤検知防止)")
+    p.add_argument("--wedged-no-success-s", type=float, default=300.0,
+                   help="build error を出しつつこの秒数 成功 run が無ければ wedged とみなす")
+    p.add_argument("--wedged-cooldown-s", type=float, default=600.0,
+                   help="wedged で子を落とした slug をこの秒数 再 spawn しない")
     p.add_argument("--proxy", action="store_true",
                    help="P2-1: agent 内アグリゲータを起動し、子を proxy 経由で control plane に繋ぐ")
     p.add_argument("--proxy-port", type=int, default=8799)
@@ -52,6 +60,10 @@ def main(argv: list[str] | None = None) -> int:
         gpu_index=args.gpu_index,
         vram_safety_mult=args.vram_safety_mult,
         vram_floor_mb=args.vram_floor_mb,
+        drain_grace_s=args.drain_grace_s,
+        wedged_min_age_s=args.wedged_min_age_s,
+        wedged_no_success_s=args.wedged_no_success_s,
+        wedged_cooldown_s=args.wedged_cooldown_s,
     )
 
     # P2-1: アグリゲータ proxy。 有効時は子の control-url を proxy に向け、 上流は本物の control plane。
@@ -66,6 +78,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         proxy.start()
         sup.control_url = proxy.base_url  # 子はここを向く (reconcile で上書きしない)
+        # wedged 判定の材料は proxy が中継する run 結果だけ (worker 無改修)。
+        # proxy 無効時は health_source=None のまま = wedged 判定オフ (従来挙動)。
+        sup.health_source = proxy.health
+        sup.health_forget = proxy.forget
 
     stop = {"v": False}
 
