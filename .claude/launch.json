@@ -8,6 +8,23 @@
       "port": 5173
     },
     {
+      "name": "api-local",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "-m", "pipeline", "run", "--dev",
+        "--db-url", "sqlite:///./scratch/verify_fleet.db",
+        "--port", "8000"
+      ],
+      "port": 8000
+    },
+    {
+      "name": "web-live",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "web"],
+      "port": 5173,
+      "env": { "VITE_API_TARGET": "http://10.10.50.7:8001" }
+    },
+    {
       "name": "docs",
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8765"],
