@@ -290,11 +290,33 @@ class QueueRepository:
             for r in rows
         ]
 
+    def _retry_on_deadlock(self, what: str, fn, max_attempts: int = 5):
+        """deadlock(1213)/lock-wait の victim を短い backoff で再試行する。
+
+        claim は自前で retry を持っていたが complete/fail は素通しで、 deadlock が
+        そのまま 500 になって worker 側に httpx エラーとして出ていた。 その場合
+        タスクは claimed のまま残り lease 失効まで再処理されない (= 二重処理と遅延)。
+        いずれも 1 トランザクション内で完結し rollback 済みなので再実行は安全。
+        """
+        for attempt in range(max_attempts):
+            try:
+                return fn()
+            except Exception as e:
+                if _is_deadlock(e) and attempt < max_attempts - 1:
+                    time.sleep(0.01 * (2 ** attempt))
+                    log.debug("%s deadlock (attempt %d) — retrying", what, attempt + 1)
+                    continue
+                raise
+
     def complete(self, queue_table: str, pk: str) -> None:
         """成功時に row を DELETE。"""
         _validate_queue_table(queue_table)
-        with self._get_db(queue_table).transaction() as conn:
-            conn.execute(f"DELETE FROM {queue_table} WHERE pk = :pk", {"pk": str(pk)})
+
+        def _do() -> None:
+            with self._get_db(queue_table).transaction() as conn:
+                conn.execute(f"DELETE FROM {queue_table} WHERE pk = :pk", {"pk": str(pk)})
+
+        self._retry_on_deadlock(f"complete({queue_table})", _do)
 
     def fail(self, queue_table: str, pk: str, max_attempts: int, error: str | None) -> str:
         """失敗時: attempt+1。max 未満なら pending に戻す、max に達したら failed で残置。
@@ -302,36 +324,40 @@ class QueueRepository:
         戻り値: 'pending'(retry 可) or 'failed'(打切り)。
         """
         _validate_queue_table(queue_table)
-        with self._get_db(queue_table).transaction() as conn:
-            cur = conn.execute(
-                f"SELECT attempt FROM {queue_table} WHERE pk=:pk", {"pk": str(pk)}
-            )
-            row = cur.fetchone()
-            if row is None:
-                return "failed"  # 既に消えてる
-            new_attempt = int(row["attempt"]) + 1
-            now = _utcnow_iso()
-            if new_attempt >= int(max_attempts):
+
+        def _do() -> str:
+            with self._get_db(queue_table).transaction() as conn:
+                cur = conn.execute(
+                    f"SELECT attempt FROM {queue_table} WHERE pk=:pk", {"pk": str(pk)}
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return "failed"  # 既に消えてる
+                new_attempt = int(row["attempt"]) + 1
+                now = _utcnow_iso()
+                if new_attempt >= int(max_attempts):
+                    conn.execute(
+                        f"""
+                        UPDATE {queue_table}
+                        SET state='failed', attempt=:a, last_error=:e,
+                            claimed_at=NULL, claimed_by=NULL, updated_at=:now
+                        WHERE pk=:pk
+                        """,
+                        {"a": new_attempt, "e": (error or "")[:4000], "pk": str(pk), "now": now},
+                    )
+                    return "failed"
                 conn.execute(
                     f"""
                     UPDATE {queue_table}
-                    SET state='failed', attempt=:a, last_error=:e,
+                    SET state='pending', attempt=:a, last_error=:e,
                         claimed_at=NULL, claimed_by=NULL, updated_at=:now
                     WHERE pk=:pk
                     """,
                     {"a": new_attempt, "e": (error or "")[:4000], "pk": str(pk), "now": now},
                 )
-                return "failed"
-            conn.execute(
-                f"""
-                UPDATE {queue_table}
-                SET state='pending', attempt=:a, last_error=:e,
-                    claimed_at=NULL, claimed_by=NULL, updated_at=:now
-                WHERE pk=:pk
-                """,
-                {"a": new_attempt, "e": (error or "")[:4000], "pk": str(pk), "now": now},
-            )
-            return "pending"
+                return "pending"
+
+        return self._retry_on_deadlock(f"fail({queue_table})", _do)
 
     def count_by_state(self, queue_table: str) -> dict[str, int]:
         _validate_queue_table(queue_table)
