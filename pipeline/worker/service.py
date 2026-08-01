@@ -468,6 +468,22 @@ class WorkerDaemon:
         self._starvation_floor_s = float(
             os.environ.get("PIPELINE_STARVATION_FLOOR_S", "60")
         )
+        # ---------------- executor build 失敗のサーキットブレーカ ----------------
+        # build 失敗 (= VRAM 枯渇で CUDA session が張れない等) は「タスクが悪い」の
+        # ではなく「このホストが今ダメ」。 従来は claim 済みタスクを全部 fail にして
+        # 即 次の claim に進んでいたため、 1 プロセスが 10 秒で 300 件を failed に
+        # 焼き、 かつ evict→rebuild を高速反復して VRAM リークを加速していた
+        # (2026-08-01 ai-gpu3: image-embed failed 46,816 件)。
+        # 対策: タスクは fail せず放棄 (lease 失効で pending へ自動復帰)、 slug 単位に
+        # 指数バックオフの claim 停止を掛ける。 build 成功で解除。
+        self._build_fail_streak: dict[str, int] = {}
+        self._build_fail_until: dict[str, float] = {}
+        self._build_backoff_base_s = float(
+            os.environ.get("PIPELINE_BUILD_BACKOFF_BASE_S", "30")
+        )
+        self._build_backoff_max_s = float(
+            os.environ.get("PIPELINE_BUILD_BACKOFF_MAX_S", "600")
+        )
         # ---------------- workload filter (= 自動切替 SoT) ----------------
         # SoT は control plane の workers.workload_filter (= None なら env fallback)。
         # _filter_reload_loop が 30s 毎に poll して更新、 _drain_once が読む。
@@ -884,6 +900,12 @@ class WorkerDaemon:
             # requires_gpu=0 (= CPU workload) なので vram_mb 判定だと誤スキップする。
             if not self._has_gpu and w.get("requires_gpu"):
                 continue
+            # executor build がこのホストで連続失敗中の slug は claim しない。
+            # ここで止めないと「claim → build 失敗 → 放棄」を全力で回し、 lease 中の
+            # タスクを増やすだけで前に進まない (= キューを claimed で埋める)。
+            cool_until = self._build_fail_until.get(w["slug"])
+            if cool_until is not None and time.monotonic() < cool_until:
+                continue
             tasks = await self._client.claim(self.worker_id, w["slug"], w["batch_size"])
             if not tasks:
                 continue
@@ -893,22 +915,41 @@ class WorkerDaemon:
             try:
                 executor, just_built = self._get_or_build_executor_observe(w)
             except Exception as e:
-                log.warning("executor build failed for %s: %s", w["slug"], e)
+                # 失敗しているのはタスクではなくこのホスト。 claim 済みタスクは
+                # fail せず放棄する = lease 失効で pending に戻り、 健全な別ホストが
+                # 拾える (QueueRepository.claim が claimed_at < cutoff を再 claim する)。
+                streak = self._build_fail_streak.get(w["slug"], 0) + 1
+                self._build_fail_streak[w["slug"]] = streak
+                backoff = min(
+                    self._build_backoff_base_s * (2 ** (streak - 1)),
+                    self._build_backoff_max_s,
+                )
+                self._build_fail_until[w["slug"]] = time.monotonic() + backoff
+                log.warning(
+                    "executor build failed for %s: %s "
+                    "(%d 連続 → %.0fs claim 停止, task %d 件は fail せず放棄)",
+                    w["slug"], e, streak, backoff, len(tasks),
+                )
                 self._evict_if_cached(w["slug"])
-                for t in tasks:
-                    await self._client.fail(self.worker_id, w["slug"], t["pk"], str(e))
-                    await self._client.record_run(self.worker_id, {
-                        "workload_slug": w["slug"],
-                        "pk": t["pk"],
-                        "attempt": int(t["attempt"]),
-                        "started_at": _utcnow_iso(),
-                        "success": False,
-                        "exit_code": None,
-                        "duration_ms": 0,
-                        "error": f"executor build error: {e}",
-                    })
-                    self._pending_errs += 1
+                # 可視化用に 1 イベント 1 run だけ残す (旧実装は task 毎に記録して
+                # 10 秒で 300 行を runs に流し込んでいた)。 pk はバッチ先頭を代表に。
+                await self._client.record_run(self.worker_id, {
+                    "workload_slug": w["slug"],
+                    "pk": tasks[0]["pk"],
+                    "attempt": int(tasks[0]["attempt"]),
+                    "started_at": _utcnow_iso(),
+                    "success": False,
+                    "exit_code": None,
+                    "duration_ms": 0,
+                    "error": (f"executor build error ({streak} 連続, "
+                              f"{backoff:.0f}s claim 停止, {len(tasks)} 件放棄): {e}"),
+                })
+                self._pending_errs += 1
                 continue
+            # build 成功 = このホストは復帰した。 バックオフ解除。
+            if self._build_fail_streak.pop(w["slug"], 0):
+                self._build_fail_until.pop(w["slug"], None)
+                log.info("executor build 復帰: %s (claim 停止を解除)", w["slug"])
             # build 直後 (= plugin.setup() 完了直後) のベース VRAM を即測って報告
             if just_built and w["executor_type"] == "python_module":
                 await self._maybe_report_vram(w["slug"], first_run=True)
