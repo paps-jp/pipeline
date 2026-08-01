@@ -56,6 +56,24 @@ export function ParticleEdge(props: EdgeProps) {
   const sy = srcHoriz ? sourceY + sLane : sourceY;
   const tx = tgtHoriz ? targetX : targetX + tLane;
   const ty = tgtHoriz ? targetY + tLane : targetY;
+  // trunk (= 中央の直交セグメント) も lane 分ずらす。 getSmoothStepPath は
+  // center 未指定だと trunk を幾何中点に固定するため、 端点(sx/sy/tx/ty)だけ
+  // ずらしても trunk が再収束し、 同じ handle から出る複数配管が同一の通り道で
+  // 重なっていた。 dominant lane 分 trunk を平行移動して並走させる。
+  //   水平配管 (L/R↔L/R) → trunk は縦 → centerX をずらす
+  //   垂直配管 (T/B↔T/B) → trunk は横 → centerY をずらす
+  // solo edge (lane=0) は offset 0 = 無変更 (回帰なし)。
+  const sLaneRaw = d0.sourceLane ?? 0;
+  const tLaneRaw = d0.targetLane ?? 0;
+  const trunkLane =
+    (Math.abs(sLaneRaw) >= Math.abs(tLaneRaw) ? sLaneRaw : tLaneRaw) * LANE_GAP;
+  const bothHoriz = srcHoriz && tgtHoriz;
+  const bothVert = !srcHoriz && !tgtHoriz;
+  const centerParams: { centerX?: number; centerY?: number } = {};
+  if (trunkLane !== 0) {
+    if (bothHoriz) centerParams.centerX = (sx + tx) / 2 + trunkLane;
+    else if (bothVert) centerParams.centerY = (sy + ty) / 2 + trunkLane;
+  }
   const [edgePath, labelX, labelY] = getSmoothStepPath({
     sourceX: sx,
     sourceY: sy,
@@ -65,6 +83,7 @@ export function ParticleEdge(props: EdgeProps) {
     targetPosition,
     borderRadius: 12,    // 角丸 → 滑らか
     offset: 24,           // handle から最初の曲げまでの余白 (= node の縁から離す)
+    ...centerParams,
   });
   const d = d0;
   const rate = Number(d.rate ?? 0);

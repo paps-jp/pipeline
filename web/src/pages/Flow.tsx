@@ -447,7 +447,25 @@ function WorkloadNode({
 //   3. 太いハイライト (= 波頂を白く強調、 メインと同期)
 //   4. 大きなキラキラ泡 (5 個、 上下バウンド + opacity 点滅、 メインと同期で流れる)
 //   5. specular sweep (= 横切る白い光帯、 7s で右から左に通る = 反射光の表現)
+// タブが hidden の時 (裏タブで YouTube 視聴中など) は TankWave を非描画にして
+// SMIL アニメを完全停止する。 GPU プロセスは全タブ共有なので、 SMIL の paint
+// 負荷が YouTube のハードウェアビデオデコード枠を奪う問題を回避。
+// (CSS transform アニメは SVG <g> に対して Chromium で視覚適用されない既知制約が
+//  あるため SMIL のまま。 代わりに tab visibility ゲートで実効負荷を落とす)
+function useTabVisible(): boolean {
+  const [visible, setVisible] = useState(() =>
+    typeof document !== "undefined" ? document.visibilityState !== "hidden" : true
+  );
+  useEffect(() => {
+    const on = () => setVisible(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", on);
+    return () => document.removeEventListener("visibilitychange", on);
+  }, []);
+  return visible;
+}
+
 function TankWave({ color, isLight }: { color: string; isLight: boolean }) {
+  const tabVisible = useTabVisible();
   // viewBox 0..40 height で振幅 を大きく
   // main: baseline y=20, 振幅 = 16 (peak 4..36)
   const pathMain =
@@ -478,24 +496,28 @@ function TankWave({ color, isLight }: { color: string; isLight: boolean }) {
       {/* 2. 反射波 (= 薄め、 反対方向) */}
       <g>
         <path d={pathBack} fill={color} opacity={isLight ? 0.35 : 0.5} />
-        <animateTransform
-          attributeName="transform"
-          type="translate"
-          values="-200 0; 0 0"
-          dur="5.5s"
-          repeatCount="indefinite"
-        />
+        {tabVisible && (
+          <animateTransform
+            attributeName="transform"
+            type="translate"
+            values="-200 0; 0 0"
+            dur="5.5s"
+            repeatCount="indefinite"
+          />
+        )}
       </g>
       {/* 1. メイン波 (= 濃色) */}
       <g>
         <path d={pathMain} fill={color} opacity={isLight ? 0.72 : 0.9} />
-        <animateTransform
-          attributeName="transform"
-          type="translate"
-          values="0 0; -200 0"
-          dur="3.5s"
-          repeatCount="indefinite"
-        />
+        {tabVisible && (
+          <animateTransform
+            attributeName="transform"
+            type="translate"
+            values="0 0; -200 0"
+            dur="3.5s"
+            repeatCount="indefinite"
+          />
+        )}
       </g>
       {/* 3. ハイライト (= 太めの白線で波頂を強調) */}
       <g>
@@ -507,47 +529,17 @@ function TankWave({ color, isLight }: { color: string; isLight: boolean }) {
           opacity={isLight ? 0.7 : 0.85}
           strokeLinecap="round"
         />
-        <animateTransform
-          attributeName="transform"
-          type="translate"
-          values="0 0; -200 0"
-          dur="3.5s"
-          repeatCount="indefinite"
-        />
+        {tabVisible && (
+          <animateTransform
+            attributeName="transform"
+            type="translate"
+            values="0 0; -200 0"
+            dur="3.5s"
+            repeatCount="indefinite"
+          />
+        )}
       </g>
-      {/* 4. キラキラ泡 (= 大きめの白点、 各点が上下バウンド + 透明度脈動) */}
-      <g>
-        {[
-          { cx: 60,  cy: 14, r: 1.8, dur: 2.4 },
-          { cx: 200, cy: 16, r: 1.5, dur: 2.9 },
-          { cx: 360, cy: 12, r: 2.0, dur: 3.1 },
-          { cx: 510, cy: 16, r: 1.5, dur: 2.6 },
-          { cx: 680, cy: 14, r: 1.8, dur: 2.3 },
-        ].map((b, i) => (
-          <circle key={i} cx={b.cx} cy={b.cy} r={b.r} fill={hlColor}>
-            <animate
-              attributeName="cy"
-              values={`${b.cy};${b.cy - 3};${b.cy}`}
-              dur={`${b.dur}s`}
-              repeatCount="indefinite"
-            />
-            <animate
-              attributeName="opacity"
-              values="0.15;0.95;0.15"
-              dur={`${b.dur}s`}
-              repeatCount="indefinite"
-            />
-          </circle>
-        ))}
-        <animateTransform
-          attributeName="transform"
-          type="translate"
-          values="0 0; -200 0"
-          dur="3.5s"
-          repeatCount="indefinite"
-        />
-      </g>
-      {/* 5. specular sweep (= 反射光が横切るバンド、 7s に 1 回斜めに走る) */}
+      {/* 4. specular sweep (= 反射光が横切るバンド、 7s に 1 回斜めに走る) */}
       <defs>
         <linearGradient id="tankwave-sweep" x1="0" y1="0" x2="1" y2="0">
           <stop offset="0%" stopColor={hlColor} stopOpacity="0" />
@@ -565,13 +557,15 @@ function TankWave({ color, isLight }: { color: string; isLight: boolean }) {
           fill="url(#tankwave-sweep)"
           transform="skewX(-25)"
         />
-        <animateTransform
-          attributeName="transform"
-          type="translate"
-          values="800 0; -160 0"
-          dur="7s"
-          repeatCount="indefinite"
-        />
+        {tabVisible && (
+          <animateTransform
+            attributeName="transform"
+            type="translate"
+            values="800 0; -160 0"
+            dur="7s"
+            repeatCount="indefinite"
+          />
+        )}
       </g>
     </svg>
   );
@@ -801,10 +795,12 @@ function TankNode({ data }: { data: FlowNode & { activeHandles?: string[];
           </Text>
         </Group>
         <Text size="lg" fw={800} style={{ fontFamily: "ui-monospace, monospace", lineHeight: 1 }}>
-          {fmtNum(data.pending)}
+          {fmtNum(data.pending)}{data.unit ? ` ${data.unit}` : ""}
         </Text>
         {data.capacity_warn != null && (
-          <Text size="xs" c="dimmed">/ {fmtNum(data.capacity_warn)}</Text>
+          <Text size="xs" c="dimmed">
+            / {fmtNum(data.capacity_warn)}{data.unit ? ` ${data.unit}` : ""}
+          </Text>
         )}
         {/* 1 分間の流入/流出量 (= edges の rate_per_min を集計したもの)。
             IN/OUT ラベルは黒(地味)、 数値は意味色 (緑=in, 橙=out)。
@@ -1866,13 +1862,31 @@ export default function Flow() {
     };
     const sourceGroups = groupBy((e) => `${e.source}:${e.sourceHandle}`);
     const targetGroups = groupBy((e) => `${e.target}:${e.targetHandle}`);
+    // lane は「相手側ノードの位置順」に並べてから割り当てる。 こうすると
+    // 上の出力→上のノード / 下の出力→下のノード となり、 同じ handle から出る
+    // (入る) 配管どうしが交差しない。 旧実装は edge 到着順で割当てていたため、
+    // 上の出力が下のタンクに繋がると下の出力線と交差していた。 3 本以上でも
+    // 位置ソートなので単調 (= 交差ゼロ)。
+    //   水平 handle (Left/Right) → lane は Y 方向 → 相手の cy 昇順
+    //   垂直 handle (Top/Bottom) → lane は X 方向 → 相手の cx 昇順
+    const laneAxis = (handle?: string | null): "y" | "x" =>
+      handle && (handle.includes("left") || handle.includes("right")) ? "y" : "x";
+    const otherPos = (id: string, axis: "y" | "x"): number => {
+      const p = posMap.get(id);
+      if (!p) return 0;
+      return axis === "y" ? p.cy : p.cx;
+    };
     for (const [, list] of sourceGroups) {
+      const axis = laneAxis(list[0].sourceHandle as string | undefined);
+      list.sort((a, b) => otherPos(a.target, axis) - otherPos(b.target, axis));
       list.forEach((e, i) => {
         ((e.data as Record<string, unknown>).sourceLane as number) =
           i - (list.length - 1) / 2;
       });
     }
     for (const [, list] of targetGroups) {
+      const axis = laneAxis(list[0].targetHandle as string | undefined);
+      list.sort((a, b) => otherPos(a.source, axis) - otherPos(b.source, axis));
       list.forEach((e, i) => {
         ((e.data as Record<string, unknown>).targetLane as number) =
           i - (list.length - 1) / 2;
