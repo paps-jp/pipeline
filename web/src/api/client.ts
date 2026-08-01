@@ -165,6 +165,8 @@ export interface PluginKwargField {
   max?: number;
   options?: unknown[];
   required?: boolean;
+  /** UI のセクション名 (= supervisor のようにキーが数十個ある plugin を畳むため) */
+  group?: string;
 }
 
 export interface PluginManifest {

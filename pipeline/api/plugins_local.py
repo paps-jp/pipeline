@@ -35,6 +35,9 @@ class PluginKwargField(BaseModel):
     max: float | None = None
     options: list[Any] | None = None
     required: bool = False
+    # UI のセクション名。 設定項目が数十個ある plugin (= supervisor) を
+    # サブシステム単位に畳んで表示するために使う。 未指定なら「その他」扱い。
+    group: str | None = None
 
 
 class PluginManifest(BaseModel):

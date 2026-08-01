@@ -22,6 +22,7 @@ import {
   IconScript,
   IconServer,
   IconSettings,
+  IconSettingsAutomation,
   IconSitemap,
   IconSun,
   IconUsersGroup,
@@ -37,6 +38,7 @@ import Dashboard from "./pages/Dashboard";
 import Deploy from "./pages/Deploy";
 import Flow from "./pages/Flow";
 import Hosts from "./pages/Hosts";
+import Supervisor from "./pages/Supervisor";
 import Throughput from "./pages/Throughput";
 import PluginPanel from "./pages/PluginPanel";
 import Settings from "./pages/Settings";
@@ -234,6 +236,12 @@ export default function App() {
           to="/hosts"
         />
         <NavLink
+          label={t("nav.supervisor", "Supervisor")}
+          leftSection={<IconSettingsAutomation size={18} />}
+          component={RouterNavLink}
+          to="/supervisor"
+        />
+        <NavLink
           label={t("nav.logs")}
           leftSection={<IconScript size={18} />}
           component={RouterNavLink}
@@ -284,6 +292,7 @@ export default function App() {
             <Route path="/workloads/:slug/runs" element={<Workloads />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/hosts" element={<Hosts />} />
+            <Route path="/supervisor" element={<Supervisor />} />
             <Route path="/logs" element={<ServiceLog />} />
             <Route path="/deploy" element={<Deploy />} />
             <Route path="/settings" element={<Settings />} />
