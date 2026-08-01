@@ -51,17 +51,62 @@ class AgentRepository:
                 return None
         return None
 
+    @staticmethod
+    def _clamp_to_template(effective: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]:
+        """effective を template の上限で頭打ちにする (planner の削減は保持)。
+
+        template に無い slug は落とす。 count は min(effective, template)。
+        """
+        t_wl = (template or {}).get("workloads") or {}
+        e_wl = (effective or {}).get("workloads") or {}
+        out: dict[str, Any] = {}
+        for slug, t_spec in t_wl.items():
+            spec = dict(t_spec)
+            e_spec = e_wl.get(slug)
+            if isinstance(e_spec, dict) and e_spec.get("count") is not None:
+                try:
+                    spec["count"] = min(int(e_spec["count"]), int(t_spec.get("count") or 0))
+                except (TypeError, ValueError):
+                    pass
+            out[slug] = spec
+        return {"workloads": out}
+
     def set_template(self, host: str, template: dict[str, Any], by: str) -> None:
-        """operator が上限テンプレ(max intent)を設定。 planner 未介入時に agent が困らないよう
-        effective(desired_json)も初期値としてテンプレで埋める (planner が後で VRAM 算定して上書き)。"""
+        """operator/supervisor が上限テンプレ(max intent)を設定。
+
+        初回 (INSERT) は planner 未介入なので effective もテンプレで埋める。
+        既存行の UPDATE では effective をテンプレで上書きしない。 elastic の
+        AGENT-SCALE がこの経路で毎 tick テンプレを書くため、 上書きすると
+        planner が算定した VRAM 予算内の effective が数秒で消え、 物理的に
+        入らない台数が agent に配られ続ける (2026-08-01: 16GB のカードに 22GB
+        分の plan が復活し続けた)。 template が下がった場合だけ effective を
+        その上限まで引き下げる。
+        """
         tj = json.dumps(template, ensure_ascii=False)
         with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT desired_json FROM agent_desired WHERE host=:h", {"h": host}
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO agent_desired (host, template_json, desired_json, updated_at, updated_by) "
+                    "VALUES (:h, :t, :t, :now, :by)",
+                    {"h": host, "t": tj, "now": _now(), "by": by},
+                )
+                return
+            effective = None
+            if row["desired_json"]:
+                try:
+                    effective = json.loads(row["desired_json"])
+                except Exception:
+                    effective = None
+            dj = tj if effective is None else json.dumps(
+                self._clamp_to_template(effective, template), ensure_ascii=False
+            )
             conn.execute(
-                "INSERT INTO agent_desired (host, template_json, desired_json, updated_at, updated_by) "
-                "VALUES (:h, :t, :t, :now, :by) "
-                "ON CONFLICT(host) DO UPDATE SET template_json=:t, desired_json=:t, "
-                "  updated_at=:now, updated_by=:by",
-                {"h": host, "t": tj, "now": _now(), "by": by},
+                "UPDATE agent_desired SET template_json=:t, desired_json=:d, "
+                "  updated_at=:now, updated_by=:by WHERE host=:h",
+                {"h": host, "t": tj, "d": dj, "now": _now(), "by": by},
             )
 
     def set_effective(self, host: str, desired: dict[str, Any], by: str) -> None:
