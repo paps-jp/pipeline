@@ -19,7 +19,12 @@ import {
   Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { IconAlertTriangle, IconCpu, IconDeviceDesktopAnalytics } from "@tabler/icons-react";
+import {
+  IconAlertTriangle,
+  IconCpu,
+  IconDeviceDesktopAnalytics,
+  IconRefresh,
+} from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -71,6 +76,54 @@ function vramEstimate(w: Workload | undefined): number {
 }
 
 type DraftEntry = { count: number; pin: boolean };
+
+// ------------------------------------------------------------
+// 目標(template) と 実効(effective) の乖離
+//
+// agent が reconcile するのは effective だけなので、 目標を上げても effective が
+// 追随しなければ子は 1 つも立たない。 「なぜ届いていないか」を出さないと、 画面上は
+// ただの小さい数字で、 フリートが止まっていても気づけない (2026-08-02: nas-c2 の
+// image-pull/job-submit が effective=0 のまま 1 時間停止し、 GPU 全台が遊休した)。
+//   affinity … host_affinity 違反の矯正 (正常。 絶対制約なので目標が悪い)
+//   vram     … planner が VRAM 実測で丸めた (正常。 GPU 行のみ起きうる)
+//   stuck    … 上記いずれでもない = 誰も戻さない片道切符 (異常。 要 operator 介入)
+// ------------------------------------------------------------
+type EffGap = "affinity" | "vram" | "stuck" | null;
+
+function effectiveGap(
+  slug: string,
+  host: string,
+  template: Record<string, AgentWorkloadEntry>,
+  effective: Record<string, AgentWorkloadEntry>,
+  w: Workload | undefined,
+): EffGap {
+  const target = Number(template[slug]?.count ?? 0);
+  const spec = effective[slug];
+  if (Number(spec?.count ?? 0) >= target) return null;
+  // 印 (planner が矯正済み) だけでなく host_affinity 自体も見る。 planner がまだ
+  // 回っていない / このホストを skip する場合は印が付かないので、 印だけで判定すると
+  // 「許可外なのに未追随」と誤診し、 operator に実効の引き上げを促してしまう
+  // (= 許可外ホストで子が起動 → claim 拒否 → balancer swap の綱引き再発)。
+  const affinity = (w?.host_affinity ?? []) as string[];
+  if (spec?.affinity_blocked || (affinity.length > 0 && !affinity.includes(host))) {
+    return "affinity";
+  }
+  return w?.requires_gpu ? "vram" : "stuck";
+}
+
+/** そのホストで operator 介入が要る (= stuck) 行数。 折り畳んだ状態でも出す。 */
+function countStuckGaps(
+  host: string,
+  agent: AgentRecord | undefined,
+  workloads: Workload[],
+): number {
+  const template = agent?.template?.workloads ?? {};
+  const effective = agent?.desired?.workloads ?? {};
+  const bySlug = new Map(workloads.map((w) => [w.slug, w]));
+  return Object.keys(template).filter(
+    (s) => effectiveGap(s, host, template, effective, bySlug.get(s)) === "stuck",
+  ).length;
+}
 
 // ============================================================
 // 1 ホスト分のカード
@@ -160,6 +213,35 @@ function HostCard({
       notifications.show({ color: "red", message: String(e) }),
   });
 
+  // 実効が目標に追随していない行 (stuck) だけを目標まで引き上げる。
+  // template 全体を effective に流し込むと planner の VRAM 算定まで消してしまい、
+  // 物理的に入らない台数が配られる (2026-08-01 の 16GB カードに 22GB 分の plan)。
+  const resyncEffective = useMutation({
+    mutationFn: () => {
+      const bySlug = new Map(workloads.map((x) => [x.slug, x]));
+      const next: Record<string, AgentWorkloadEntry> = {};
+      for (const [slug, tSpec] of Object.entries(template)) {
+        // 土台は現 effective (planner の判断と affinity 矯正の印を保つ)
+        const base: AgentWorkloadEntry = { ...(effective[slug] ?? tSpec) };
+        if (effectiveGap(slug, policy.host, template, effective, bySlug.get(slug)) === "stuck") {
+          base.count = Number(tSpec.count ?? 0);
+        }
+        next[slug] = base;
+      }
+      return hostApi.setAgentEffective(policy.host, next);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["agents"] });
+      notifications.show({
+        color: "teal",
+        message: t("hostcfg.resynced", { host: policy.host,
+          defaultValue: `${policy.host} の実効を目標に戻しました` }),
+      });
+    },
+    onError: (e: unknown) =>
+      notifications.show({ color: "red", message: String(e) }),
+  });
+
   const setAffinity = useMutation({
     mutationFn: ({ slug, hosts }: { slug: string; hosts: string[] }) =>
       api.setWorkloadHostAffinity(slug, hosts),
@@ -175,6 +257,14 @@ function HostCard({
     (sum, w) => sum + entryOf(w.slug).count * vramEstimate(w), 0);
   const vramPct = vramTotal > 0 ? Math.min(100, (vramPlanned / vramTotal) * 100) : 0;
 
+  // ---- GPU 非搭載ホストの判定 ----
+  // GPU 無しホスト (= nas-c2 等の CPU 専用) に requires_gpu の目標台数を書いても、 agent の
+  // VRAM 実測ゲート (nvidia-smi 不在 → spawn 見送り) で子は 1 つも立たない。 さらに planner は
+  // vram_total=None のホストを skip するので effective も 0 に矯正されず、 「目標 3 / 実効 3 /
+  // 稼働 0」 の残骸が画面に残り続ける。 そもそも書けないようにする。
+  // VRAM 上書き or ティア手動指定があればそちらを尊重 (= agent 未報告の新規 GPU ホスト救済)。
+  const hostHasGpu = vramTotal > 0 || (policy.tier_effective ?? "").startsWith("gpu-");
+
   const rows = useMemo(() => {
     const known = new Set(workloads.map((w) => w.slug));
     const extra = Object.keys(template).filter((s) => !known.has(s));
@@ -186,6 +276,7 @@ function HostCard({
   }, [workloads, template]);
 
   const desiredDirty = Object.keys(draft).length > 0;
+  const stuckCount = countStuckGaps(policy.host, agent, workloads);
   const stale = !agent?.last_seen_at ||
     (Date.now() - new Date(agent.last_seen_at).getTime()) / 1000 > 180;
 
@@ -279,12 +370,33 @@ function HostCard({
                 </Box>
               </Tooltip>
             )}
+            {stuckCount > 0 && (
+              <Tooltip label={t("hostcfg.resync_tip",
+                "実効が目標に追随していない行を目標まで戻します。 planner が VRAM で減らした GPU 行と、 許可外で 0 にされた行は触りません")}>
+                <Button size="xs" color="red" variant="light"
+                        leftSection={<IconRefresh size={14} />}
+                        loading={resyncEffective.isPending}
+                        onClick={() => resyncEffective.mutate()}>
+                  {t("hostcfg.resync", { defaultValue: "実効を目標に戻す ({{n}})", n: stuckCount })}
+                </Button>
+              </Tooltip>
+            )}
             <Button size="xs" disabled={!desiredDirty} loading={saveDesired.isPending}
                     onClick={() => saveDesired.mutate()}>
               {t("hostcfg.save", "保存")}
             </Button>
           </Group>
         </Group>
+
+        {stuckCount > 0 && (
+          <Alert color="red" icon={<IconAlertTriangle size={16} />} mb="xs">
+            {t("hostcfg.stuck_alert", {
+              defaultValue:
+                "{{n}} 件の workload で実効が目標に届いていません (VRAM でも許可外でもない)。 agent が見るのは実効だけなので、 この行の子は 1 つも動きません。",
+              n: stuckCount,
+            })}
+          </Alert>
+        )}
 
         {!agent && (
           <Alert color="orange" icon={<IconAlertTriangle size={16} />} mb="xs">
@@ -341,8 +453,13 @@ function HostCard({
               const overCap = perHost !== null && e.count > perHost;
               const alive = aliveOf(slug);
               const eff = Number(effective[slug]?.count ?? 0);
+              const gap = effectiveGap(slug, policy.host, template, effective, w);
+              // GPU workload × GPU 無しホスト = 何台書いても起動しない。 ただし既に残骸
+              // (count>0) がある行は 0 に戻せないと困るので編集を許す。
+              const gpuBlocked = Boolean(w?.requires_gpu) && !hostHasGpu;
+              const dimmed = (!allowed || gpuBlocked) && e.count === 0;
               return (
-                <Table.Tr key={slug} style={!allowed && e.count === 0 ? { opacity: 0.55 } : undefined}>
+                <Table.Tr key={slug} style={dimmed ? { opacity: 0.55 } : undefined}>
                   <Table.Td>
                     <Tooltip
                       label={
@@ -400,6 +517,14 @@ function HostCard({
                     <Group gap={6} wrap="nowrap">
                       <Code>{slug}</Code>
                       {w?.requires_gpu && <Badge size="xs" color="violet" variant="light">GPU</Badge>}
+                      {gpuBlocked && (
+                        <Tooltip label={t("hostcfg.no_gpu_tip",
+                          "このホストは GPU 非搭載 (VRAM 未報告) です。 GPU workload は agent の VRAM ゲートで spawn されません")}>
+                          <Badge size="xs" color="gray" variant="outline">
+                            {t("hostcfg.no_gpu", "GPU 無し")}
+                          </Badge>
+                        </Tooltip>
+                      )}
                       {w && !w.enabled && (
                         <Badge size="xs" color="gray" variant="outline">
                           {t("hostcfg.disabled", "停止中")}
@@ -413,12 +538,41 @@ function HostCard({
                       min={0}
                       max={64}
                       value={e.count}
-                      error={overCap}
+                      error={overCap || (gpuBlocked && e.count > 0)}
+                      disabled={gpuBlocked && e.count === 0}
                       onChange={(v) => setEntry(slug, { count: Number(v) || 0 })}
                     />
                   </Table.Td>
                   <Table.Td>
-                    <Text size="sm" c={eff < e.count ? "orange" : undefined}>{eff}</Text>
+                    <Group gap={4} wrap="nowrap">
+                      <Text size="sm"
+                            fw={gap === "stuck" ? 700 : undefined}
+                            c={gap === "stuck" ? "red" : gap ? "orange" : undefined}>
+                        {eff}
+                      </Text>
+                      {gap === "affinity" && (
+                        <Tooltip label={t("hostcfg.gap_affinity_tip",
+                          "host_affinity 違反として planner が 0 に固定しています。 目標ではなく「許可」を直してください")}>
+                          <Badge size="xs" color="gray" variant="outline">
+                            {t("hostcfg.gap_affinity", "許可外")}
+                          </Badge>
+                        </Tooltip>
+                      )}
+                      {gap === "vram" && (
+                        <Tooltip label={t("hostcfg.gap_vram_tip",
+                          "planner が VRAM 実測で丸めています。 VRAM が空けば自動で目標まで戻ります")}>
+                          <Badge size="xs" color="yellow" variant="light">VRAM</Badge>
+                        </Tooltip>
+                      )}
+                      {gap === "stuck" && (
+                        <Tooltip label={t("hostcfg.gap_stuck_tip",
+                          "VRAM でも許可外でもないのに実効が目標に届いていません。 自動では戻らないので「実効を目標に戻す」を押してください")}>
+                          <Badge size="xs" color="red">
+                            {t("hostcfg.gap_stuck", "未追随")}
+                          </Badge>
+                        </Tooltip>
+                      )}
+                    </Group>
                   </Table.Td>
                   <Table.Td>
                     <Text size="sm" c={alive < eff ? "dimmed" : undefined}>{alive}</Text>
@@ -434,6 +588,19 @@ function HostCard({
                     {!allowed && e.count > 0 && (
                       <Text size="xs" c="red">
                         {t("hostcfg.warn_affinity", "許可外 → 0 に矯正されます")}
+                      </Text>
+                    )}
+                    {gpuBlocked && e.count > 0 && (
+                      <Text size="xs" c="red">
+                        {t("hostcfg.warn_no_gpu", "GPU 無し → 子は起動しません (0 にしてください)")}
+                      </Text>
+                    )}
+                    {gap === "stuck" && (
+                      <Text size="xs" c="red">
+                        {t("hostcfg.warn_stuck", {
+                          defaultValue: "実効 {{eff}} が目標 {{target}} に未追随 → 子は動きません",
+                          eff, target: Number(template[slug]?.count ?? 0),
+                        })}
                       </Text>
                     )}
                     {overCap && (
@@ -502,6 +669,7 @@ export function HostConfigSection() {
           const a = agentBy.get(h.host);
           const alive = (a?.last_children ?? []).filter((c) => c.alive);
           const gpuAlive = alive.filter((c) => c.gpu).length;
+          const stuck = countStuckGaps(h.host, a, workloads);
           const freePct = h.vram_total_mb
             ? ((h.vram_total_mb - (h.vram_free_mb ?? 0)) / h.vram_total_mb) * 100
             : 0;
@@ -521,6 +689,11 @@ export function HostConfigSection() {
                       GPU {gpuAlive}
                       {h.max_gpu_workers !== null ? ` / ${h.max_gpu_workers}` : ""}
                     </Badge>
+                    {stuck > 0 && (
+                      <Badge size="xs" color="red" leftSection={<IconAlertTriangle size={10} />}>
+                        {t("hostcfg.stuck_badge", { defaultValue: "未追随 {{n}}", n: stuck })}
+                      </Badge>
+                    )}
                   </Group>
                   <Group gap={8} wrap="nowrap">
                     <Box w={130}>

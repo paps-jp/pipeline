@@ -55,7 +55,22 @@ class AgentRepository:
     def _clamp_to_template(effective: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]:
         """effective を template の上限で頭打ちにする (planner の削減は保持)。
 
-        template に無い slug は落とす。 count は min(effective, template)。
+        template に無い slug は落とす。 **GPU slug のみ** count = min(effective, template)。
+
+        CPU (gpu=false) slug は clamp しない = template が唯一の権威。 effective を
+        下げるのは supervisor の planner だけで、 planner が触るのは GPU slug のみ
+        (_agent_desired_planner の gpu_slugs)。 しかも planner は VRAM 未報告ホスト
+        (nas-c2 のような GPU 非搭載 LXC = nvidia-smi 不在) を丸ごと skip する。 そこで
+        CPU slug まで min() を掛けると effective は下がる一方で誰も戻せない片道切符に
+        なり、 一度 0 になった workload が template を 1 に戻しても永久に停止する。
+        実障害 2026-08-02: nas-c2 の paprika-image-pull / paprika-job-submit /
+        embed-write / video-health が effective=0 で 1 時間以上停止 (= パイプラインの
+        蛇口が閉まり GPU が全台遊休)。 crawl-face-cleanup も全 GPU ホストで 0 固着し、
+        elastic が「want=1 cur=0」を見て template を 31 まで膨らませ続けた。
+
+        例外は affinity 矯正由来の 0 (affinity_blocked)。 これは host_affinity という
+        絶対制約の結果なので、 template から復活させてはいけない
+        (agent-planner の enforce_affinity が印を付け、 違反解消時に外す)。
         """
         t_wl = (template or {}).get("workloads") or {}
         e_wl = (effective or {}).get("workloads") or {}
@@ -64,10 +79,14 @@ class AgentRepository:
             spec = dict(t_spec)
             e_spec = e_wl.get(slug)
             if isinstance(e_spec, dict) and e_spec.get("count") is not None:
-                try:
-                    spec["count"] = min(int(e_spec["count"]), int(t_spec.get("count") or 0))
-                except (TypeError, ValueError):
-                    pass
+                if e_spec.get("affinity_blocked"):
+                    spec["count"] = 0
+                    spec["affinity_blocked"] = True
+                elif t_spec.get("gpu"):
+                    try:
+                        spec["count"] = min(int(e_spec["count"]), int(t_spec.get("count") or 0))
+                    except (TypeError, ValueError):
+                        pass
             out[slug] = spec
         return {"workloads": out}
 

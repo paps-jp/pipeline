@@ -420,6 +420,8 @@ export interface InfraAlert {
   kind: string;
   endpoint?: string | null;
   error?: string | null;
+  severity?: string;
+  detail?: string | null;
 }
 
 export interface FlowSnapshot {
@@ -583,6 +585,9 @@ export interface AgentWorkloadEntry {
   cvd?: string | null;
   /** operator 固定。 true の間 supervisor の elastic は増減させない。 */
   pin?: boolean;
+  /** effective 側のみ。 host_affinity 違反で planner が 0 に矯正した印。
+   *  この印がある 0 は template から復活させてはいけない (絶対制約)。 */
+  affinity_blocked?: boolean;
 }
 
 export interface AgentChildStatus {
@@ -617,10 +622,24 @@ export const hostApi = {
     }),
 
   listAgents: () => request<{ agents: AgentRecord[] }>("/api/v1/agents"),
-  /** template を全置換する (= このホストの workload 別 目標台数)。 effective も同値で埋まる。 */
+  /** template を全置換する (= このホストの workload 別 目標台数)。
+   *
+   *  effective は「CPU slug は template 同値 / GPU slug は min(既存 effective, template)」で
+   *  追随する (planner の VRAM 算定を消さないため)。 GPU 行は planner が VRAM 実測で
+   *  戻すまで目標に届かないことがある。 */
   setAgentDesired: (host: string, workloads: Record<string, AgentWorkloadEntry>) =>
     request<{ host: string; ok: boolean }>(
       `/api/v1/agents/${encodeURIComponent(host)}/desired`,
+      { method: "PUT", json: { workloads } },
+    ),
+  /** effective (agent が実際に reconcile する値) を直接書く。
+   *
+   *  通常は planner の領分だが、 planner が触れないホスト・slug で effective が
+   *  目標を下回ったまま戻らなくなったときの operator 用の復旧レバー
+   *  (2026-08-02: nas-c2 の CPU singleton が effective=0 で恒久停止)。 */
+  setAgentEffective: (host: string, workloads: Record<string, AgentWorkloadEntry>) =>
+    request<{ host: string; ok: boolean }>(
+      `/api/v1/agents/${encodeURIComponent(host)}/effective`,
       { method: "PUT", json: { workloads } },
     ),
 };

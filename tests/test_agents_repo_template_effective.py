@@ -80,6 +80,72 @@ def test_テンプレに増えた_slug_はテンプレ値で入る(repo):
     assert _counts(repo.get("h1")["desired"]) == {"hash": 2, "embed": 3}
 
 
+def _cpu_tmpl(**counts) -> dict:
+    return {"workloads": {s: {"count": c, "gpu": False, "pin": True}
+                          for s, c in counts.items()}}
+
+
+def test_CPU_slug_は_effective_が_0_でもテンプレで復活する(repo):
+    """planner は GPU slug しか effective を戻さないので CPU slug を clamp すると
+    片道切符になる (2026-08-02: nas-c2 の image-pull/job-submit が恒久停止)。"""
+    repo.set_template("nas-c2", _cpu_tmpl(image_pull=1, job_submit=1), by="operator")
+    repo.set_effective("nas-c2", _cpu_tmpl(image_pull=0, job_submit=0)["workloads"] and
+                       {"workloads": _cpu_tmpl(image_pull=0, job_submit=0)["workloads"]},
+                       by="planner")
+    assert _counts(repo.get("nas-c2")["desired"]) == {"image_pull": 0, "job_submit": 0}
+
+    repo.set_template("nas-c2", _cpu_tmpl(image_pull=1, job_submit=1), by="operator")
+
+    assert _counts(repo.get("nas-c2")["desired"]) == {"image_pull": 1, "job_submit": 1}, \
+        "CPU slug は template が権威 (誰も戻せない 0 固着を作らない)"
+
+
+def test_affinity_矯正由来の_0_はテンプレで復活しない(repo):
+    repo.set_template("ai-gpu5", _cpu_tmpl(image_pull=1), by="operator")
+    repo.set_effective("ai-gpu5",
+                       {"workloads": {"image_pull": {"count": 0, "gpu": False, "pin": True,
+                                                     "affinity_blocked": True}}},
+                       by="supervisor")
+
+    repo.set_template("ai-gpu5", _cpu_tmpl(image_pull=1), by="elastic")
+
+    row = repo.get("ai-gpu5")
+    assert _counts(row["desired"]) == {"image_pull": 0}, "host_affinity は絶対制約"
+    assert row["desired"]["workloads"]["image_pull"]["affinity_blocked"] is True, \
+        "印が消えると次の set_template で復活してしまう"
+
+
+def test_affinity_違反が解消したら_CPU_slug_は復活する(repo):
+    repo.set_template("ai-gpu5", _cpu_tmpl(image_pull=1), by="operator")
+    repo.set_effective("ai-gpu5",
+                       {"workloads": {"image_pull": {"count": 0, "gpu": False, "pin": True,
+                                                     "affinity_blocked": True}}},
+                       by="supervisor")
+    # planner が違反解消を検知して印を外す
+    repo.set_effective("ai-gpu5",
+                       {"workloads": {"image_pull": {"count": 0, "gpu": False, "pin": True}}},
+                       by="supervisor")
+
+    repo.set_template("ai-gpu5", _cpu_tmpl(image_pull=1), by="elastic")
+
+    assert _counts(repo.get("ai-gpu5")["desired"]) == {"image_pull": 1}
+
+
+def test_GPU_slug_は従来どおり_clamp_される(repo):
+    """CPU 例外が GPU の VRAM 算定結果まで壊していないことの明示的な確認。"""
+    mixed_t = {"workloads": {"embed": {"count": 4, "gpu": True, "vram_mb": 2000},
+                             "cleanup": {"count": 2, "gpu": False}}}
+    repo.set_template("ai-gpu9", mixed_t, by="operator")
+    repo.set_effective("ai-gpu9",
+                       {"workloads": {"embed": {"count": 1, "gpu": True, "vram_mb": 2000},
+                                      "cleanup": {"count": 0, "gpu": False}}},
+                       by="planner")
+
+    repo.set_template("ai-gpu9", mixed_t, by="elastic")
+
+    assert _counts(repo.get("ai-gpu9")["desired"]) == {"embed": 1, "cleanup": 2}
+
+
 def test_effective_が壊れていてもテンプレで復旧する(repo):
     repo.set_template("h1", _tmpl(hash=4), by="operator")
     with repo.db.transaction() as conn:
