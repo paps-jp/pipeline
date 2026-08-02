@@ -358,6 +358,24 @@ function HostCard({
                           size="xs"
                           checked={allowed}
                           disabled={!w || unconstrained || setAffinity.isPending}
+                          // host_affinity=[] は「全ホスト許可」= 有効。 触れないだけで無効ではないので
+                          // disabled の灰色を打ち消して通常の ON 色で描く (灰色だと禁止に見える)
+                          styles={
+                            w && unconstrained
+                              ? {
+                                  track: {
+                                    backgroundColor: "var(--mantine-primary-color-filled)",
+                                    borderColor: "var(--mantine-primary-color-filled)",
+                                    opacity: 1,
+                                    cursor: "default",
+                                  },
+                                  thumb: {
+                                    backgroundColor: "var(--mantine-color-white)",
+                                    borderColor: "var(--mantine-color-white)",
+                                  },
+                                }
+                              : undefined
+                          }
                           onChange={(ev) => {
                             if (!w) return;
                             const on = ev.currentTarget.checked;
