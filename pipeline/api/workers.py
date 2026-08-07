@@ -194,6 +194,12 @@ class RunStartRequest(BaseModel):
     started_at: str
 
 
+class RunStartItem(BaseModel):
+    pk: str
+    attempt: int
+    started_at: str
+
+
 class RunFinishRequest(BaseModel):
     success: bool
     exit_code: int | None = None
@@ -204,8 +210,53 @@ class RunFinishRequest(BaseModel):
     error: str | None = None
 
 
+class RunStartBatchRequest(BaseModel):
+    workload_slug: str
+    items: list[RunStartItem] = Field(min_length=1)
+
+
+class RunStartBatchResponse(BaseModel):
+    # items と同じ順序の run id。 worker 側は zip して対応付ける。
+    ids: list[str]
+
+
+class BatchResultItem(BaseModel):
+    pk: str
+    attempt: int = 0
+    # start-batch / runs/start で採番済なら渡す。 None なら run 行をここで新規作成する。
+    run_id: str | None = None
+    # run_id=None のときだけ必要 (= run 行の started_at)。
+    started_at: str | None = None
+    success: bool
+    exit_code: int | None = None
+    duration_ms: int = 0
+    stdout: str | None = None
+    stderr: str | None = None
+    output_json: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class BatchResultRequest(BaseModel):
+    workload_slug: str
+    results: list[BatchResultItem] = Field(min_length=1)
+
+
+class BatchResultResponse(BaseModel):
+    completed: int          # queue から削除した件数
+    failed: int             # fail 処理した件数
+    retry_pks: list[str]    # pending に戻った pk (= まだ attempt が残っている)
+    dead_pks: list[str]     # max_attempts に達して failed で残置した pk
+
+
 class WorkloadsForWorkerResponse(BaseModel):
     workloads: list[Workload]
+    # claim 候補が 1 件以上ある workload の slug。 worker はこれに載っていない slug への
+    # claim を省略できる (= 空振り claim の削減)。
+    # **workloads からは外さない**。 worker daemon は offer されなくなった slug の executor を
+    # 破棄する (service.py の offered_slugs) ため、 queue が一時的に空になっただけで
+    # model load 数十秒の python_module executor が捨てられ、 rebuild churn を起こす。
+    # 旧 worker はこのフィールドを読まないので、 従来通り全 slug を claim しにいくだけ。
+    claimable: list[str] = Field(default_factory=list)
 
 
 class SetWorkerFilterRequest(BaseModel):
@@ -966,7 +1017,22 @@ def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorker
         -_fair_share_key(w, recent_counts),
         w.slug,
     ))
-    return WorkloadsForWorkerResponse(workloads=out)
+    # claim 候補がある slug を backend ごとに 1 transaction で判定して同梱する。
+    # これが無いと worker は offer された workload 全部に claim を撃つので、
+    # 16 worker x 12 workload = 1 cycle あたり 192 回の空振りが構造的に発生していた
+    # (perf/control-plane-bottleneck.md §3)。 判定失敗時は fail-open で「候補あり」 扱い。
+    claimable: list[str] = []
+    if out:
+        try:
+            tables = _qrepo(request).claimable_tables(
+                [(w.queue_table, w.lease_secs) for w in out]
+            )
+            claimable = [w.slug for w in out if w.queue_table in tables]
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "claimable probe failed; offering all slugs as claimable")
+            claimable = [w.slug for w in out]
+    return WorkloadsForWorkerResponse(workloads=out, claimable=claimable)
 
 
 @router.get("/{worker_id}/higher-pending", response_model=dict[str, Any])
@@ -983,26 +1049,29 @@ def higher_pending(worker_id: str, than: int, request: Request) -> dict[str, Any
     # workload_filter=None の時は env_filter にフォールバック。
     worker_filter = _resolve_worker_filter(worker)
     qrepo = _qrepo(request)
-    higher_slugs: list[str] = []
-    for w in _wlrepo(request).list_all():
-        if not w.enabled:
-            continue
-        if int(w.priority or 0) <= than:
-            continue
-        if worker_filter is not None and w.slug not in worker_filter:
-            continue
-        affinity = list(w.host_affinity or [])
-        if not _host_matches_affinity(worker_host, affinity):
-            continue
-        # 安全な queue_table のみ count、 失敗時 (= 表未作成等) は skip
-        try:
-            counts = qrepo.count_by_state(w.queue_table)
-        except Exception:
-            continue
-        if int(counts.get("pending", 0)) > 0:
-            higher_slugs.append(w.slug)
-            if len(higher_slugs) >= 5:  # = 早期 break、 高 priority N 件あれば十分
-                break
+    candidates = [
+        w for w in _wlrepo(request).list_all()
+        if w.enabled
+        and int(w.priority or 0) > than
+        and (worker_filter is None or w.slug in worker_filter)
+        and _host_matches_affinity(worker_host, list(w.host_affinity or []))
+    ]
+    if not candidates:
+        return {"has_pending": False, "slugs": [], "than": than}
+    # 旧実装は workload ごとに count_by_state を撃っていたので、 workload 12 件で
+    # 14 transaction 張っていた (perf/control-plane-bottleneck.md §2)。 この endpoint は
+    # batch 完了ごとに呼ばれる hot path なので、 backend ごと 1 transaction の
+    # EXISTS 判定に置き換える。 include_expired=False で従来と同じ 「pending があるか」 の意味論。
+    # fail_open=False: 判定できなかった表は 「pending 無し」 に倒す (= 旧実装の
+    # `except: continue` と同じ)。 preempt を誤検知すると worker が現 workload を
+    # 手放し続けるので、 ここは安全側が閉じる方向。
+    with_work = qrepo.claimable_tables(
+        [(w.queue_table, w.lease_secs) for w in candidates],
+        include_expired=False,
+        fail_open=False,
+    )
+    # 早期 break は維持 (= 高 priority が N 件あれば preempt 判断には十分)
+    higher_slugs = [w.slug for w in candidates if w.queue_table in with_work][:5]
     return {"has_pending": bool(higher_slugs), "slugs": higher_slugs, "than": than}
 
 
@@ -1075,8 +1144,12 @@ def claim(worker_id: str, body: ClaimRequest, request: Request) -> ClaimResponse
 def complete(worker_id: str, body: CompleteRequest, request: Request) -> None:
     _get_worker_or_404(request, worker_id)
     w = _get_workload_or_404(request, body.workload_slug)
-    for pk in body.pks:
-        _qrepo(request).complete(w.queue_table, pk)
+    # NOTE: 以前は `for pk in body.pks: _qrepo(request).complete(...)` だった。
+    # _qrepo() は secondary_db 有効時に WorkloadRepository.list_all() を実行するため、
+    # pk 1 件ごとに workloads 全表スキャン + pydantic parse が走り、 pks=10 の complete が
+    # 22 transaction になっていた (perf/control-plane-bottleneck.md §2)。
+    # repo 生成をループ外に出し、 DELETE も 1 transaction に畳んで 3 transaction にする。
+    _qrepo(request).complete_many(w.queue_table, list(body.pks))
 
 
 @router.post("/{worker_id}/fail", status_code=status.HTTP_204_NO_CONTENT)
@@ -1111,6 +1184,100 @@ def finish_run(worker_id: str, run_id: str, body: RunFinishRequest, request: Req
         stderr=body.stderr,
         output_json=body.output_json,
         error=body.error,
+    )
+
+
+@router.post("/{worker_id}/runs/start-batch", response_model=RunStartBatchResponse,
+             status_code=status.HTTP_201_CREATED)
+def start_runs_batch(
+    worker_id: str, body: RunStartBatchRequest, request: Request
+) -> RunStartBatchResponse:
+    """batch 分の run 行を 1 リクエスト / 1 transaction で作る (= runs/start の bulk 版)。
+
+    Dashboard の 「実行中」 パネルは runs.finished_at IS NULL を見ているので、
+    実行前に run 行を作る意味論は維持したまま往復だけ畳む。
+    """
+    _get_worker_or_404(request, worker_id)
+    w = _get_workload_or_404(request, body.workload_slug)
+    ids = _rrepo(request).start_many([
+        {
+            "workload_slug": w.slug,
+            "pk": it.pk,
+            "worker_id": worker_id,
+            "attempt": it.attempt,
+            "started_at": it.started_at,
+        }
+        for it in body.items
+    ])
+    return RunStartBatchResponse(ids=ids)
+
+
+@router.post("/{worker_id}/batch-result", response_model=BatchResultResponse)
+def batch_result(
+    worker_id: str, body: BatchResultRequest, request: Request
+) -> BatchResultResponse:
+    """batch 分の 「run 完了 + queue の complete/fail」 を 1 リクエストにまとめる。
+
+    従来は 1 task につき runs/start → complete → runs/{id}/finish の 3 往復で、
+    各リクエストが更に 2〜4 transaction を張っていた。 これが control plane の
+    スループット上限を決めていた (perf/control-plane-bottleneck.md §2/§4)。
+    ここでは task 数によらず transaction を 4 本以下に抑える。
+
+    冪等性は従来と同じ (= at-least-once)。 同じ pk を 2 回送ると 2 回目の DELETE は
+    0 行になるだけで、 run 行は run_id 指定なら上書き更新される。
+    """
+    _get_worker_or_404(request, worker_id)
+    w = _get_workload_or_404(request, body.workload_slug)
+    rrepo = _rrepo(request)
+
+    # 1) run 行: run_id 済 (= start-batch 経由) は UPDATE、 未採番は INSERT+UPDATE。
+    finish_items = [
+        {
+            "run_id": r.run_id,
+            "success": r.success,
+            "exit_code": r.exit_code,
+            "duration_ms": r.duration_ms,
+            "stdout": r.stdout,
+            "stderr": r.stderr,
+            "output_json": r.output_json,
+            "error": r.error,
+        }
+        for r in body.results if r.run_id
+    ]
+    if finish_items:
+        rrepo.finish_many(finish_items)
+    unrecorded = [r for r in body.results if not r.run_id]
+    if unrecorded:
+        rrepo.record_many([
+            {
+                "workload_slug": w.slug,
+                "pk": r.pk,
+                "worker_id": worker_id,
+                "attempt": r.attempt,
+                "started_at": r.started_at or datetime.now(timezone.utc).isoformat(
+                    timespec="microseconds"),
+                "success": r.success,
+                "exit_code": r.exit_code,
+                "duration_ms": r.duration_ms,
+                "stdout": r.stdout,
+                "stderr": r.stderr,
+                "output_json": r.output_json,
+                "error": r.error,
+            }
+            for r in unrecorded
+        ])
+
+    # 2) queue: 成功は一括 DELETE、 失敗は attempt を進めて pending or failed へ。
+    qrepo = _qrepo(request)
+    ok_pks = [r.pk for r in body.results if r.success]
+    ng = [(r.pk, r.error or r.stderr or "non-zero exit") for r in body.results if not r.success]
+    completed = qrepo.complete_many(w.queue_table, ok_pks) if ok_pks else 0
+    states = qrepo.fail_many(w.queue_table, ng, max_attempts=w.max_attempts) if ng else {}
+    return BatchResultResponse(
+        completed=completed,
+        failed=len(ng),
+        retry_pks=[pk for pk, st in states.items() if st == "pending"],
+        dead_pks=[pk for pk, st in states.items() if st == "failed"],
     )
 
 

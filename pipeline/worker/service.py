@@ -285,10 +285,17 @@ class ControlClient:
         except Exception:
             log.exception("deregister failed; ignored")
 
-    async def list_workloads(self, worker_id: str) -> list[dict]:
+    async def list_workloads(self, worker_id: str) -> tuple[list[dict], set[str] | None]:
+        """offer された workload と、 claim 候補がある slug 集合を返す。
+
+        戻り値の 2 番目が None = control plane が `claimable` を返さない旧版
+        (= 全 slug に claim を撃つ従来動作へフォールバック)。
+        """
         r = await self._client.get(f"{self.base}/api/v1/workers/{worker_id}/workloads")
         r.raise_for_status()
-        return r.json().get("workloads", [])
+        body = r.json()
+        claimable = body.get("claimable")
+        return body.get("workloads", []), (None if claimable is None else set(claimable))
 
     async def get_config(self, worker_id: str) -> dict[str, Any]:
         """control plane の worker 設定 (= workload_filter 等) を取得。
@@ -352,6 +359,41 @@ class ControlClient:
             f"{self.base}/api/v1/workers/{worker_id}/runs", json=payload
         )
         r.raise_for_status()
+
+    async def start_runs_batch(
+        self, worker_id: str, workload_slug: str, items: list[dict]
+    ) -> list[str | None]:
+        """batch 分の run 行を 1 往復で作る。 戻り値は items と同じ順序の run id。
+
+        control plane が旧版で 404 を返す場合は None 埋めのリストを返し、 呼出側は
+        run_id 無しで batch_result を投げる (= サーバ側が run 行を作る) に degrade する。
+        """
+        r = await self._client.post(
+            f"{self.base}/api/v1/workers/{worker_id}/runs/start-batch",
+            json={"workload_slug": workload_slug, "items": items},
+        )
+        if r.status_code == 404:
+            return [None] * len(items)
+        r.raise_for_status()
+        ids = r.json().get("ids") or []
+        return list(ids) + [None] * (len(items) - len(ids))
+
+    async def batch_result(
+        self, worker_id: str, workload_slug: str, results: list[dict]
+    ) -> bool:
+        """batch 分の 「run 完了 + queue complete/fail」 を 1 往復で送る。
+
+        戻り値 False = endpoint 未実装 (= control plane が旧版)。 呼出側は
+        従来の complete / fail / finish_run 経路にフォールバックする。
+        """
+        r = await self._client.post(
+            f"{self.base}/api/v1/workers/{worker_id}/batch-result",
+            json={"workload_slug": workload_slug, "results": results},
+        )
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+        return True
 
     async def poll_admin_cmd(self, worker_id: str, host: str) -> dict | None:
         """long poll: pending admin cmd を待つ (= 最大 25s)、 無ければ None."""
@@ -800,10 +842,11 @@ class WorkerDaemon:
         return vram > 0
 
     async def _drain_once(self) -> bool:
+        claimable: set[str] | None = None
         try:
             # httpx client が timeout 後に stuck 接続を掴んで hang する事象を防ぐため、
             # asyncio.wait_for で硬い上限を課す (httpx 自身の timeout=30s を超えても復帰)。
-            workloads = await asyncio.wait_for(
+            workloads, claimable = await asyncio.wait_for(
                 self._client.list_workloads(self.worker_id), timeout=35.0
             )
         except httpx.HTTPStatusError as e:
@@ -860,6 +903,13 @@ class WorkerDaemon:
             # vram_mb ではなく requires_gpu で判定: dispatcher は vram_mb>0 だが
             # requires_gpu=0 (= CPU workload) なので vram_mb 判定だと誤スキップする。
             if not self._has_gpu and w.get("requires_gpu"):
+                continue
+            # control plane が 「この slug には claim 候補が無い」 と言っているなら
+            # claim を撃たない (= 空振り往復の削減、 2026-08-07)。 claimable=None は
+            # 旧 control plane で、 その場合は従来通り全 slug に claim する。
+            # **executor cache は触らない**: w は offered_slugs に残るので、 queue が
+            # 一瞬空になっただけで model load 済 executor が捨てられることはない。
+            if claimable is not None and w["slug"] not in claimable:
                 continue
             tasks = await self._client.claim(self.worker_id, w["slug"], w["batch_size"])
             if not tasks:
@@ -1060,13 +1110,45 @@ class WorkerDaemon:
         # OOM 検知 → observed VRAM peak を bump (= 次回 install-multi-worker で N が下がり self-healing)
         if not is_success and _looks_like_oom(result.error or "", result.stderr or ""):
             await self._report_oom_bump(w["slug"])
+        if is_success:
+            self.success_total += 1
+        else:
+            self.failure_total += 1
+            self._pending_errs += 1
+
+        # run 完了 + queue complete/fail を 1 往復にまとめる (2026-08-07)。
+        # 旧経路は complete/fail と finish_run で 2 往復・計 5〜6 transaction だった。
+        # batch-result が無い旧 control plane 相手には従来経路へ degrade する。
+        payload = {
+            "pk": t["pk"],
+            "attempt": int(t["attempt"]),
+            "run_id": run_id,
+            "started_at": started,
+            "success": is_success,
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms,
+            "stdout": result.stdout or None,
+            "stderr": result.stderr or None,
+            "output_json": result.output_json,
+            "error": result.error,
+        }
+        try:
+            if await self._client.batch_result(self.worker_id, w["slug"], [payload]):
+                return
+        except Exception:
+            log.exception("batch_result HTTP failed; falling back to legacy endpoints")
+
+        await self._report_result_legacy(w, t, run_id, started, is_success, result)
+
+    async def _report_result_legacy(
+        self, w: dict, t: dict, run_id: str | None, started: str,
+        is_success: bool, result: ExecutionResult,
+    ) -> None:
+        """batch-result が使えない control plane 向けの従来経路 (complete/fail + finish_run)。"""
         try:
             if is_success:
-                self.success_total += 1
                 await self._client.complete(self.worker_id, w["slug"], [t["pk"]])
             else:
-                self.failure_total += 1
-                self._pending_errs += 1
                 await self._client.fail(
                     self.worker_id, w["slug"], t["pk"],
                     (result.error or result.stderr or "non-zero exit")[:4000],
@@ -1110,19 +1192,22 @@ class WorkerDaemon:
         """
         started = _utcnow_iso()
 
+        # batch 内の run 行は 1 往復でまとめて作る (2026-08-07)。 旧実装は task 数だけ
+        # start_run を逐次 await していた (= batch_size 10 なら 10 往復 x 2 transaction)。
+        # batch 実行では全 task が同時に開始/終了するので、 まとめても意味論は変わらない。
         run_ids: dict[str, str | None] = {}
-        for t in tasks:
-            try:
-                rid = await self._client.start_run(self.worker_id, {
-                    "workload_slug": w["slug"],
-                    "pk": t["pk"],
-                    "attempt": int(t["attempt"]),
-                    "started_at": started,
-                })
-                run_ids[t["pk"]] = rid
-            except Exception:
-                log.exception("start_run HTTP failed for pk=%s", t["pk"])
-                run_ids[t["pk"]] = None
+        try:
+            ids = await self._client.start_runs_batch(
+                self.worker_id, w["slug"],
+                [{"pk": t["pk"], "attempt": int(t["attempt"]), "started_at": started}
+                 for t in tasks],
+            )
+            run_ids = {t["pk"]: rid for t, rid in zip(tasks, ids, strict=False)}
+        except Exception:
+            # 記録できなくても task 実行は続ける。 run_id 無しの結果は batch-result 側で
+            # サーバが run 行を作るので、 履歴が落ちることはない。
+            log.exception("start_runs_batch HTTP failed; runs will be recorded at finish")
+            run_ids = {t["pk"]: None for t in tasks}
 
         workdir = Path(tempfile.mkdtemp(prefix=f"pipeline-{w['slug']}-batch-"))
         deadline = datetime.now(timezone.utc) + timedelta(seconds=int(w["lease_secs"]))
@@ -1153,17 +1238,43 @@ class WorkerDaemon:
         # OOM 検知: batch 全体で 1 回だけ bump (= 同じ workload で連発の防止)
         if any(_looks_like_oom(r.error or "", r.stderr or "") for r in results):
             await self._report_oom_bump(w["slug"])
-        success_pks: list[str] = []
-        for t, result in zip(tasks, results):
+        payloads: list[dict] = []
+        for t, result in zip(tasks, results, strict=False):
             is_success = _eval_success(w["success_criteria"], result)
             self.processed_total += 1
             self._pending_rows += 1
             if is_success:
                 self.success_total += 1
-                success_pks.append(t["pk"])
             else:
                 self.failure_total += 1
                 self._pending_errs += 1
+            payloads.append({
+                "pk": t["pk"],
+                "attempt": int(t["attempt"]),
+                "run_id": run_ids.get(t["pk"]),
+                "started_at": started,
+                "success": is_success,
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "stdout": result.stdout or None,
+                "stderr": result.stderr or None,
+                "output_json": result.output_json,
+                "error": result.error,
+            })
+
+        # batch 全体の 「run 完了 + queue complete/fail」 を 1 往復で送る。
+        # 旧実装は task ごとに finish_run (+ 失敗時は fail) を逐次 await し、
+        # 最後に complete を 1 回投げていた (= 2N+1 往復)。
+        try:
+            if await self._client.batch_result(self.worker_id, w["slug"], payloads):
+                return
+        except Exception:
+            log.exception("batch_result HTTP failed; falling back to legacy endpoints")
+
+        # 旧 control plane 向けフォールバック (= 従来の per-task 経路)。
+        success_pks = [p["pk"] for p in payloads if p["success"]]
+        for t, result, p in zip(tasks, results, payloads, strict=False):
+            if not p["success"]:
                 try:
                     await self._client.fail(
                         self.worker_id, w["slug"], t["pk"],
@@ -1171,35 +1282,23 @@ class WorkerDaemon:
                     )
                 except Exception:
                     log.exception("fail HTTP failed; will rely on lease expiry")
-            rid = run_ids.get(t["pk"])
             try:
-                if rid:
-                    await self._client.finish_run(self.worker_id, rid, {
-                        "success": is_success,
-                        "exit_code": result.exit_code,
-                        "duration_ms": result.duration_ms,
-                        "stdout": result.stdout or None,
-                        "stderr": result.stderr or None,
-                        "output_json": result.output_json,
-                        "error": result.error,
+                if p["run_id"]:
+                    await self._client.finish_run(self.worker_id, p["run_id"], {
+                        k: p[k] for k in
+                        ("success", "exit_code", "duration_ms", "stdout", "stderr",
+                         "output_json", "error")
                     })
                 else:
                     await self._client.record_run(self.worker_id, {
-                        "workload_slug": w["slug"],
-                        "pk": t["pk"],
-                        "attempt": int(t["attempt"]),
-                        "started_at": started,
-                        "success": is_success,
-                        "exit_code": result.exit_code,
-                        "duration_ms": result.duration_ms,
-                        "stdout": result.stdout or None,
-                        "stderr": result.stderr or None,
-                        "output_json": result.output_json,
-                        "error": result.error,
+                        "workload_slug": w["slug"], **{
+                            k: p[k] for k in
+                            ("pk", "attempt", "started_at", "success", "exit_code",
+                             "duration_ms", "stdout", "stderr", "output_json", "error")
+                        },
                     })
             except Exception:
                 log.exception("finish_run HTTP failed; lost")
-        # 成功分は 1 リクエストで一括 complete (= 軽量化)
         if success_pks:
             try:
                 await self._client.complete(self.worker_id, w["slug"], success_pks)

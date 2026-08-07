@@ -100,6 +100,99 @@ class RunsRepository:
                 },
             )
 
+    def start_many(self, items: list[dict[str, Any]]) -> list[str]:
+        """複数 run を 1 transaction でまとめて INSERT。 run id を入力順で返す。
+
+        1 件ずつ start() を呼ぶと task 数だけ transaction が張られ、 SQLite の
+        単一接続 RLock 上でそのまま直列区間になる (perf/control-plane-bottleneck.md §2)。
+        items の各要素は start() と同じキー (workload_slug / pk / worker_id /
+        attempt / started_at) を持つ。
+        """
+        if not items:
+            return []
+        ids = [_new_run_id() for _ in items]
+        with self.db.transaction() as conn:
+            for run_id, it in zip(ids, items, strict=True):
+                conn.execute(
+                    """
+                    INSERT INTO runs (
+                        id, workload_slug, pk, worker_id, attempt,
+                        started_at, finished_at,
+                        success, exit_code, duration_ms,
+                        stdout, stderr, output_json, error
+                    ) VALUES (
+                        :id, :ws, :pk, :wid, :att,
+                        :s_at, NULL,
+                        NULL, NULL, NULL,
+                        NULL, NULL, NULL, NULL
+                    )
+                    """,
+                    {
+                        "id": run_id,
+                        "ws": it["workload_slug"],
+                        "pk": str(it["pk"]),
+                        "wid": it["worker_id"],
+                        "att": int(it.get("attempt") or 0),
+                        "s_at": it["started_at"],
+                    },
+                )
+        return ids
+
+    def finish_many(self, items: list[dict[str, Any]]) -> int:
+        """複数 run の完了を 1 transaction でまとめて UPDATE。 戻り値 = 更新行数。
+
+        items の各要素は {"run_id": ..., "success": ..., "exit_code": ...,
+        "duration_ms": ..., "stdout": ..., "stderr": ..., "output_json": ...,
+        "error": ...}。 finish() と同じ意味論。
+        """
+        if not items:
+            return 0
+        finished_at = _utcnow_iso()
+        updated = 0
+        with self.db.transaction() as conn:
+            for it in items:
+                cur = conn.execute(
+                    """
+                    UPDATE runs
+                    SET finished_at  = :f_at,
+                        success      = :ok,
+                        exit_code    = :ec,
+                        duration_ms  = :dur,
+                        stdout       = :so,
+                        stderr       = :se,
+                        output_json  = :oj,
+                        error        = :er
+                    WHERE id = :id
+                    """,
+                    {
+                        "id": it["run_id"],
+                        "f_at": finished_at,
+                        "ok": 1 if it.get("success") else 0,
+                        "ec": it.get("exit_code"),
+                        "dur": int(it.get("duration_ms") or 0),
+                        "so": it.get("stdout"),
+                        "se": it.get("stderr"),
+                        "oj": json.dumps(it["output_json"]) if it.get("output_json") else None,
+                        "er": it.get("error"),
+                    },
+                )
+                updated += int(cur.rowcount or 0)
+        return updated
+
+    def record_many(self, items: list[dict[str, Any]]) -> list[str]:
+        """INSERT + 完了 UPDATE を 1 往復で行う bulk 版 (= record() の複数件版)。
+
+        run_id を持たない結果 (= start_run を打たずに実行した task) をまとめて
+        記録するために使う。 transaction は INSERT 用と UPDATE 用の 2 本。
+        """
+        if not items:
+            return []
+        ids = self.start_many(items)
+        self.finish_many([
+            {**it, "run_id": rid} for rid, it in zip(ids, items, strict=True)
+        ])
+        return ids
+
     def record(
         self,
         *,

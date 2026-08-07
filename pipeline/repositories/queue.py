@@ -34,6 +34,17 @@ def _validate_queue_table(name: str) -> None:
         raise ValueError(f"invalid queue table name: {name!r}")
 
 
+# 1 文 に埋める bind 変数の上限。 SQLite の SQLITE_MAX_VARIABLE_NUMBER は既定 999
+# (3.32 以降は 32766 だがビルド依存)、 MariaDB も max_prepared_stmt_count がある。
+# batch_size は最大 10000 を許すので、 IN (...) は必ずこの単位に刻む。
+_IN_CHUNK = 400
+
+
+def _chunks(items: list[Any], size: int = _IN_CHUNK) -> Iterable[list[Any]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
 class ClaimedTask:
     """claim() の戻り値。dict より型がはっきりして使いやすい。"""
 
@@ -179,6 +190,28 @@ class QueueRepository:
             self._backend_map.get(queue_table) == "secondary"
             and self.secondary_db is not None
         )
+        # 空振り claim から書き込みを取り除く (2026-08-07 ボトルネック調査)。
+        # SQLite 経路は候補 0 件でも UPDATE を必ず発行していたため、 task が 1 件も無い
+        # fleet でも空振り claim が 178 回/秒 発生し、 control plane の直列区間の 72% を
+        # 消費していた (perf/control-plane-bottleneck.md §3)。 先に候補の有無だけを読み、
+        # 無ければ書き込みを発行せず返す。 候補がある時に増えるのは SELECT 1 本だけで、
+        # UPDATE は従来通り 1 回なので二重取得は起きない。
+        # secondary (MariaDB) 経路は元々 SELECT ... FOR UPDATE が先頭にあり空振りでも
+        # 書き込まないので、 往復を増やさないようこの短絡は通さない。
+        if not secondary:
+            with self._get_db(queue_table).transaction() as conn:
+                probe = conn.execute(
+                    f"""
+                    SELECT 1 AS x FROM {queue_table}
+                    WHERE state='pending'
+                       OR (state='claimed' AND claimed_at < :cutoff)
+                    LIMIT 1
+                    """,
+                    {"cutoff": lease_cutoff},
+                )
+                if probe.fetchone() is None:
+                    return []
+
         with self._get_db(queue_table).transaction() as conn:
             if secondary:
                 sel = conn.execute(
@@ -262,6 +295,144 @@ class QueueRepository:
         _validate_queue_table(queue_table)
         with self._get_db(queue_table).transaction() as conn:
             conn.execute(f"DELETE FROM {queue_table} WHERE pk = :pk", {"pk": str(pk)})
+
+    def complete_many(self, queue_table: str, pks: list[str]) -> int:
+        """成功した pk 群を 1 transaction でまとめて DELETE。 戻り値 = 削除行数。
+
+        1 件ずつ complete() を呼ぶと pk の数だけ transaction が張られる。 SQLite は
+        単一接続を RLock で直列化しているので、 これがそのまま control plane の
+        直列区間になっていた (perf/control-plane-bottleneck.md §2)。
+        bind 変数上限があるので IN (...) は _IN_CHUNK 単位に刻むが、 transaction は
+        1 本にまとめる (= chunk 境界で部分 commit しない)。
+        """
+        _validate_queue_table(queue_table)
+        if not pks:
+            return 0
+        deleted = 0
+        with self._get_db(queue_table).transaction() as conn:
+            for chunk in _chunks([str(p) for p in pks]):
+                ph = ", ".join(f":p{i}" for i in range(len(chunk)))
+                cur = conn.execute(
+                    f"DELETE FROM {queue_table} WHERE pk IN ({ph})",
+                    {f"p{i}": pk for i, pk in enumerate(chunk)},
+                )
+                deleted += int(cur.rowcount or 0)
+        return deleted
+
+    def fail_many(
+        self, queue_table: str, items: list[tuple[str, str | None]], max_attempts: int
+    ) -> dict[str, str]:
+        """失敗した (pk, error) 群を 1 transaction で処理。 fail() の bulk 版。
+
+        戻り値 = {pk: 'pending' (retry 可) or 'failed' (打切り)}。 既に queue から
+        消えている pk は 'failed' 扱い (= fail() と同じ)。 attempt の判定は行ごとに
+        必要なので SELECT は pk 数だけ走るが、 transaction は 1 本に畳む。
+        """
+        _validate_queue_table(queue_table)
+        if not items:
+            return {}
+        out: dict[str, str] = {}
+        now = _utcnow_iso()
+        with self._get_db(queue_table).transaction() as conn:
+            for pk, error in items:
+                cur = conn.execute(
+                    f"SELECT attempt FROM {queue_table} WHERE pk=:pk", {"pk": str(pk)}
+                )
+                row = cur.fetchone()
+                if row is None:
+                    out[pk] = "failed"   # 既に消えてる
+                    continue
+                new_attempt = int(row["attempt"]) + 1
+                terminal = new_attempt >= int(max_attempts)
+                conn.execute(
+                    f"""
+                    UPDATE {queue_table}
+                    SET state=:st, attempt=:a, last_error=:e,
+                        claimed_at=NULL, claimed_by=NULL, updated_at=:now
+                    WHERE pk=:pk
+                    """,
+                    {
+                        "st": "failed" if terminal else "pending",
+                        "a": new_attempt,
+                        "e": (error or "")[:4000],
+                        "pk": str(pk),
+                        "now": now,
+                    },
+                )
+                out[pk] = "failed" if terminal else "pending"
+        return out
+
+    def claimable_tables(
+        self,
+        specs: list[tuple[str, int]],
+        include_expired: bool = True,
+        fail_open: bool = True,
+    ) -> set[str]:
+        """(queue_table, lease_secs) の列を受け、 claim 候補が 1 件以上ある表名を返す。
+
+        include_expired=False なら state='pending' だけを見る (= lease 切れの claimed を
+        数えない)。 「pending があるか」 だけを知りたい呼出側 (= higher-pending の
+        preemption 判定) が、 従来の count_by_state と同じ意味論を保つために使う。
+
+        `GET /workers/{id}/workloads` が 「pending が無い workload まで offer する」 ため、
+        worker は 1 cycle ごとに workload 数だけ空振り claim を撃っていた。 その判定を
+        ここで一括に行う。 表ごとに count_by_state を呼ぶ (= 表の数だけ transaction) のを
+        避けるため、 **backend ごとに transaction 1 本** にまとめて EXISTS だけ問い合わせる。
+
+        fail_open=True (既定): 表が無い等で問い合わせに失敗した表は 「候補あり」 として返す。
+        判定に失敗したせいで workload が offer から消える (= fleet が止まる) 方が
+        空振り claim より遥かに悪いため。 逆に 「候補ありと誤判定すると困る」 呼出側
+        (= preemption 判定。 誤検知すると worker が現 workload を無限に手放す) は
+        fail_open=False を渡して従来の 「失敗した表は skip」 に倒す。
+        """
+        if not specs:
+            return set()
+        # backend (= 実 DB instance) ごとにまとめる。 id() ではなく _get_db の戻りで束ねる。
+        by_db: dict[int, tuple[Any, list[tuple[str, int]]]] = {}
+        for queue_table, lease_secs in specs:
+            _validate_queue_table(queue_table)
+            db = self._get_db(queue_table)
+            by_db.setdefault(id(db), (db, []))[1].append((queue_table, lease_secs))
+
+        out: set[str] = set()
+        now = datetime.now(timezone.utc)
+        for db, group in by_db.values():
+            try:
+                with db.transaction() as conn:
+                    for queue_table, lease_secs in group:
+                        cutoff = (
+                            now - timedelta(seconds=max(1, lease_secs))
+                        ).isoformat(timespec="microseconds")
+                        try:
+                            if include_expired:
+                                cur = conn.execute(
+                                    f"""
+                                    SELECT 1 AS x FROM {queue_table}
+                                    WHERE state='pending'
+                                       OR (state='claimed' AND claimed_at < :cutoff)
+                                    LIMIT 1
+                                    """,
+                                    {"cutoff": cutoff},
+                                )
+                            else:
+                                cur = conn.execute(
+                                    f"SELECT 1 AS x FROM {queue_table} "
+                                    f"WHERE state='pending' LIMIT 1"
+                                )
+                            if cur.fetchone() is not None:
+                                out.add(queue_table)
+                        except Exception:
+                            log.debug("claimable probe failed for %s (fail_open=%s)",
+                                      queue_table, fail_open)
+                            if fail_open:
+                                out.add(queue_table)
+            except Exception:
+                # transaction そのものが張れない = backend 障害。 group 全体を fail-open。
+                log.warning("claimable probe transaction failed for %d tables (fail_open=%s)",
+                            len(group), fail_open)
+                if fail_open:
+                    out.update(t for t, _ in group)
+        return out
 
     def fail(self, queue_table: str, pk: str, max_attempts: int, error: str | None) -> str:
         """失敗時: attempt+1。max 未満なら pending に戻す、max に達したら failed で残置。

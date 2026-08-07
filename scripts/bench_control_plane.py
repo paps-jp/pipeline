@@ -211,7 +211,9 @@ async def _seed(base: str, n_workloads: int, n_tasks: int) -> None:
             r.raise_for_status()
 
 
-async def _worker_sim(base: str, idx: int, stop_at: float, counters, fused: bool) -> None:
+async def _worker_sim(base: str, idx: int, stop_at: float, counters,
+                      fused: bool, legacy: bool, idle_sleep: float,
+                      batch_executor: bool) -> None:
     """service.py の _drain_loop / _drain_once と同じ順序で API を叩く。"""
     async with httpx.AsyncClient(base_url=base, timeout=60) as c:
         r = await c.post("/api/v1/workers", json={
@@ -226,14 +228,20 @@ async def _worker_sim(base: str, idx: int, stop_at: float, counters, fused: bool
                 await _timed("PUT heartbeat",
                              c.put(f"/api/v1/workers/{wid}/heartbeat", json={}))
             r = await _timed("GET workloads", c.get(f"/api/v1/workers/{wid}/workloads"))
-            wls = r.json()["workloads"]
+            body = r.json()
+            wls = body["workloads"]
+            # service.py と同じく、 claimable ヒントがあれば空振り claim を省く。
+            # legacy=True なら旧 worker の挙動 (= 全 slug に claim) を再現する。
+            claimable = None if legacy else body.get("claimable")
             if not wls:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(idle_sleep)
                 continue
             did = False
             for w in wls:
                 if time.monotonic() >= stop_at:
                     break
+                if claimable is not None and w["slug"] not in claimable:
+                    continue
                 r = await _timed("POST claim", c.post(
                     f"/api/v1/workers/{wid}/claim",
                     json={"workload_slug": w["slug"], "limit": w["batch_size"]}))
@@ -242,35 +250,69 @@ async def _worker_sim(base: str, idx: int, stop_at: float, counters, fused: bool
                     counters["empty_claim"] += 1
                     continue
                 did = True
+                started = "2026-01-01T00:00:00+00:00"
                 if fused:
+                    # 仮想 endpoint (= 理論上限の確認用)。 本番 API には存在しない。
                     await _timed("POST fused", c.post(
                         f"/bench/fused/{wid}",
                         json={"workload_slug": w["slug"],
                               "results": [{"pk": t["pk"], "attempt": t["attempt"],
-                                           "started_at": "2026-01-01T00:00:00+00:00",
+                                           "started_at": started,
                                            "duration_ms": 1} for t in tasks]}))
                     counters["done"] += len(tasks)
-                    continue
-                for t in tasks:
-                    rr = await _timed("POST runs/start", c.post(
-                        f"/api/v1/workers/{wid}/runs/start",
-                        json={"workload_slug": w["slug"], "pk": t["pk"],
-                              "attempt": t["attempt"],
-                              "started_at": "2026-01-01T00:00:00+00:00"}))
-                    rid = rr.json()["id"]
-                    await _timed("POST complete", c.post(
-                        f"/api/v1/workers/{wid}/complete",
-                        json={"workload_slug": w["slug"], "pks": [t["pk"]]}))
-                    await _timed("POST runs/finish", c.post(
-                        f"/api/v1/workers/{wid}/runs/{rid}/finish",
-                        json={"success": True, "exit_code": 0, "duration_ms": 1}))
-                    counters["done"] += 1
+                elif legacy:
+                    # 旧 worker: 1 task = runs/start + complete + runs/finish の 3 往復
+                    for t in tasks:
+                        rr = await _timed("POST runs/start", c.post(
+                            f"/api/v1/workers/{wid}/runs/start",
+                            json={"workload_slug": w["slug"], "pk": t["pk"],
+                                  "attempt": t["attempt"], "started_at": started}))
+                        rid = rr.json()["id"]
+                        await _timed("POST complete", c.post(
+                            f"/api/v1/workers/{wid}/complete",
+                            json={"workload_slug": w["slug"], "pks": [t["pk"]]}))
+                        await _timed("POST runs/finish", c.post(
+                            f"/api/v1/workers/{wid}/runs/{rid}/finish",
+                            json={"success": True, "exit_code": 0, "duration_ms": 1}))
+                        counters["done"] += 1
+                elif batch_executor:
+                    # service.py の _execute_batch: batch 全体で start-batch + batch-result の 2 往復
+                    ids = (await _timed("POST runs/start-batch", c.post(
+                        f"/api/v1/workers/{wid}/runs/start-batch",
+                        json={"workload_slug": w["slug"],
+                              "items": [{"pk": t["pk"], "attempt": t["attempt"],
+                                         "started_at": started} for t in tasks]}))).json()["ids"]
+                    await _timed("POST batch-result", c.post(
+                        f"/api/v1/workers/{wid}/batch-result",
+                        json={"workload_slug": w["slug"],
+                              "results": [{"pk": t["pk"], "attempt": t["attempt"],
+                                           "run_id": rid, "started_at": started,
+                                           "success": True, "exit_code": 0, "duration_ms": 1}
+                                          for t, rid in zip(tasks, ids, strict=False)]}))
+                    counters["done"] += len(tasks)
+                else:
+                    # service.py の _execute_one: 1 task = runs/start + batch-result の 2 往復
+                    for t in tasks:
+                        rr = await _timed("POST runs/start", c.post(
+                            f"/api/v1/workers/{wid}/runs/start",
+                            json={"workload_slug": w["slug"], "pk": t["pk"],
+                                  "attempt": t["attempt"], "started_at": started}))
+                        rid = rr.json()["id"]
+                        await _timed("POST batch-result", c.post(
+                            f"/api/v1/workers/{wid}/batch-result",
+                            json={"workload_slug": w["slug"],
+                                  "results": [{"pk": t["pk"], "attempt": t["attempt"],
+                                               "run_id": rid, "started_at": started,
+                                               "success": True, "exit_code": 0,
+                                               "duration_ms": 1}]}))
+                        counters["done"] += 1
                 r = await _timed("GET higher-pending", c.get(
                     f"/api/v1/workers/{wid}/higher-pending", params={"than": w["priority"]}))
                 if r.json().get("has_pending"):
                     break                                # Lv2 preemption
             if not did:
-                await asyncio.sleep(0.02)
+                # service.py の _drain_loop と同じ: 何も処理しなかった cycle は待つ
+                await asyncio.sleep(idle_sleep)
 
 
 def _pct(v: list[float], p: int) -> float:
@@ -323,7 +365,8 @@ async def cmd_load(a: argparse.Namespace) -> None:
 
     counters: Counter = Counter()
     t0 = time.monotonic()
-    await asyncio.gather(*[_worker_sim(base, i, t0 + a.dur, counters, a.fused)
+    await asyncio.gather(*[_worker_sim(base, i, t0 + a.dur, counters, a.fused, a.legacy,
+                                       a.idle_sleep, a.batch_executor)
                            for i in range(a.workers)])
     elapsed = time.monotonic() - t0
 
@@ -334,6 +377,10 @@ async def cmd_load(a: argparse.Namespace) -> None:
         mode.append("fused")
     if a.secondary:
         mode.append("secondary_db")
+    if a.legacy:
+        mode.append("legacy-worker")
+    if a.batch_executor:
+        mode.append("batch-executor")
     print(f"\n=== workers={a.workers} workloads={a.workloads} dur={elapsed:.1f}s "
           f"{'[' + ','.join(mode) + ']' if mode else ''} ===")
     print(f"tasks completed : {counters['done']}  ({counters['done'] / elapsed:.1f} tasks/s)")
@@ -428,6 +475,14 @@ def main() -> None:
                     help="1 task=3 request を 1 batch=1 request に畳んだ場合の上限を測る")
     lo.add_argument("--secondary", action="store_true",
                     help="PIPELINE_SECONDARY_DB_URL を立てて _qrepo の配線経路を有効化")
+    lo.add_argument("--idle-sleep", type=float, default=1.0,
+                    dest="idle_sleep",
+                    help="何も処理しなかった cycle の待ち (= worker の DEFAULT_IDLE_SLEEP_S)")
+    lo.add_argument("--batch-executor", action="store_true",
+                    dest="batch_executor",
+                    help="process_batch を持つ plugin (= _execute_batch 経路) を再現する")
+    lo.add_argument("--legacy", action="store_true",
+                    help="claimable ヒントを無視する旧 worker の挙動を再現する")
     lo.add_argument("--tmpdir", default=None)
 
     sc = sub.add_parser("sqlcount", help="API 1 リクエストあたりの SQL / tx 回数を数える")
