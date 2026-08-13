@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import re
 
 import pytest
 
@@ -62,7 +63,7 @@ def _metrics(total: int, free: int, live: int) -> str:
 
 
 def _state(sup, *, used: int, live: int, enabled: bool = True,
-           warn: float = 70.0, crit: float = 85.0, monkeypatch=None) -> dict:
+           warn: float = 80.0, crit: float = 90.0, monkeypatch=None) -> dict:
     """probe を metrics テキスト固定にした state を作る。"""
     state = {
         "ramdisk_cfg": {
@@ -144,7 +145,7 @@ def test_clamp_budget_limits_growth(sup, monkeypatch):
     used=45G, crit=85% → crit ライン 76.5G、 残 31.5G。 claim 900MB なので
     +35 台まで。 active=10 なので 45 が上限 → 目標 20 はそのまま通る。
     """
-    state = _state(sup, used=45 * _GB, live=5 * _GB, monkeypatch=monkeypatch)
+    state = _state(sup, used=45 * _GB, live=5 * _GB, crit=85.0, monkeypatch=monkeypatch)
     plan = {"video-face-extract": 20}
     info = sup._ramdisk_clamp(state, plan, {"video-face-extract": 10},
                               {"video-face-extract": _wl()})
@@ -157,8 +158,10 @@ def test_clamp_budget_caps_when_headroom_small(sup, monkeypatch):
 
     used=60G, crit=85% → crit ライン 76.5G、 残 16.5G = 16896MB。
     claim 900MB なので +18 台。 active=2 → 上限 20。 目標 32 は 20 に落ちる。
+
+    閾値は既定値の変更から独立させるため明示指定する。
     """
-    state = _state(sup, used=60 * _GB, live=8 * _GB, monkeypatch=monkeypatch)
+    state = _state(sup, used=60 * _GB, live=8 * _GB, crit=85.0, monkeypatch=monkeypatch)
     plan = {"video-face-extract": 32}
     info = sup._ramdisk_clamp(state, plan, {"video-face-extract": 2},
                               {"video-face-extract": _wl()})
@@ -169,7 +172,7 @@ def test_clamp_budget_caps_when_headroom_small(sup, monkeypatch):
 
 def test_clamp_warn_freezes_growth_but_allows_shrink(sup, monkeypatch):
     """warn 域では増やさない。 減らす提案はそのまま通す。"""
-    state = _state(sup, used=int(0.75 * _TOTAL), live=8 * _GB, monkeypatch=monkeypatch)
+    state = _state(sup, used=int(0.85 * _TOTAL), live=8 * _GB, monkeypatch=monkeypatch)
     plan = {"video-face-extract": 30}
     sup._ramdisk_clamp(state, plan, {"video-face-extract": 18},
                        {"video-face-extract": _wl()})
@@ -245,7 +248,7 @@ def test_clamp_uses_declared_claim_mb_over_default(sup, monkeypatch):
 
     残 16.5G = 16896MB。 claim を 4224MB と宣言すれば +4 台まで (既定 900 なら +18)。
     """
-    state = _state(sup, used=60 * _GB, live=8 * _GB, monkeypatch=monkeypatch)
+    state = _state(sup, used=60 * _GB, live=8 * _GB, crit=85.0, monkeypatch=monkeypatch)
     plan = {"video-face-extract": 32}
     sup._ramdisk_clamp(state, plan, {"video-face-extract": 2},
                        {"video-face-extract": _wl(claim_mb=4224)})
@@ -253,8 +256,24 @@ def test_clamp_uses_declared_claim_mb_over_default(sup, monkeypatch):
 
 
 def test_clamp_falls_back_to_default_claim_when_undeclared(sup, monkeypatch):
-    state = _state(sup, used=60 * _GB, live=8 * _GB, monkeypatch=monkeypatch)
+    state = _state(sup, used=60 * _GB, live=8 * _GB, crit=85.0, monkeypatch=monkeypatch)
     plan = {"video-face-extract": 32}
     sup._ramdisk_clamp(state, plan, {"video-face-extract": 2},
                        {"video-face-extract": _wl(claim_mb=None)})
     assert plan["video-face-extract"] == 20          # active 2 + 16896//900
+
+
+def test_shipped_default_thresholds_clear_the_measured_envelope(sup):
+    """出荷時の既定閾値が .48 の実測 envelope を超えていること。
+
+    2026-08-14 の 6 分連続実測で .48 は 80G tmpfs の 71.7% (58.8G) まで届き、
+    約 30 秒で自然に落ちる (Paprika のバケット一括削除 + MinIO trash purge 待ち
+    の重なり)。 既定を 70/85 に戻すと平常運転で増加凍結と赤ボックスが常時発火し、
+    alert が意味を失う。 setup() は os.uname() 依存で Windows から呼べないので
+    ソースの既定値を読む。
+    """
+    src = pathlib.Path(sup.__file__).read_text(encoding="utf-8")
+    warn = float(re.search(r'"ramdisk_warn_pct", ([0-9.]+)\)', src).group(1))
+    crit = float(re.search(r'"ramdisk_crit_pct", ([0-9.]+)\)', src).group(1))
+    assert warn > 71.7, f"warn={warn} は実測ピーク 71.7% を割っている"
+    assert crit > warn

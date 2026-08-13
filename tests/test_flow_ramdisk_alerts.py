@@ -64,8 +64,19 @@ def test_below_warn_emits_no_alert(fake_metrics):
     assert flow._ramdisk_probe_one("video-ram", "http://x:9000") is None
 
 
+def test_normal_peak_does_not_alert(fake_metrics):
+    """実測の通常ピーク (80G tmpfs の 71.7%) では鳴らないこと。
+
+    2026-08-14 の 6 分連続実測で .48 は 58.8G まで届き 約 30 秒で自然に落ちる
+    (Paprika のバケット一括削除 → MinIO trash purge 待ちの重なり)。 ここで鳴ると
+    平常運転で赤ボックスが点きっぱなしになり alert として機能しなくなる。
+    """
+    fake_metrics(_metrics(80 * _GB, 80 * _GB - 58 * _GB, 20 * _GB))   # 72.5%
+    assert flow._ramdisk_probe_one("video-ram", "http://x:9000") is None
+
+
 def test_warn_threshold_emits_warn(fake_metrics):
-    fake_metrics(_metrics(_TOTAL, _TOTAL - 68 * _GB, 10 * _GB))    # 75.6%
+    fake_metrics(_metrics(_TOTAL, _TOTAL - 76 * _GB, 10 * _GB))    # 84.4%
     a = flow._ramdisk_probe_one("video-ram", "http://x:9000")
     assert a is not None
     assert a["severity"] == "warn"
@@ -74,7 +85,7 @@ def test_warn_threshold_emits_warn(fake_metrics):
 
 
 def test_crit_threshold_emits_crit(fake_metrics):
-    fake_metrics(_metrics(_TOTAL, _TOTAL - 81 * _GB, 12 * _GB))    # 90%
+    fake_metrics(_metrics(_TOTAL, _TOTAL - 82 * _GB, 12 * _GB))    # 91.1%
     a = flow._ramdisk_probe_one("video-ram", "http://x:9000")
     assert a is not None
     assert a["severity"] == "crit"

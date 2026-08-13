@@ -333,8 +333,12 @@ def _pve_alerts() -> list[dict[str, Any]]:
 # (実測でピーク時の 83〜99% が trash 側だった)。
 _RAMDISK_HEALTH_TTL_S = 60.0
 _RAMDISK_DEFAULT = "video-ram:.48=http://10.10.50.48:9000"
-_RAMDISK_WARN_PCT = 70.0
-_RAMDISK_CRIT_PCT = 85.0
+# 閾値は .48 の実測 envelope 由来。 2026-08-14 の 6 分連続実測で通常ピークは
+# 80G tmpfs の 71.7% (58.8G) まで届き、 約 30 秒で自然に落ちる (Paprika が
+# バケットを一括削除 → MinIO の trash purge 待ち、 の重なり)。 70/85 だと
+# 平常運転で赤ボックスが点いてしまい、 alert として意味を失う。
+_RAMDISK_WARN_PCT = 80.0
+_RAMDISK_CRIT_PCT = 90.0
 _ramdisk_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
 _ramdisk_health_lock = threading.Lock()
 
