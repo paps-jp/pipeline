@@ -9,8 +9,9 @@ tmpfs (90G) に載せるのに、 workload の資源宣言は `vram_mb` だけ�
 
 このテストが守る性質:
   - probe は `capacity total - free` を使う (= df 相当、 trash 込み)。
-    `usage_total_bytes` (live のみ) で予算判定すると trash 分を見落とし、
-    実測で使用量の 83〜99% を占めていた側を丸ごと無視することになる。
+    `usage_total_bytes` で予算判定してはいけない。 これは live のみを表すうえ
+    データスキャナの定期集計で数分〜数十分遅れる (実測: 実 du 8152MB に対し
+    11812MB = 45% 過大)。 判定にも「used - live = 削除待ち」の引き算にも使わない。
   - probe 失敗は fail-open。 metrics 障害で動画パイプラインを止めない。
   - crit でも min_workers は下回らない。 0 台にすると throughput も slope も
     観測できず二度と発進できない (`_goodput_gear_engaged` と同じ理由)。 また
@@ -102,15 +103,15 @@ def _wl(min_workers: int = 15, claim_mb: int | None = 900) -> dict:
 def test_probe_uses_capacity_not_live_usage(sup, monkeypatch):
     """used は capacity(total-free) 由来。 live (usage_total) と混同しない。
 
-    実測でピーク時の使用量の 83〜99% は .trash 側だった。 live を予算に使うと
-    その分を丸ごと見落とす。
+    live を予算に使うと .trash 分を見落とすうえ、 スキャナ遅延で値自体が信用
+    できない。 保持はするが名前で参考値だと分かるようにしてある。
     """
     state = _state(sup, used=45 * _GB, live=5 * _GB, monkeypatch=monkeypatch)
     snap = sup._ramdisk_probe(state)
     assert snap is not None
     assert snap["total_mb"] == 90 * 1024
     assert snap["used_mb"] == 45 * 1024
-    assert snap["live_mb"] == 5 * 1024      # live は別枠で保持するだけ
+    assert snap["live_mb_approx"] == 5 * 1024   # 参考値として保持するだけ
     assert snap["pct"] == pytest.approx(50.0, abs=0.1)
 
 

@@ -399,12 +399,18 @@ def _ramdisk_probe_one(name: str, base: str) -> dict[str, Any] | None:
     pct = used / total * 100.0
     if pct < _RAMDISK_WARN_PCT:
         return None
-    live = vals.get("minio_cluster_usage_total_bytes") or 0.0
     g = 1024 ** 3
-    # trash = df 上の使用量 - live オブジェクト。 「消したのにまだ RAM を
-    # 掴んでいる分」で、 逼迫時はこちらが主犯になる。
-    detail = (f"{used / g:.1f}G / {total / g:.1f}G ({pct:.1f}%) "
-              f"— live {live / g:.1f}G / 削除待ち {max(0.0, used - live) / g:.1f}G")
+    # 判定と表示は capacity(total-free) だけで行う。 これは df と一致する実測値。
+    #
+    # `minio_cluster_usage_total_bytes` (= live オブジェクトの実体) を引いて
+    # 「live / 削除待ち」 の内訳を出したくなるが、 **やってはいけない**。 この値は
+    # データスキャナが定期的に集計したもので数分〜数十分遅れる。 2026-08-14 の実測で
+    # 実 du 8152MB に対しメトリクスは 11812MB (45% 過大) を返し、 引き算した
+    # 「削除待ち」 は 8390MB の実測に対し 5000MB を示した。 used < live になる
+    # 瞬間すらあり、 内訳が 0 に潰れる。 誤った内訳は内訳が無いより有害なので出さない。
+    # 内訳が要るときは CT で直接 du を取る (`du -sm /data/paprika
+    # /data/.minio.sys/tmp/.trash`)。
+    detail = f"{used / g:.1f}G / {total / g:.1f}G ({pct:.1f}%) — tmpfs 逼迫"
     return {"name": f"ramdisk:{name}", "kind": "storage_full", "endpoint": base,
             "severity": "crit" if pct >= _RAMDISK_CRIT_PCT else "warn",
             "detail": detail}

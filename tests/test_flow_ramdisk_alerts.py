@@ -80,17 +80,29 @@ def test_crit_threshold_emits_crit(fake_metrics):
     assert a["severity"] == "crit"
 
 
-def test_detail_separates_live_from_pending_delete(fake_metrics):
-    """detail に live と削除待ちの内訳を出す。
+def test_detail_never_derives_a_live_breakdown(fake_metrics):
+    """detail に「live / 削除待ち」の内訳を出してはいけない。
 
-    「使用量は多いが live はわずか」という .48 特有の状態を、 赤ボックスを見た
-    人がその場で判断できるようにするため。
+    minio_cluster_usage_total_bytes はデータスキャナの定期集計で数分〜数十分
+    遅れる。 2026-08-14 の実測では 実 du 8152MB に対し 11812MB (45% 過大) を
+    返し、 引き算した「削除待ち」は 実測 8390MB に対し 5000MB を示した。
+    used < live になる瞬間すらあり内訳が 0 に潰れる。 誤った内訳は内訳が無いより
+    有害なので、 detail は df と一致する used/total だけにする。
     """
     fake_metrics(_metrics(_TOTAL, _TOTAL - 80 * _GB, 10 * _GB))
     a = flow._ramdisk_probe_one("video-ram", "http://x:9000")
     assert a is not None
-    assert "live 10.0G" in a["detail"]
-    assert "削除待ち 70.0G" in a["detail"]
+    assert "80.0G / 90.0G" in a["detail"]
+    for forbidden in ("live", "削除待ち"):
+        assert forbidden not in a["detail"]
+
+
+def test_detail_survives_live_exceeding_used(fake_metrics):
+    """スキャナ遅延で live > used になっても detail が壊れない。"""
+    fake_metrics(_metrics(_TOTAL, _TOTAL - 80 * _GB, 85 * _GB))
+    a = flow._ramdisk_probe_one("video-ram", "http://x:9000")
+    assert a is not None
+    assert "80.0G / 90.0G (88.9%)" in a["detail"]
 
 
 def test_uses_capacity_not_live_usage(fake_metrics):
