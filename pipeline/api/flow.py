@@ -14,10 +14,14 @@
 
 from __future__ import annotations
 
+import datetime as _dt
+import json
 import logging
 import os
+import ssl
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -92,18 +96,21 @@ class FlowEdge(BaseModel):
 
 
 class InfraAlert(BaseModel):
-    """ストレージ等インフラ接続の死活 down 通知 (= フロー赤ボックスに表示)。"""
-    name: str            # "minio:crawl" / "db:main"
-    kind: str            # "minio" | "db"
+    """ストレージ等インフラの異常通知 (= フロー赤ボックスに表示)。"""
+    name: str            # "minio:crawl" / "db:main" / "garage/local-lvm" / "faiss:search"
+    kind: str            # "minio" | "db" | "thinpool" | "storage_full" | "faiss"
     endpoint: str | None = None
     error: str | None = None
+    severity: str = "crit"       # "crit" | "warn"
+    detail: str | None = None    # 容量系の内訳 ("768.8G / 794.3G (96.8%)")
 
 
 class FlowSnapshot(BaseModel):
     canvas: dict[str, Any]
     nodes: list[FlowNode]
     edges: list[FlowEdge]
-    # ストレージ死活 down のみ (= reg.health() の ok=False)。GPU/silent-hang と同じ赤ボックスへ。
+    # ストレージ死活 down (= reg.health() の ok=False) と PVE ストレージ逼迫。
+    # GPU/silent-hang と同じ赤ボックスへ。
     infra_alerts: list[InfraAlert] = []
 
 
@@ -144,6 +151,372 @@ def _storage_alerts() -> list[dict[str, Any]]:
         return list(_storage_health["alerts"])
 
 
+# ── PVE ストレージ逼迫 (thin-pool 割当率) ───────────────────────────────────
+# LVM-thin の割当は「一度でも書かれたブロック」の高水位で、 trim しない限り下がらない。
+# 2026-08-02 に garage が 96.8% まで張り付き満杯まで残り 10h の状態が誰にも見えて
+# いなかった (PVE GUI には出ていたが Flow を見ている運用では気付けない) ため、
+# ここで PVE API を叩いて赤ボックスに合流させる。 死活 probe と同じく background
+# refresh + cache で snapshot リクエストは絶対にブロックしない。
+_PVE_HEALTH_TTL_S = 120.0
+_pve_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
+_pve_health_lock = threading.Lock()
+_pve_cfg_cache: tuple[float, dict[str, Any] | None] = (0.0, None)
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """`KEY=value` 形式の env ファイルを読む。 存在しなければ空 dict。"""
+    if not path.exists():
+        return {}
+    env: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def _read_pve_cfg() -> dict[str, Any] | None:
+    """PVE API 接続設定を env から読み込み (60s cache)。 未設定なら None = 機能 off。"""
+    global _pve_cfg_cache
+    now = time.monotonic()
+    ts, cfg = _pve_cfg_cache
+    if (now - ts) < 60.0 and ts > 0.0:
+        return cfg
+    env = _parse_env_file(Path(os.environ.get("PAPRIKA_FLOW_DB_ENV") or _DEFAULT_DB_ENV))
+
+    def _get(key: str, default: str = "") -> str:
+        return (os.environ.get(key) or env.get(key) or default).strip()
+
+    urls = [u.strip().rstrip("/") for u in _get("PVE_API_URL").split(",") if u.strip()]
+    token_id, secret = _get("PVE_TOKEN_ID"), _get("PVE_TOKEN_SECRET")
+    if not urls or not token_id or not secret:
+        _pve_cfg_cache = (now, None)
+        return None
+    cfg = {
+        "urls": urls,
+        "token": f"{token_id}={secret}",
+        "storages": [s.strip() for s in _get("PVE_STORAGES", "local-lvm").split(",") if s.strip()],
+        "warn_pct": float(_get("PVE_WARN_PCT", "85")),
+        "crit_pct": float(_get("PVE_CRIT_PCT", "93")),
+    }
+    _pve_cfg_cache = (now, cfg)
+    return cfg
+
+
+def _pve_get(base: str, path: str, token: str, timeout: float = 4.0) -> Any:
+    """PVE API を 1 本叩く。 証明書は自己署名なので検証しない (クラスタ内 LAN)。"""
+    req = urllib.request.Request(
+        f"{base}/api2/json{path}", headers={"Authorization": f"PVEAPIToken={token}"},
+    )
+    ctx = ssl._create_unverified_context()  # noqa: S323 — PVE 既定の自己署名証明書
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310
+        return json.loads(resp.read().decode("utf-8")).get("data")
+
+
+def _pve_fill_eta_h(base: str, token: str, node: str, storage: str,
+                    avail_b: float) -> float | None:
+    """PVE 自身の RRD から直近の増加率を出し、 満杯までの残り時間 (h) を返す。
+
+    ローカルに履歴を持たずに済むので、 probe は完全に stateless。 減少中/横ばいなら None。
+    """
+    try:
+        rows = _pve_get(base, f"/nodes/{node}/storage/{storage}/rrddata?timeframe=hour",
+                        token) or []
+    except Exception:  # noqa: BLE001 — ETA は付加情報。 取れなくても alert 自体は出す
+        return None
+    pts = [(float(r["time"]), float(r["used"])) for r in rows
+           if r.get("time") is not None and r.get("used") is not None]
+    if len(pts) < 2:
+        return None
+    (t0, u0), (t1, u1) = pts[0], pts[-1]
+    if t1 <= t0 or u1 <= u0:
+        return None
+    rate_b_per_s = (u1 - u0) / (t1 - t0)
+    if rate_b_per_s <= 0:
+        return None
+    return avail_b / rate_b_per_s / 3600.0
+
+
+def _refresh_pve_health() -> None:
+    alerts: list[dict[str, Any]] = []
+    try:
+        cfg = _read_pve_cfg()
+        if cfg:
+            alerts = _probe_pve_storages(cfg)
+    except Exception as e:  # noqa: BLE001
+        log.warning("flow: pve storage probe failed: %s", e)
+    with _pve_health_lock:
+        _pve_health["ts"] = time.monotonic()
+        _pve_health["alerts"] = alerts
+        _pve_health["refreshing"] = False
+
+
+def _probe_pve_storages(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    token = cfg["token"]
+    base = ""
+    nodes: list[dict[str, Any]] = []
+    for url in cfg["urls"]:  # 先に応答した 1 台をクラスタ全体の入口として使う
+        try:
+            nodes = _pve_get(url, "/nodes", token) or []
+            base = url
+            break
+        except Exception as e:  # noqa: BLE001
+            log.debug("flow: pve entry %s unreachable: %s", url, e)
+    if not base:
+        log.warning("flow: no PVE API entrypoint reachable (%s)", ",".join(cfg["urls"]))
+        return []
+
+    alerts: list[dict[str, Any]] = []
+    for n in nodes:
+        node = str(n.get("node") or "")
+        if not node or n.get("status") != "online":
+            continue
+        for storage in cfg["storages"]:
+            try:
+                st = _pve_get(base, f"/nodes/{node}/storage/{storage}/status", token)
+            except Exception as e:  # noqa: BLE001 — 未定義 storage / ノード応答なしは黙って skip
+                log.debug("flow: pve %s/%s status failed: %s", node, storage, e)
+                continue
+            total, used = float(st.get("total") or 0), float(st.get("used") or 0)
+            if total <= 0:
+                continue
+            pct = used / total * 100.0
+            severity = ("crit" if pct >= cfg["crit_pct"]
+                        else "warn" if pct >= cfg["warn_pct"] else None)
+            if severity is None:
+                continue
+            gib = 1024 ** 3
+            detail = f"{used / gib:.1f}G / {total / gib:.1f}G ({pct:.1f}%)"
+            eta_h = _pve_fill_eta_h(base, token, node, storage, total - used)
+            if eta_h is not None and eta_h < 240:
+                detail += f" · 満杯まで約 {eta_h:.1f}h"
+            alerts.append({
+                "name": f"{node}/{storage}",
+                "kind": "thinpool" if st.get("type") == "lvmthin" else "storage_full",
+                "endpoint": base,
+                "severity": severity,
+                "detail": detail,
+                "error": detail,
+            })
+    return alerts
+
+
+def _pve_alerts() -> list[dict[str, Any]]:
+    """cache を即返す。 stale ならバックグラウンド refresh を1本だけ起動 (request 非ブロック)。"""
+    if _read_pve_cfg() is None:
+        return []
+    now = time.monotonic()
+    with _pve_health_lock:
+        stale = (now - _pve_health["ts"]) >= _PVE_HEALTH_TTL_S
+        if stale and not _pve_health["refreshing"]:
+            _pve_health["refreshing"] = True
+            threading.Thread(target=_refresh_pve_health, daemon=True).start()
+        return list(_pve_health["alerts"])
+
+
+# ── RAM ディスク MinIO (.48 video-ram) の逼迫 ─────────────────────────────────
+# .48 は Paprika (producer) と video-face-extract (consumer) の間に挟まった
+# tmpfs 90G のステージング。 実体が RAM なので満杯にすると MinIO が ENOSPC で
+# 書けなくなり、 動画パイプラインが両側から止まる。 CT501 は swap:0 で逃げ場も無い。
+#
+# 2026-08-14 の調査で `memory.peak` が 89.65 GiB (= tmpfs ほぼ満杯) を記録して
+# いたことが判明したが、 **どの監視にも出ていなかった**。 .48 には node_exporter
+# が居らず、 PVE の storage API にも tmpfs は出ない (thin-pool しか見ない) ため、
+# 既存の _pve_alerts では原理的に拾えない。 MinIO 自身の Prometheus メトリクスが
+# 唯一のソースなので、 ここで直接叩いて同じ赤ボックスへ合流させる。
+#
+# 使用率は `capacity total - free` (= df 相当) で見る。 MinIO の削除は
+# `.minio.sys/tmp/.trash` 経由の非同期 purge なので、 live オブジェクトのみを表す
+# `usage_total_bytes` で見ると tmpfs を実際に食っている分を見落とす
+# (実測でピーク時の 83〜99% が trash 側だった)。
+_RAMDISK_HEALTH_TTL_S = 60.0
+_RAMDISK_DEFAULT = "video-ram:.48=http://10.10.50.48:9000"
+_RAMDISK_WARN_PCT = 70.0
+_RAMDISK_CRIT_PCT = 85.0
+_ramdisk_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
+_ramdisk_health_lock = threading.Lock()
+
+
+def _ramdisk_targets() -> list[tuple[str, str]]:
+    """監視対象の (表示名, base URL) 一覧。 env で上書き可、 空文字で無効化。
+
+    書式: ``name=url,name2=url2``。 supervisor 側の ramdisk_metrics_url とは
+    独立に設定できる (別プロセスなので設定を共有していない)。
+    """
+    raw = os.environ.get("PIPELINE_RAMDISK_TARGETS")
+    if raw is None:
+        raw = _RAMDISK_DEFAULT
+    out: list[tuple[str, str]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, _, url = item.partition("=")
+        if not url:
+            continue
+        out.append((name.strip(), url.strip().rstrip("/")))
+    return out
+
+
+def _ramdisk_probe_one(name: str, base: str) -> dict[str, Any] | None:
+    """1 台分の使用率を読む。 逼迫していなければ None (= alert 無し)。"""
+    url = f"{base}/minio/v2/metrics/cluster"
+    req = urllib.request.Request(url, headers={"Accept": "text/plain"})
+    with urllib.request.urlopen(req, timeout=4.0) as r:
+        raw = r.read().decode("utf-8", "replace")
+
+    vals: dict[str, float] = {}
+    for ln in raw.splitlines():
+        if not ln or ln.startswith("#"):
+            continue
+        metric, _, rest = ln.partition("{")
+        if rest:
+            _, _, v = rest.partition("} ")
+        else:
+            metric, _, v = ln.partition(" ")
+        metric = metric.strip()
+        if metric in ("minio_cluster_capacity_usable_total_bytes",
+                      "minio_cluster_capacity_usable_free_bytes",
+                      "minio_cluster_usage_total_bytes"):
+            try:
+                vals[metric] = float(v.strip())
+            except ValueError:
+                continue
+
+    total = vals.get("minio_cluster_capacity_usable_total_bytes") or 0.0
+    free = vals.get("minio_cluster_capacity_usable_free_bytes")
+    if total <= 0 or free is None:
+        # 403 (= MINIO_PROMETHEUS_AUTH_TYPE 未設定) もここに来る。 死活は
+        # _storage_alerts が別途見ているので、 ここでは「読めない」だけ warn。
+        return {"name": f"ramdisk:{name}", "kind": "storage_full",
+                "endpoint": url, "severity": "warn",
+                "error": "capacity metrics を読めない "
+                         "(MINIO_PROMETHEUS_AUTH_TYPE=public が要る)"}
+
+    used = max(0.0, total - free)
+    pct = used / total * 100.0
+    if pct < _RAMDISK_WARN_PCT:
+        return None
+    live = vals.get("minio_cluster_usage_total_bytes") or 0.0
+    g = 1024 ** 3
+    # trash = df 上の使用量 - live オブジェクト。 「消したのにまだ RAM を
+    # 掴んでいる分」で、 逼迫時はこちらが主犯になる。
+    detail = (f"{used / g:.1f}G / {total / g:.1f}G ({pct:.1f}%) "
+              f"— live {live / g:.1f}G / 削除待ち {max(0.0, used - live) / g:.1f}G")
+    return {"name": f"ramdisk:{name}", "kind": "storage_full", "endpoint": base,
+            "severity": "crit" if pct >= _RAMDISK_CRIT_PCT else "warn",
+            "detail": detail}
+
+
+def _refresh_ramdisk_health() -> None:
+    alerts: list[dict[str, Any]] = []
+    for name, base in _ramdisk_targets():
+        try:
+            a = _ramdisk_probe_one(name, base)
+        except Exception as e:  # noqa: BLE001 — probe 失敗自体は死活側の担当
+            log.warning("flow: ramdisk probe failed %s (%s): %s", name, base, e)
+            continue
+        if a:
+            alerts.append(a)
+    with _ramdisk_health_lock:
+        _ramdisk_health["ts"] = time.monotonic()
+        _ramdisk_health["alerts"] = alerts
+        _ramdisk_health["refreshing"] = False
+
+
+def _ramdisk_alerts() -> list[dict[str, Any]]:
+    """cache を即返す。 stale ならバックグラウンド refresh を1本だけ起動。"""
+    if not _ramdisk_targets():
+        return []
+    now = time.monotonic()
+    with _ramdisk_health_lock:
+        stale = (now - _ramdisk_health["ts"]) >= _RAMDISK_HEALTH_TTL_S
+        if stale and not _ramdisk_health["refreshing"]:
+            _ramdisk_health["refreshing"] = True
+            threading.Thread(target=_refresh_ramdisk_health, daemon=True).start()
+        return list(_ramdisk_health["alerts"])
+
+
+# ── faiss_api 死活 + index 鮮度 ───────────────────────────────────────────────
+# faiss_api (.27:9000) は pipeline 管理外のプロセスで、 落ちても誰も検知できなかった
+# (2026-08-04 に半日以上落ちたまま face-person-link が走り、 knn 不能を「候補ゼロ」と
+# 誤読して全 face を新規 person 化していた)。 SSH 鍵が要る systemd 監視と違い
+# GET /version は無認証で叩けるので、 検知だけ先にここへ合流させる。
+#
+# index 鮮度も同じ probe で見る。 faiss-index-build の max_age_hours (既定 168h) を
+# 超えても再構築されていなければ、 検索に出ない embedding が積み上がっている。
+_FAISS_HEALTH_TTL_S = 60.0
+_FAISS_URL_DEFAULT = "http://10.10.50.27:9000"
+_FAISS_STALE_H_DEFAULT = 168.0
+_faiss_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
+_faiss_health_lock = threading.Lock()
+
+
+def _faiss_index_age_h(version: str | None) -> float | None:
+    """/version の "2026-07-31 04:03:40" を現在との時間差 (h) にする。"""
+    if not version:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            built = _dt.datetime.strptime(str(version)[:19], fmt)
+        except ValueError:
+            continue
+        return (_dt.datetime.now() - built).total_seconds() / 3600.0
+    return None
+
+
+def _probe_faiss(url: str, stale_h: float) -> list[dict[str, Any]]:
+    try:
+        with urllib.request.urlopen(f"{url}/version", timeout=5) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001 — 不通そのものが検知したい事象
+        return [{"name": "faiss:search", "kind": "faiss", "endpoint": url,
+                 "severity": "crit", "error": str(e)[:200],
+                 "detail": "knn 検索不能 — face-person-link は止めること"}]
+
+    if not data.get("ready") or data.get("error"):
+        return [{"name": "faiss:search", "kind": "faiss", "endpoint": url,
+                 "severity": "crit",
+                 "error": str(data.get("error") or "ready=false")[:200],
+                 "detail": "index 未ロード — face-person-link は止めること"}]
+
+    age_h = _faiss_index_age_h(data.get("version"))
+    if age_h is not None and age_h >= stale_h:
+        return [{"name": "faiss:index", "kind": "faiss", "endpoint": url,
+                 "severity": "warn",
+                 "error": f"index が {age_h / 24:.1f} 日前のまま",
+                 "detail": f"build={data.get('version')} — 以降の embedding は検索に出ない"}]
+    return []
+
+
+def _refresh_faiss_health() -> None:
+    alerts: list[dict[str, Any]] = []
+    try:
+        url = (os.environ.get("PAPRIKA_FLOW_FAISS_URL") or _FAISS_URL_DEFAULT).rstrip("/")
+        stale_h = float(os.environ.get("PAPRIKA_FLOW_FAISS_STALE_H")
+                        or _FAISS_STALE_H_DEFAULT)
+        alerts = _probe_faiss(url, stale_h)
+    except Exception as e:  # noqa: BLE001
+        log.warning("flow: faiss health probe failed: %s", e)
+    with _faiss_health_lock:
+        _faiss_health["ts"] = time.monotonic()
+        _faiss_health["alerts"] = alerts
+        _faiss_health["refreshing"] = False
+
+
+def _faiss_alerts() -> list[dict[str, Any]]:
+    """cache を即返す。 stale ならバックグラウンド refresh を1本だけ起動 (request 非ブロック)。"""
+    now = time.monotonic()
+    with _faiss_health_lock:
+        stale = (now - _faiss_health["ts"]) >= _FAISS_HEALTH_TTL_S
+        if stale and not _faiss_health["refreshing"]:
+            _faiss_health["refreshing"] = True
+            threading.Thread(target=_refresh_faiss_health, daemon=True).start()
+        return list(_faiss_health["alerts"])
+
+
 def _load_layout() -> dict[str, Any]:
     path = Path(os.environ.get("PAPRIKA_FLOW_LAYOUT_PATH") or _LAYOUT_PATH_DEFAULT)
     if not path.exists():
@@ -176,17 +549,11 @@ def _read_db_cfg() -> dict[str, Any] | None:
     if cfg is not None and (now - ts) < 60.0:
         return cfg
     env_path = Path(os.environ.get("PAPRIKA_FLOW_DB_ENV") or _DEFAULT_DB_ENV)
-    if not env_path.exists():
+    env = _parse_env_file(env_path)
+    if not env:
         log.debug("flow: db env not found at %s", env_path)
         _db_cfg_cache = (now, None)
         return None
-    env: dict[str, str] = {}
-    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        env[k.strip()] = v.strip().strip('"').strip("'")
     if not all(env.get(k) for k in ("DB_HOST", "DB_USER", "DB_PASS", "DB_NAME")):
         log.warning("flow: db env missing required keys")
         _db_cfg_cache = (now, None)
@@ -685,7 +1052,9 @@ def snapshot(req: Request) -> FlowSnapshot:
         edge.rate_per_min = rate
         edges.append(edge)
 
-    infra_alerts = [InfraAlert(**a) for a in _storage_alerts()]
+    infra_alerts = [InfraAlert(**a) for a in
+                    (*_storage_alerts(), *_pve_alerts(), *_ramdisk_alerts(),
+                     *_faiss_alerts())]
     return FlowSnapshot(canvas=canvas, nodes=nodes, edges=edges, infra_alerts=infra_alerts)
 
 
