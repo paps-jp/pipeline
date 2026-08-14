@@ -277,3 +277,41 @@ def test_shipped_default_thresholds_clear_the_measured_envelope(sup):
     crit = float(re.search(r'"ramdisk_crit_pct", ([0-9.]+)\)', src).group(1))
     assert warn > 71.7, f"warn={warn} は実測ピーク 71.7% を割っている"
     assert crit > warn
+
+
+def test_summary_log_can_be_suppressed(sup, monkeypatch, caplog):
+    """log_summary=False でサマリ行を出さない (shadow scheduler 用)。
+
+    shadow scheduler は ranked の slug ごとにこの関数を呼ぶので、 抑止しないと
+    同一のサマリ行が 1 tick に slug 数だけ並ぶ (2026-08-14 に実際 12 本/tick 出た)。
+    権威側の goodput allocator が 1 tick 1 本出すので、 shadow 側は黙る。
+    """
+    import logging
+    state = _state(sup, used=int(0.86 * _TOTAL), live=14 * _GB, monkeypatch=monkeypatch)
+    plan = {"video-face-extract": 15}
+    with caplog.at_level(logging.WARNING):
+        sup._ramdisk_clamp(state, plan, {"video-face-extract": 15},
+                           {"video-face-extract": _wl()}, log_summary=False)
+    assert not [r for r in caplog.records if "ramdisk" in r.getMessage()]
+
+    state["ramdisk_last"] = None
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        sup._ramdisk_clamp(state, plan, {"video-face-extract": 15},
+                           {"video-face-extract": _wl()})
+    msgs = [r.getMessage() for r in caplog.records if "ramdisk" in r.getMessage()]
+    assert len(msgs) == 1 and "WARN" in msgs[0]
+
+
+def test_clamp_at_floor_is_a_noop_not_an_error(sup, monkeypatch):
+    """既に min_workers に居るときは何も動かさない (下回らせない)。
+
+    実運用で観測された状態: .48 が 86.3% でも VFE は既に min_workers=15 なので
+    ゲートに動かせる余地が無い。 これは正常であって異常ではない。
+    """
+    state = _state(sup, used=int(0.86 * _TOTAL), live=14 * _GB, monkeypatch=monkeypatch)
+    plan = {"video-face-extract": 15}
+    info = sup._ramdisk_clamp(state, plan, {"video-face-extract": 15},
+                              {"video-face-extract": _wl(min_workers=15)})
+    assert plan["video-face-extract"] == 15
+    assert info["clamped"] == []
