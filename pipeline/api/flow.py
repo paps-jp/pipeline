@@ -527,6 +527,96 @@ def _faiss_alerts() -> list[dict[str, Any]]:
         return list(_faiss_health["alerts"])
 
 
+# ── GPU 死活 (= センサーが黙った GPU を赤ボックスに出す) ────────────────────
+# 2026-08-15: ai-gpu8 が Xid 119 (GSP timeout) で `GPU requires reset` に落ち、
+# **19 時間気付かれなかった**。 このとき UI の GPU カードは VRAM と Mem 帯域を
+# 表示し続けていた (= mem_used/mem_total の凍結値から計算した見かけの数字) ので、
+# 「カードに数字が出ている = 生きている」と読めてしまう。
+#
+# nvidia-smi は rc=0 で応答し、 温度/電力/クロックだけを `[N/A]` で返す。 つまり
+# **temp_c が NULL であることだけが唯一の正直な信号**。 util_pct は MPS 下で
+# service.py が power から逆算して埋めるため、 mem_used_mb はハング中も凍結値が
+# 入り続けるため、 どちらも判定に使えない。
+#
+# supervisor の _gpu_health_watchdog が同じ条件でドレインするが、 こちらは表示専用
+# (= watchdog が DRY でも、 apply 前でも人間には見える)。
+_GPU_HEALTH_TTL_S = 60.0
+_GPU_HEALTH_WINDOW_MIN_DEFAULT = 5
+_GPU_HEALTH_MIN_SAMPLES_DEFAULT = 20
+_gpu_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
+_gpu_health_lock = threading.Lock()
+
+
+def _probe_gpu_health(db: Any, window_min: int, min_samples: int) -> list[dict[str, Any]]:
+    """worker_metrics のセンサー生存率から故障 GPU を拾う。
+
+    worker_metrics は reaper が 24h で刈るうえ ts に index があるので、 数分窓の
+    集約は軽い。 host は worker_id 由来で正規化する (`w_ai_gpu8_a4` → `ai-gpu8`)。
+    """
+    since = (_dt.datetime.now(_dt.timezone.utc)
+             - _dt.timedelta(minutes=window_min)).isoformat()
+    with db.transaction() as conn:
+        rows = conn.execute(
+            "SELECT m.worker_id AS wid, COUNT(*) AS n, "
+            "       SUM(CASE WHEN m.temp_c IS NOT NULL THEN 1 ELSE 0 END) AS temp_ok "
+            "FROM worker_metrics m JOIN workers w ON w.id = m.worker_id "
+            "WHERE m.ts >= :since AND w.state = 'active' "
+            "GROUP BY m.worker_id",
+            {"since": since},
+        ).fetchall()
+
+    per_host: dict[str, dict[str, int]] = {}
+    for r in rows:
+        wid = r["wid"] or ""
+        parts = wid[2:].split("_") if wid.startswith("w_") else []
+        host = (parts[0] + "-" + parts[1]) if len(parts) >= 2 else wid
+        st = per_host.setdefault(host, {"n": 0, "temp_ok": 0})
+        st["n"] += int(r["n"] or 0)
+        st["temp_ok"] += int(r["temp_ok"] or 0)
+
+    alerts: list[dict[str, Any]] = []
+    for host, st in sorted(per_host.items()):
+        if st["temp_ok"] or st["n"] < min_samples:
+            continue
+        # endpoint は付けない (name が既に host を持っており、 UI が二重表示する)。
+        # detail は UI 側で 160 文字に切られるので、 効く情報から順に置く。
+        alerts.append({
+            "name": host, "kind": "gpu", "severity": "crit",
+            "error": "GPU センサー無応答 — `GPU requires reset` の可能性",
+            "detail": (f"直近 {window_min} 分の {st['n']} サンプル全てで温度/電力が NULL "
+                       "(VRAM 表示は凍結値)。 workload は CPU フォールバックで完走し続ける。 "
+                       "復旧は PVE で qm stop→qm start"),
+        })
+    return alerts
+
+
+def _refresh_gpu_health(db: Any) -> None:
+    alerts: list[dict[str, Any]] = []
+    try:
+        window_min = int(os.environ.get("PAPRIKA_FLOW_GPU_HEALTH_WINDOW_MIN")
+                         or _GPU_HEALTH_WINDOW_MIN_DEFAULT)
+        min_samples = int(os.environ.get("PAPRIKA_FLOW_GPU_HEALTH_MIN_SAMPLES")
+                          or _GPU_HEALTH_MIN_SAMPLES_DEFAULT)
+        alerts = _probe_gpu_health(db, window_min, min_samples)
+    except Exception as e:  # noqa: BLE001 — 表示用なので落とさない
+        log.warning("flow: gpu health probe failed: %s", e)
+    with _gpu_health_lock:
+        _gpu_health["ts"] = time.monotonic()
+        _gpu_health["alerts"] = alerts
+        _gpu_health["refreshing"] = False
+
+
+def _gpu_alerts(db: Any) -> list[dict[str, Any]]:
+    """cache を即返す。 stale ならバックグラウンド refresh を1本だけ起動 (request 非ブロック)。"""
+    now = time.monotonic()
+    with _gpu_health_lock:
+        stale = (now - _gpu_health["ts"]) >= _GPU_HEALTH_TTL_S
+        if stale and not _gpu_health["refreshing"]:
+            _gpu_health["refreshing"] = True
+            threading.Thread(target=_refresh_gpu_health, args=(db,), daemon=True).start()
+        return list(_gpu_health["alerts"])
+
+
 def _load_layout() -> dict[str, Any]:
     path = Path(os.environ.get("PAPRIKA_FLOW_LAYOUT_PATH") or _LAYOUT_PATH_DEFAULT)
     if not path.exists():
@@ -1064,7 +1154,7 @@ def snapshot(req: Request) -> FlowSnapshot:
 
     infra_alerts = [InfraAlert(**a) for a in
                     (*_storage_alerts(), *_pve_alerts(), *_ramdisk_alerts(),
-                     *_faiss_alerts())]
+                     *_faiss_alerts(), *_gpu_alerts(req.app.state.db))]
     return FlowSnapshot(canvas=canvas, nodes=nodes, edges=edges, infra_alerts=infra_alerts)
 
 
