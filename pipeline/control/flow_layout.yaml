@@ -273,9 +273,13 @@ nodes:
   unit: GB
   metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(used_bytes/1073741824,1),
     ROUND(total_bytes/1073741824,1)) FROM storage_capacity WHERE name='image-ram-47'
-  capacity_sql: SELECT ROUND(total_bytes/1073741824,1) FROM storage_capacity WHERE
-    name='image-ram-47'
-  capacity_warn: 100
+  # 分母は tmpfs 実容量ではなく **warn ライン** (= 実容量 x 80%) を返す。
+  # 満杯を分母にすると液面 70% が 「まだ余裕」 に見えるが、 .47 は満杯にすると
+  # MinIO が ENOSPC になり画像パイプラインが両側から止まる (2026-08-15)。
+  # 実容量に追随させたいので固定値ではなく SQL 側で係数を掛ける。
+  capacity_sql: SELECT ROUND(total_bytes*0.8/1073741824,1) FROM storage_capacity
+    WHERE name='image-ram-47'
+  capacity_warn: 80
 - id: minio-video-ram
   kind: tank
   x: 47

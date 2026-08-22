@@ -5,7 +5,7 @@
  * React Flow + カスタム SVG ノードでレンダ。 3 秒ごとに自動更新。
  */
 
-import { createContext, Fragment, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -1262,225 +1262,6 @@ function DragHandles({
   );
 }
 
-// ---------- worker × workload マトリクス ----------
-// worker daemon は workload_filter (= 自動切替の SoT) に従って claim する。
-// 各 host の各 worker の filter を表で見せ、 セルクリックで toggle 可能。
-
-function parseHostFromWid(wid: string): string {
-  // _host_stats と同規約: w_ai_gpu1_3_c0da → ai-gpu1
-  if (!wid.startsWith("w_")) return wid;
-  const parts = wid.slice(2).split("_");
-  if (parts.length >= 2) return `${parts[0]}-${parts[1]}`;
-  return wid;
-}
-
-function parseInstFromHost(host: string): number {
-  // "ai-gpu1-6" → 6、 サフィックス無しは 0
-  const m = host.match(/-(\d+)$/);
-  return m ? parseInt(m[1], 10) : 0;
-}
-
-function WorkerMatrixPanel({ isLight }: { isLight: boolean }) {
-  const { t } = useTranslation();
-  const qc = useQueryClient();
-  const [open, setOpen] = useState(false);
-  const workersQ = useQuery({
-    queryKey: ["workers-with-filter"],
-    queryFn: () => api.listWorkers(),
-    refetchInterval: open ? 5_000 : 30_000,
-  });
-  const wlsQ = useQuery({
-    queryKey: ["workloads-for-matrix"],
-    queryFn: () => api.listWorkloads(),
-    refetchInterval: 60_000,
-  });
-
-  const data = useMemo(() => {
-    const ws = (workersQ.data?.workers ?? []).filter((w) => w.state === "active");
-    const wls = (wlsQ.data?.workloads ?? []).filter((w) => w.enabled).map((w) => w.slug);
-    // host → 各 worker (instance 順)
-    const byHost = new Map<string, typeof ws>();
-    for (const w of ws) {
-      const host = parseHostFromWid(w.id);
-      const arr = byHost.get(host) ?? [];
-      arr.push(w);
-      byHost.set(host, arr);
-    }
-    for (const arr of byHost.values()) {
-      arr.sort((a, b) => parseInstFromHost(a.host) - parseInstFromHost(b.host));
-    }
-    return {
-      hosts: Array.from(byHost.keys()).sort(),
-      byHost,
-      workloads: wls,
-    };
-  }, [workersQ.data, wlsQ.data]);
-
-  const toggleMut = useMutation({
-    mutationFn: async (args: { workerId: string; cur: string[] | null;
-                                slug: string; allSlugs: string[] }) => {
-      // cur=null (= 全 workload 対象) のセルをクリック → そのセルだけ「外した」 list を作る
-      // cur=list → セルが含まれるか? toggle
-      let next: string[] | null;
-      if (args.cur === null) {
-        next = args.allSlugs.filter((s) => s !== args.slug).sort();
-      } else if (args.cur.includes(args.slug)) {
-        const r = args.cur.filter((s) => s !== args.slug).sort();
-        next = r;    // 空 list は server 側で「解除 == env fallback」 になる
-      } else {
-        next = [...args.cur, args.slug].sort();
-      }
-      return api.setWorkerFilter(args.workerId, next, "matrix-ui");
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["workers-with-filter"] }),
-  });
-
-  const cellBg = (active: boolean, allActive: boolean) =>
-    allActive ? "#94a3b8" : active ? "#22c55e" : "transparent";
-  const cellColor = (active: boolean, allActive: boolean) =>
-    allActive || active ? "#ffffff" : isLight ? "#64748b" : "#94a3b8";
-
-  return (
-    <Paper
-      shadow="md"
-      radius="md"
-      style={{
-        position: "absolute",
-        top: 12,
-        right: 12,
-        zIndex: 10,
-        background: isLight ? "#ffffff" : "#1e293b",
-        border: `1px solid ${isLight ? "#e2e8f0" : "#334155"}`,
-        maxHeight: "calc(100vh - 120px)",
-        overflow: "auto",
-        padding: 8,
-      }}
-    >
-      <Group justify="space-between" wrap="nowrap" gap={8} mb={open ? 8 : 0}>
-        <Text size="xs" fw={700} c={isLight ? "#0f172a" : "#e2e8f0"}>
-          {t("flow.matrix.title", "Worker × Workload")}
-        </Text>
-        <Text
-          size="xs"
-          c={isLight ? "#64748b" : "#94a3b8"}
-          style={{ cursor: "pointer", userSelect: "none" }}
-          onClick={() => setOpen(!open)}
-        >
-          {open ? "▲" : "▼"}
-        </Text>
-      </Group>
-      {open && data.hosts.length > 0 && (
-        <Box style={{ overflowX: "auto" }}>
-          <table style={{ borderCollapse: "collapse", fontSize: 11 }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: "left", padding: "2px 6px",
-                              color: isLight ? "#475569" : "#cbd5e1" }}>
-                  host / @inst
-                </th>
-                {data.workloads.map((slug) => (
-                  <th
-                    key={slug}
-                    style={{
-                      padding: "2px 4px",
-                      writingMode: "vertical-rl",
-                      transform: "rotate(180deg)",
-                      height: 80,
-                      color: isLight ? "#475569" : "#cbd5e1",
-                      fontWeight: 500,
-                    }}
-                    title={slug}
-                  >
-                    {slug}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {data.hosts.map((host) => (
-                <Fragment key={host}>
-                  <tr key={`${host}-head`}>
-                    <td
-                      colSpan={data.workloads.length + 1}
-                      style={{
-                        padding: "6px 6px 2px",
-                        fontWeight: 700,
-                        color: isLight ? "#0f172a" : "#f1f5f9",
-                        borderTop: `1px solid ${isLight ? "#e2e8f0" : "#334155"}`,
-                      }}
-                    >
-                      {host}
-                    </td>
-                  </tr>
-                  {(data.byHost.get(host) ?? []).map((w) => {
-                    const inst = parseInstFromHost(w.host);
-                    const filter = w.workload_filter;
-                    const allActive = filter === null;
-                    return (
-                      <tr key={w.id}>
-                        <td
-                          style={{
-                            padding: "1px 6px",
-                            color: isLight ? "#334155" : "#cbd5e1",
-                            whiteSpace: "nowrap",
-                          }}
-                          title={`${w.id}\nupdated by: ${w.filter_updated_by ?? "—"}\nat: ${w.filter_updated_at ?? "—"}`}
-                        >
-                          @{inst}
-                          {allActive && (
-                            <Text component="span" size="9px" c="dimmed" ml={4}>
-                              (all)
-                            </Text>
-                          )}
-                        </td>
-                        {data.workloads.map((slug) => {
-                          const active = allActive || (filter?.includes(slug) ?? false);
-                          return (
-                            <td
-                              key={slug}
-                              onClick={() =>
-                                toggleMut.mutate({
-                                  workerId: w.id,
-                                  cur: filter,
-                                  slug,
-                                  allSlugs: data.workloads,
-                                })
-                              }
-                              style={{
-                                padding: 0,
-                                textAlign: "center",
-                                cursor: "pointer",
-                                background: cellBg(active, allActive),
-                                color: cellColor(active, allActive),
-                                border: `1px solid ${isLight ? "#e2e8f0" : "#334155"}`,
-                                minWidth: 16,
-                                height: 16,
-                                lineHeight: "16px",
-                                fontSize: 10,
-                                fontWeight: 700,
-                              }}
-                              title={`${w.id} → ${slug}: ${active ? "claim 可" : "filter 外"} (クリックで toggle)`}
-                            >
-                              {active ? "●" : ""}
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    );
-                  })}
-                </Fragment>
-              ))}
-            </tbody>
-          </table>
-          <Text size="9px" c="dimmed" mt={6}>
-            ● = この worker が claim 可能 / 灰 = filter=null (env fallback 含む全受) / 緑 = 明示 list 内
-          </Text>
-        </Box>
-      )}
-    </Paper>
-  );
-}
-
 // ---------- GPU 緊急エラー アラート ----------
 // フロー左上に常時固定の赤ボックス。 workload node の最新 run エラー(flow.py が
 // error/error_worker として載せる)を GPU 故障シグネチャで走査し、 該当があれば表示。
@@ -1551,24 +1332,35 @@ function GpuAlertBox({
         緊急アラート ({total})
       </div>
       <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
-        {infraAlerts.map((a) => (
-          <div key={`infra-${a.name}`} style={{ fontSize: 12, lineHeight: 1.35 }}>
-            <div style={{ fontWeight: 700 }}>
-              🗄 ストレージ停止 · {a.name}
-              {a.endpoint ? ` (${a.endpoint})` : ""}
+        {infraAlerts.map((a) => {
+          const full = a.kind === "thinpool" || a.kind === "storage_full";
+          const icon = a.severity === "warn" ? "⚠" : "🛑";
+          const head = full
+            ? `${icon} ストレージ逼迫 · ${a.name}`
+            : a.kind === "faiss"
+              ? `${icon} 顔検索 (FAISS) · ${a.name}`
+              : a.kind === "gpu"
+                ? `${icon} GPU センサー無応答 · ${a.name}`
+                : `🗄 ストレージ停止 · ${a.name}`;
+          return (
+            <div key={`infra-${a.name}`} style={{ fontSize: 12, lineHeight: 1.35 }}>
+              <div style={{ fontWeight: 700 }}>
+                {head}
+                {!full && a.endpoint ? ` (${a.endpoint})` : ""}
+              </div>
+              <div
+                style={{
+                  opacity: 0.85,
+                  fontFamily: "ui-monospace, monospace",
+                  fontSize: 11,
+                  wordBreak: "break-word",
+                }}
+              >
+                {String(a.detail ?? a.error ?? "unreachable").slice(0, 160)}
+              </div>
             </div>
-            <div
-              style={{
-                opacity: 0.85,
-                fontFamily: "ui-monospace, monospace",
-                fontSize: 11,
-                wordBreak: "break-word",
-              }}
-            >
-              {String(a.error ?? "unreachable").slice(0, 160)}
-            </div>
-          </div>
-        ))}
+          );
+        })}
         {gpu.map((a) => (
           <div key={a.id} style={{ fontSize: 12, lineHeight: 1.35 }}>
             <div style={{ fontWeight: 700 }}>
@@ -2011,7 +1803,6 @@ export default function Flow() {
   return (
     <FlowControlContext.Provider value={ctrlValue}>
     <Box ref={rfBoxRef} style={{ height: "calc(100vh - 80px)", background: bg, borderRadius: 8, overflow: "hidden", position: "relative" }}>
-      <WorkerMatrixPanel isLight={isLight} />
       <GpuAlertBox nodes={snapQ.data?.nodes ?? []} infraAlerts={snapQ.data?.infra_alerts ?? []} />
       <AnnotationToolbar
         activeTool={activeTool}

@@ -79,10 +79,12 @@ WORKLOADS_ALTERS = [
     # 'sqlite' (= 既定) / 'mariadb' (= secondary_db)。 workload 毎に切替。
     "ALTER TABLE workloads ADD COLUMN queue_backend TEXT NOT NULL DEFAULT 'sqlite'",
     # Elastic Workers (2026-07-04)。 supervisor が worker プロセスを需要+余力で
-    # spawn/kill する際の baseline / 上限。
-    # min_resident_workers: 常に維持する最低 worker 数 (= 0 なら暇なとき 0 台まで縮小可、
+    # spawn/kill する際の下限 / 上限。
+    # min_workers: 常に維持する最低 worker 数 (= 0 なら暇なとき 0 台まで縮小可、
     #   1 なら最低 1 台常駐。 「1 workload=1 worker 固定」は min=1 かつ max=1)。 既定 0。
-    "ALTER TABLE workloads ADD COLUMN min_resident_workers INTEGER NOT NULL DEFAULT 0",
+    #   2026-08-09 に min_resident_workers から改名 (max_workers と対にして読みやすく)。
+    #   既存 DB は sqlite.py の _migrate_min_workers_rename() が RENAME COLUMN する。
+    "ALTER TABLE workloads ADD COLUMN min_workers INTEGER NOT NULL DEFAULT 0",
     # max_workers: この workload 向けに elastic scaler が起こす worker 数の絶対上限。
     #   NULL = 無制限 (= host 余力と max_concurrent_* だけで制限)。
     "ALTER TABLE workloads ADD COLUMN max_workers INTEGER",

@@ -327,11 +327,11 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
         />
         <Knob
           icon={<IconUsers size={14} />}
-          label="最低常駐 (min_resident_workers)"
-          value={String(w.min_resident_workers ?? 0)}
-          hint="この workload に常に確保する worker 数の下限。 balancer が VRAM を優先予約し starvation を防ぐ (backlog>0 の時)"
-          onDown={() => patchMut.mutate({ min_resident_workers: Math.max(0, (w.min_resident_workers ?? 0) - 1) })}
-          onUp={() => patchMut.mutate({ min_resident_workers: Math.min(100, (w.min_resident_workers ?? 0) + 1) })}
+          label="最低台数 (min_workers)"
+          value={String(w.min_workers ?? 0)}
+          hint="この workload に常に確保する worker 数の下限。 max_workers と対。 backlog>0 なら supervisor がここまでは必ず戻す"
+          onDown={() => patchMut.mutate({ min_workers: Math.max(0, (w.min_workers ?? 0) - 1) })}
+          onUp={() => patchMut.mutate({ min_workers: Math.min(100, (w.min_workers ?? 0) + 1) })}
           disabled={pending}
         />
         <Knob

@@ -436,6 +436,49 @@ def _refresh_ramdisk_health() -> None:
         _ramdisk_health["refreshing"] = False
 
 
+# ── storage_capacity 由来の RAM ディスク逼迫 (.47 image-ram) ──────────────────
+# .47 の MinIO は Prometheus が 403 を返す (CT500 に MINIO_PROMETHEUS_AUTH_TYPE=public
+# の drop-in が無い) ので、 上の _ramdisk_probe_one 経路は使えない。 公開設定を入れる
+# には CT500 の MinIO 再起動が要り、 .47 は Paprika (producer) と image-pull
+# (consumer) が同時に叩いているホットパスなので止められない。
+#
+# 一方 storage_capacity テーブルは認証付き MinIO クライアントで .47 を既に収集して
+# いる (repositories/storage_capacity.py の image-ram-47)。 tank ゲージが動いて
+# いるのはこれのおかげなので、 赤ボックスも同じソースから出す。
+#
+# 対象 tank の capacity_sql は 「warn ライン」 (= tmpfs 実容量 x _RAMDISK_WARN_PCT)
+# を返す約束にしてある。 よって pending >= capacity_warn がそのまま warn 到達で、
+# crit はその CRIT/WARN 倍。 tank の fill_ratio は 1.0 で頭打ちになる (液面表示の
+# ため) ので、 crit 判定には使えない。 pending と capacity_warn から直接出すこと。
+_TANK_RAMDISK_ALERTS = {"minio-image-ram": "image-ram:.47"}
+_RAMDISK_CRIT_OVER_WARN = _RAMDISK_CRIT_PCT / _RAMDISK_WARN_PCT
+
+
+def _tank_ramdisk_alerts(nodes: list["FlowNode"]) -> list[dict[str, Any]]:
+    """tank の実測値から RAM ディスク逼迫を出す。 probe が使えない .47 用。"""
+    out: list[dict[str, Any]] = []
+    warn_frac = _RAMDISK_WARN_PCT / 100.0
+    for node in nodes:
+        label = _TANK_RAMDISK_ALERTS.get(node.id)
+        if not label or node.pending is None or not node.capacity_warn:
+            continue
+        warn_at = float(node.capacity_warn)
+        used = float(node.pending)
+        if used < warn_at:
+            continue
+        total = warn_at / warn_frac if warn_frac else 0.0
+        pct = (used / total * 100.0) if total else 0.0
+        out.append({
+            "name": f"ramdisk:{node.id}",
+            "kind": "storage_full",
+            "endpoint": label,
+            "severity": ("crit" if used >= warn_at * _RAMDISK_CRIT_OVER_WARN
+                         else "warn"),
+            "detail": f"{used:.1f}G / {total:.1f}G ({pct:.1f}%) — tmpfs 逼迫",
+        })
+    return out
+
+
 def _ramdisk_alerts() -> list[dict[str, Any]]:
     """cache を即返す。 stale ならバックグラウンド refresh を1本だけ起動。"""
     if not _ramdisk_targets():
@@ -1154,7 +1197,8 @@ def snapshot(req: Request) -> FlowSnapshot:
 
     infra_alerts = [InfraAlert(**a) for a in
                     (*_storage_alerts(), *_pve_alerts(), *_ramdisk_alerts(),
-                     *_faiss_alerts(), *_gpu_alerts(req.app.state.db))]
+                     *_tank_ramdisk_alerts(nodes), *_faiss_alerts(),
+                     *_gpu_alerts(req.app.state.db))]
     return FlowSnapshot(canvas=canvas, nodes=nodes, edges=edges, infra_alerts=infra_alerts)
 
 

@@ -3,6 +3,7 @@ import {
   Button,
   Checkbox,
   Drawer,
+  Fieldset,
   Group,
   JsonInput,
   NumberInput,
@@ -146,6 +147,19 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
 
   const setKwarg = (key: string, value: unknown) =>
     setInitKwargs((prev) => ({ ...prev, [key]: value }));
+
+  // manifest の group でセクション分けする。 proxmox-manager のように action ごとに
+  // 数十個の kwarg を持つ plugin が、 フラットな一覧だと読めないため。
+  // group 未指定の plugin は従来どおりフラットに出る (= 既存 plugin に影響なし)。
+  const kwargSections = useMemo(() => {
+    const fields = selectedPlugin?.manifest?.init_kwargs ?? [];
+    const grouped = new Map<string, PluginKwargField[]>();
+    for (const f of fields) {
+      if (!f.group) continue;
+      grouped.set(f.group, [...(grouped.get(f.group) ?? []), f]);
+    }
+    return { ungrouped: fields.filter((f) => !f.group), grouped: [...grouped] };
+  }, [selectedPlugin]);
 
   const renderKwargField = (f: PluginKwargField) => {
     const v = initKwargs[f.key];
@@ -450,7 +464,12 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
                     </Text>
                   )}
                   <Text size="sm" fw={500}>プラグイン設定</Text>
-                  {selectedPlugin.manifest.init_kwargs.map(renderKwargField)}
+                  {kwargSections.ungrouped.map(renderKwargField)}
+                  {kwargSections.grouped.map(([group, fields]) => (
+                    <Fieldset key={group} legend={group} variant="filled">
+                      <Stack gap="xs">{fields.map(renderKwargField)}</Stack>
+                    </Fieldset>
+                  ))}
                   <Accordion variant="separated">
                     <Accordion.Item value="raw">
                       <Accordion.Control>

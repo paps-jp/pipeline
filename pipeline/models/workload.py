@@ -9,7 +9,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 ExecutorType = Literal["shell", "http_post", "sql", "python_eval", "python_module", "container"]
 
@@ -25,7 +25,7 @@ def _validate_slug(v: str) -> str:
 class WorkloadBase(BaseModel):
     """workload の編集可能項目。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     name: str = Field(min_length=1, max_length=128)
     description: str | None = None
@@ -81,10 +81,15 @@ class WorkloadBase(BaseModel):
     queue_backend: str = "sqlite"
 
     # Elastic Workers (2026-07-04)。 supervisor が worker プロセスを需要+余力で
-    # spawn/kill する際の baseline / 上限 (elastic scaler が有効なときのみ参照)。
-    # min_resident_workers: 常に維持する最低 worker 数。 0 = 暇なとき 0 台まで縮小可、
+    # spawn/kill する際の下限 / 上限 (supervisor が有効なときのみ参照)。
+    # min_workers: 常に維持する最低 worker 数。 0 = 暇なとき 0 台まで縮小可、
     #   1 = 最低 1 台常駐。 「1 workload=1 worker 固定」は min=1 かつ max_workers=1。
-    min_resident_workers: int = Field(default=0, ge=0, le=100)
+    #   2026-08-09 に min_resident_workers から改名。 旧名も入力としては受ける
+    #   (= 未更新の UI / plugin からの PUT を 422 にしない)。
+    min_workers: int = Field(
+        default=0, ge=0, le=100,
+        validation_alias=AliasChoices("min_workers", "min_resident_workers"),
+    )
     # max_workers: elastic scaler がこの workload 向けに起こす worker 数の絶対上限。
     #   None = 無制限 (= host 余力 / max_concurrent_* だけで制限)。
     max_workers: int | None = Field(default=None, ge=1, le=1000)

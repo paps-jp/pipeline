@@ -77,6 +77,9 @@ class SqliteDatabase(Database):
                 if stmt:
                     self._conn.execute(stmt)
         self._conn.commit()
+        # 改名は ADD COLUMN より **先**。 後にすると min_workers が新規列として
+        # 追加され、 既存の値 (= フリートの配分そのもの) が既定 0 で失われる。
+        self._migrate_min_workers_rename()
         # 後から追加された列 (= 既存 DB に対する idempotent ALTER)
         for stmt in WORKER_METRICS_ALTERS + WORKLOADS_ALTERS + WORKERS_ALTERS + AGENT_DESIRED_ALTERS:
             try:
@@ -89,6 +92,25 @@ class SqliteDatabase(Database):
         self._migrate_queue_table_naming()
         self._drop_legacy_plugins_table()
         self._drop_input_source_columns()
+
+    def _migrate_min_workers_rename(self) -> None:
+        """workloads.min_resident_workers → min_workers (2026-08-09)。
+
+        max_workers と対になる名前に揃える改名。 WORKLOADS_ALTERS 側の
+        `ALTER TABLE ... ADD COLUMN min_workers` は「改名済み or 新規 DB」を前提に
+        duplicate column で無視される。 ここで先に改名しておかないと、 既存 DB では
+        値を持った旧列が残ったまま新列が 0 で作られ、 配分が全部 0 に見える。
+        """
+        cur = self._conn.execute("PRAGMA table_info(workloads)")
+        cols = {row[1] for row in cur.fetchall()}
+        if not cols:
+            return                                   # テーブル未作成 (= 新規 DB)
+        if "min_workers" in cols or "min_resident_workers" not in cols:
+            return                                   # 改名済み or 旧列が無い
+        self._conn.execute(
+            "ALTER TABLE workloads RENAME COLUMN min_resident_workers TO min_workers"
+        )
+        self._conn.commit()
 
     def _drop_legacy_plugins_table(self) -> None:
         """plugins テーブル (= 旧 Plugin Registry) を DROP (= Phase C 移行後の cleanup)。

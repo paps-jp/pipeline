@@ -70,7 +70,7 @@ export interface Workload {
   // 並列/常駐制御 (WorkloadBase)。 balancer/elastic が参照。
   max_concurrent_per_host: number | null;
   max_concurrent_total: number | null;
-  min_resident_workers: number;
+  min_workers: number;
   max_workers: number | null;
   requires_gpu: boolean;
   queue_backend: string;
@@ -193,6 +193,8 @@ export interface FleetState {
   stopped_by: string | null;
   recorded_slugs: string[];
   enabled_now: string[];
+  /** 止めると顔検索が死ぬ workload (faiss-api 等)。「検索以外全停止」の除外集合。 */
+  search_slugs: string[];
 }
 
 export interface FleetActionResult {
@@ -201,6 +203,8 @@ export interface FleetActionResult {
   changed: string[];
   failed: { slug: string; error: string }[];
   recorded_slugs: string[];
+  /** keep_search で意図的に残した slug。 */
+  kept_slugs: string[];
   message: string;
 }
 
@@ -230,8 +234,11 @@ export const api = {
 
   // --- フリート全停止 / 再開 ---
   fleetState: () => request<FleetState>("/api/v1/fleet/state"),
-  fleetStop: (by?: string) =>
-    request<FleetActionResult>("/api/v1/fleet/stop", { method: "POST", json: { by } }),
+  fleetStop: (by?: string, keepSearch = false) =>
+    request<FleetActionResult>("/api/v1/fleet/stop", {
+      method: "POST",
+      json: { by, keep_search: keepSearch },
+    }),
   fleetResume: (by?: string) =>
     request<FleetActionResult>("/api/v1/fleet/resume", { method: "POST", json: { by } }),
 
