@@ -60,7 +60,9 @@ from concurrent.futures import ThreadPoolExecutor
 TARGET_PREFIX = "crawl_face/"
 EXCLUDE_PREFIX = "crawl_face/video/"
 BUCKET = "crawl"
-ENDPOINT = "10.10.50.16:9000"
+# 内部 IP をコードに置かない。 実行時に env で与える:
+#   MINIO_ENDPOINT=10.0.0.1:9000 python scripts/migrate_face_keys.py
+ENDPOINT = os.environ.get("MINIO_ENDPOINT", "")
 
 DEFAULT_STATE_DIR = "/var/lib/pipeline/migrate_face"
 WRITER_CHECK_RECENT_IDS = 10000  # 直近 N id を writer 切替チェックの標本にする

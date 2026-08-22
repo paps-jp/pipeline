@@ -210,7 +210,7 @@ def test_storage_failure_surfaces_as_item_error(client: TestClient) -> None:
 @pytest.mark.parametrize("url", [
     "http://127.0.0.1/a.jpg",
     "http://localhost/a.jpg",
-    "http://10.10.50.7:8001/a.jpg",
+    "http://192.0.2.7:8001/a.jpg",
     "http://192.168.1.1/a.jpg",
     "http://169.254.169.254/latest/meta-data/",
 ])
@@ -265,7 +265,7 @@ def test_video_url_create_is_guarded_too(client: TestClient) -> None:
     with client:
         key = _issue_key(client)
         r = client.post("/api/v1/create/videos/url", headers=_auth(key),
-                        json={"url": "http://10.10.50.8:9100/paprika/x.mp4"})
+                        json={"url": "http://192.0.2.8:9100/paprika/x.mp4"})
         assert r.json()["items"][0]["error"] == "private_address"
         assert client.app.state.create_backend.videos == []
 

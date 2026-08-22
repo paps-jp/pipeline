@@ -145,13 +145,13 @@ def test_db_cfg_prefix_maps_to_init_kwargs():
     「認証情報が未設定」で起動しなくなる。
     """
     kwargs = {
-        "db_host": "10.10.50.20", "db_port": 3306, "db_user": "u", "db_pass": "p",
+        "db_host": "192.0.2.20", "db_port": 3306, "db_user": "u", "db_pass": "p",
         "db_name": "delian",
         "delete_db_host": "10.10.60.2", "delete_db_port": 13306,
         "delete_db_user": "du", "delete_db_pass": "dp", "delete_db_name": "delian_sakura",
     }
     assert hi._db_cfg({}, kwargs, "DB_", 3306) == {
-        "host": "10.10.50.20", "port": 3306, "user": "u",
+        "host": "192.0.2.20", "port": 3306, "user": "u",
         "password": "p", "database": "delian",
     }
     assert hi._db_cfg({}, kwargs, "DELETE_DB_", 13306) == {

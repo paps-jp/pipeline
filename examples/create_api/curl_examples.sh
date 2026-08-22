@@ -3,7 +3,7 @@
 # 実行するのではなく、 必要な行をコピーして使うことを想定している。
 set -euo pipefail
 
-BASE="${PIPELINE_CREATE_URL:-http://10.10.50.7:8001}"
+BASE="${PIPELINE_CREATE_URL:-http://localhost:8001}"
 KEY="${PIPELINE_CREATE_KEY:?PIPELINE_CREATE_KEY を設定してください}"
 AUTH=(-H "Authorization: Bearer ${KEY}")
 

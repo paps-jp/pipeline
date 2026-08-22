@@ -332,7 +332,10 @@ def _pve_alerts() -> list[dict[str, Any]]:
 # `usage_total_bytes` で見ると tmpfs を実際に食っている分を見落とす
 # (実測でピーク時の 83〜99% が trash 側だった)。
 _RAMDISK_HEALTH_TTL_S = 60.0
-_RAMDISK_DEFAULT = "video-ram:.48=http://10.10.50.48:9000"
+# 実値は env `PIPELINE_RAMDISK_TARGETS` で与える (公開リポジトリに内部 IP を
+# 置かないため)。 未設定は「監視対象無し」= 赤ボックスが出なくなるので、
+# _ramdisk_targets() で 1 度だけ警告を残す (黙って無効化させない)。
+_RAMDISK_DEFAULT = ""
 # 閾値は .48 の実測 envelope 由来。 2026-08-14 の 6 分連続実測で通常ピークは
 # 80G tmpfs の 71.7% (58.8G) まで届き、 約 30 秒で自然に落ちる (Paprika が
 # バケットを一括削除 → MinIO の trash purge 待ち、 の重なり)。 70/85 だと
@@ -341,6 +344,17 @@ _RAMDISK_WARN_PCT = 80.0
 _RAMDISK_CRIT_PCT = 90.0
 _ramdisk_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
 _ramdisk_health_lock = threading.Lock()
+
+
+_warned: set[str] = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    """同じ設定漏れを毎 tick 出さない (60 秒 TTL で回るので煩い)。"""
+    if key in _warned:
+        return
+    _warned.add(key)
+    log.warning("%s", msg)
 
 
 def _ramdisk_targets() -> list[tuple[str, str]]:
@@ -352,6 +366,12 @@ def _ramdisk_targets() -> list[tuple[str, str]]:
     raw = os.environ.get("PIPELINE_RAMDISK_TARGETS")
     if raw is None:
         raw = _RAMDISK_DEFAULT
+        # 既定が空 = 未設定なら監視対象ゼロ。 それ自体は正しい挙動だが、 設定漏れと
+        # 区別が付かないまま赤ボックスが出なくなるのが一番まずい (2026-08-22 に
+        # links-pull が 2.5 時間黙って止まっていたのと同じ形) ので 1 度だけ残す。
+        _warn_once("ramdisk",
+                   "flow: PIPELINE_RAMDISK_TARGETS 未設定 — RAM ディスクの"
+                   " 赤ボックスは出ません (systemd の drop-in で与えてください)")
     out: list[tuple[str, str]] = []
     for item in raw.split(","):
         item = item.strip()
@@ -501,7 +521,9 @@ def _ramdisk_alerts() -> list[dict[str, Any]]:
 # index 鮮度も同じ probe で見る。 faiss-index-build の max_age_hours (既定 168h) を
 # 超えても再構築されていなければ、 検索に出ない embedding が積み上がっている。
 _FAISS_HEALTH_TTL_S = 60.0
-_FAISS_URL_DEFAULT = "http://10.10.50.27:9000"
+# 実値は env `PAPRIKA_FLOW_FAISS_URL`。 未設定なら FAISS の生存確認を
+# 行わない (= 赤ボックスが出ない) ので、 こちらも警告を残す。
+_FAISS_URL_DEFAULT = ""
 _FAISS_STALE_H_DEFAULT = 168.0
 _faiss_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
 _faiss_health_lock = threading.Lock()
@@ -548,6 +570,11 @@ def _refresh_faiss_health() -> None:
     alerts: list[dict[str, Any]] = []
     try:
         url = (os.environ.get("PAPRIKA_FLOW_FAISS_URL") or _FAISS_URL_DEFAULT).rstrip("/")
+        if not url:
+            _warn_once("faiss",
+                       "flow: PAPRIKA_FLOW_FAISS_URL 未設定 — FAISS の生存確認は"
+                       " 行いません (systemd の drop-in で与えてください)")
+            return
         stale_h = float(os.environ.get("PAPRIKA_FLOW_FAISS_STALE_H")
                         or _FAISS_STALE_H_DEFAULT)
         alerts = _probe_faiss(url, stale_h)

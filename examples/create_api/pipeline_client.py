@@ -7,7 +7,7 @@
 
     from pipeline_client import PipelineClient
 
-    c = PipelineClient("http://10.10.50.7:8001", api_key="plk_...")
+    c = PipelineClient("http://localhost:8001", api_key="plk_...")
     r = c.upload_image("photo.jpg")
     print(r.items[0].id, r.items[0].dedup)
     faces = c.wait_for_embedding(r.items[0].id, timeout=1800)
@@ -16,7 +16,7 @@
 
 CLI として:
 
-    export PIPELINE_CREATE_URL=http://10.10.50.7:8001
+    export PIPELINE_CREATE_URL=http://localhost:8001
     export PIPELINE_CREATE_KEY=plk_xxx_yyy
 
     python pipeline_client.py limits
@@ -128,7 +128,7 @@ def _encode_multipart(fields: dict[str, str], file_field: str,
 class PipelineClient:
     """投入 API のクライアント。
 
-    `base_url` は control plane のルート (例 http://10.10.50.7:8001)。
+    `base_url` は control plane のルート (例 http://localhost:8001)。
     `api_key` は `POST /api/v1/api-keys` で発行された `plk_...`。
     """
 

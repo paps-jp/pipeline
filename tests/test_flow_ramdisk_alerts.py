@@ -134,9 +134,28 @@ def test_missing_capacity_metrics_reports_warn(fake_metrics):
 
 # ── ターゲット設定 ───────────────────────────────────────────────────────────
 
-def test_targets_default(monkeypatch):
+def test_targets_unset_is_empty_but_warns(monkeypatch, caplog):
+    """未設定は「監視対象ゼロ」。 ただし黙って無効化しないこと。
+
+    内部 IP を公開リポジトリに置かないため既定値を空にした (実値は systemd の
+    drop-in で与える)。 その結果「設定漏れ」と「意図的な無効化」が同じ見た目に
+    なるので、 未設定のときだけ警告を残す契約にしている。
+    """
     monkeypatch.delenv("PIPELINE_RAMDISK_TARGETS", raising=False)
-    assert flow._ramdisk_targets() == [("video-ram:.48", "http://10.10.50.48:9000")]
+    flow._warned.discard("ramdisk")
+    with caplog.at_level("WARNING"):
+        assert flow._ramdisk_targets() == []
+    assert any("PIPELINE_RAMDISK_TARGETS" in r.message for r in caplog.records)
+
+
+def test_targets_unset_warns_only_once(monkeypatch, caplog):
+    monkeypatch.delenv("PIPELINE_RAMDISK_TARGETS", raising=False)
+    flow._warned.discard("ramdisk")
+    with caplog.at_level("WARNING"):
+        flow._ramdisk_targets()
+        caplog.clear()
+        flow._ramdisk_targets()          # 2 回目は黙る (60 秒 TTL で回るため)
+    assert not [r for r in caplog.records if "PIPELINE_RAMDISK_TARGETS" in r.message]
 
 
 def test_targets_can_be_disabled(monkeypatch):

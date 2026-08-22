@@ -11,7 +11,7 @@ POST /api/v1/create/images
  crawl_image ──(30s ごとの自動 sweep)──> 顔検出 ──> crawl_face ──> embedding ──> 検索インデックス
 ```
 
-エンドポイント: **`http://10.10.50.7:8001/api/v1/create`**
+エンドポイント: **`http://localhost:8001/api/v1/create`**
 
 ## 目次
 
@@ -30,7 +30,7 @@ POST /api/v1/create/images
 **1. キーを発行**（LAN 内から一度だけ。`api_key` はこの応答でしか取れません）
 
 ```bash
-curl -sS -X POST http://10.10.50.7:8001/api/v1/api-keys \
+curl -sS -X POST http://localhost:8001/api/v1/api-keys \
   -H 'Content-Type: application/json' \
   -d '{"user_slug":"myapp","name":"my app"}'
 ```
@@ -39,7 +39,7 @@ curl -sS -X POST http://10.10.50.7:8001/api/v1/api-keys \
 
 ```bash
 export KEY=plk_xxxxx_yyyyy
-curl -sS -X POST http://10.10.50.7:8001/api/v1/create/images \
+curl -sS -X POST http://localhost:8001/api/v1/create/images \
   -H "Authorization: Bearer $KEY" \
   -F 'file=@photo.jpg'
 ```
@@ -53,14 +53,14 @@ curl -sS -X POST http://10.10.50.7:8001/api/v1/create/images \
 
 ```bash
 curl -sS -H "Authorization: Bearer $KEY" \
-  http://10.10.50.7:8001/api/v1/create/images/125309008
+  http://localhost:8001/api/v1/create/images/125309008
 ```
 
 Python なら 3 行です:
 
 ```python
 from pipeline_client import PipelineClient
-c = PipelineClient("http://10.10.50.7:8001", api_key="plk_...")
+c = PipelineClient("http://localhost:8001", api_key="plk_...")
 print(c.upload_image("photo.jpg").items[0].id)
 ```
 
@@ -85,7 +85,7 @@ print(c.upload_image("photo.jpg").items[0].id)
 キーの発行は LAN 内の管理 API で行います（**この API は外部公開しないこと**）:
 
 ```bash
-curl -sS -X POST http://10.10.50.7:8001/api/v1/api-keys \
+curl -sS -X POST http://localhost:8001/api/v1/api-keys \
   -H 'Content-Type: application/json' \
   -d '{"user_slug":"acme","name":"acme loader"}'
 ```
@@ -107,7 +107,7 @@ curl -sS -X POST http://10.10.50.7:8001/api/v1/api-keys \
 失効:
 
 ```bash
-curl -sS -X DELETE http://10.10.50.7:8001/api/v1/api-keys/a1b2c3d4e5f6
+curl -sS -X DELETE http://localhost:8001/api/v1/api-keys/a1b2c3d4e5f6
 ```
 
 ## エンドポイント
@@ -149,7 +149,7 @@ curl -sS -X DELETE http://10.10.50.7:8001/api/v1/api-keys/a1b2c3d4e5f6
 | `url` | | 出所 URL。指定すると URL でも重複排除される |
 
 ```bash
-curl -X POST http://10.10.50.7:8001/api/v1/create/images \
+curl -X POST http://localhost:8001/api/v1/create/images \
   -H "Authorization: Bearer $KEY" \
   -F 'file=@photo.jpg' \
   -F 'url=https://example.com/photo.jpg'
@@ -190,7 +190,7 @@ curl -X POST http://10.10.50.7:8001/api/v1/create/images \
 
 ```bash
 curl -sS -H "Authorization: Bearer $KEY" \
-  http://10.10.50.7:8001/api/v1/create/images/125309008
+  http://localhost:8001/api/v1/create/images/125309008
 ```
 
 ```json
@@ -240,7 +240,7 @@ curl -sS -H "Authorization: Bearer $KEY" \
 
 ```bash
 curl -sS -H "Authorization: Bearer $KEY" \
-  http://10.10.50.7:8001/api/v1/create/videos/745054
+  http://localhost:8001/api/v1/create/videos/745054
 ```
 
 ```json
@@ -305,7 +305,7 @@ item の `error`:
 ```python
 from pipeline_client import PipelineClient
 
-c = PipelineClient("http://10.10.50.7:8001", api_key="plk_...")
+c = PipelineClient("http://localhost:8001", api_key="plk_...")
 
 print(c.limits())
 
@@ -332,7 +332,7 @@ for item in r.items:
 ### CLI
 
 ```bash
-export PIPELINE_CREATE_URL=http://10.10.50.7:8001
+export PIPELINE_CREATE_URL=http://localhost:8001
 export PIPELINE_CREATE_KEY=plk_xxx_yyy
 
 python pipeline_client.py limits

@@ -129,18 +129,18 @@ def test_single_client_still_accepted(im, ok_jpeg, tmp_path):
 
 def test_labels_distinguish_the_two_tiers(im):
     """setup が作るラベルが .47 と .17 を区別できる形になっていること。"""
-    pairs = [(object(), "10.10.50.47:9000"), (object(), "10.10.50.17:9000")]
+    pairs = [(object(), "192.0.2.47:9000"), (object(), "192.0.2.17:9000")]
     labels = ["minio:%s" % e.split(":")[0] for _c, e in pairs]
-    assert labels == ["minio:10.10.50.47", "minio:10.10.50.17"]
+    assert labels == ["minio:192.0.2.47", "minio:192.0.2.17"]
     assert len(set(labels)) == 2, "同じラベルになると内訳が潰れる"
 
 
 def test_label_index_alignment(im, ok_jpeg, tmp_path):
     """返る index がラベル配列の添字としてそのまま使えること。"""
-    labels = ["minio:10.10.50.47", "minio:10.10.50.17"]
+    labels = ["minio:192.0.2.47", "minio:192.0.2.17"]
     hot, spill = _Client([]), _Client(["k"])
     ok, _e, _p, idx = im._download_from_minio([hot, spill], "paprika", "k", tmp_path)
-    assert labels[idx] == "minio:10.10.50.17"
+    assert labels[idx] == "minio:192.0.2.17"
 
 
 # ---------------------------------------------- 既定挙動を変えていない --
