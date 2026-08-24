@@ -27,9 +27,16 @@ fleet 全体で max_connections=300 を突き破って OperationalError を撒�
 from __future__ import annotations
 
 import queue as _queue
+import threading
+import time
 from typing import Any
 
 DEFAULT_POOL_TIMEOUT_S = 30.0
+
+
+def _zero_stats() -> dict:
+    return {"acquires": 0, "wait_s": 0.0, "wait_max_s": 0.0,
+            "ping_s": 0.0, "connect_s": 0.0, "connects": 0}
 
 
 class MariaPool:
@@ -60,6 +67,11 @@ class MariaPool:
         self._q: "_queue.LifoQueue" = _queue.LifoQueue(maxsize=self._size)
         for _ in range(self._size):
             self._q.put(None)
+        # 借用の実測。 「プールが細くて待たされている」のか 「DB 自体が遅い」のか
+        # は外から見分けが付かないので、 待ち (queue.get) と ping と connect を
+        # 分けて積む。 加算は DB 往復 (ms) に対し十分軽い。
+        self._lock = threading.Lock()
+        self._stats = _zero_stats()
 
     @property
     def size(self) -> int:
@@ -72,26 +84,71 @@ class MariaPool:
 
     def acquire(self, timeout: float = DEFAULT_POOL_TIMEOUT_S):
         """接続を 1 本借りる。 全借用中なら空くまで最大 timeout 秒ブロック。"""
+        _t0 = time.perf_counter()
         conn = self._q.get(timeout=timeout)
-        if conn is None:
-            try:
-                return self._connect()
-            except Exception:
-                self._q.put(None)   # connect 失敗: slot を戻して size を保つ
-                raise
+        _wait = time.perf_counter() - _t0
+        _ping = 0.0
+        _conn_s = 0.0
+        _new = 0
         try:
-            conn.ping()             # 死んだ接続を検知して張り直す
-            return conn
-        except Exception:
+            if conn is None:
+                _t1 = time.perf_counter()
+                try:
+                    out = self._connect()
+                except Exception:
+                    self._q.put(None)   # connect 失敗: slot を戻して size を保つ
+                    raise
+                _conn_s = time.perf_counter() - _t1
+                _new = 1
+                return out
+            _t1 = time.perf_counter()
             try:
-                conn.close()
+                conn.ping()             # 死んだ接続を検知して張り直す
+                _ping = time.perf_counter() - _t1
+                return conn
             except Exception:
-                pass
-            try:
-                return self._connect()
-            except Exception:
-                self._q.put(None)
-                raise
+                _ping = time.perf_counter() - _t1
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _t2 = time.perf_counter()
+                try:
+                    out = self._connect()
+                except Exception:
+                    self._q.put(None)
+                    raise
+                _conn_s = time.perf_counter() - _t2
+                _new = 1
+                return out
+        finally:
+            self._record(_wait, _ping, _conn_s, _new)
+
+    def _record(self, wait_s: float, ping_s: float, connect_s: float, new: int) -> None:
+        with self._lock:
+            st = self._stats
+            st["acquires"] += 1
+            st["wait_s"] += wait_s
+            st["ping_s"] += ping_s
+            st["connect_s"] += connect_s
+            st["connects"] += new
+            if wait_s > st["wait_max_s"]:
+                st["wait_max_s"] = wait_s
+
+    def stats(self) -> dict:
+        """借用実測のスナップショット。 size を併せて返す (占有率の判断用)。"""
+        with self._lock:
+            out = dict(self._stats)
+        out["size"] = self._size
+        return out
+
+    def reset_stats(self) -> dict:
+        """直前の値を返してゼロに戻す。 tick 単位で見るため。"""
+        with self._lock:
+            out = dict(self._stats)
+            self._stats = _zero_stats()
+        out["size"] = self._size
+        return out
 
     def release(self, conn, broken: bool = False):
         """接続を返す。 broken=True は close して None(空 slot) を戻す。"""
