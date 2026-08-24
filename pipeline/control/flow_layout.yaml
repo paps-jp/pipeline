@@ -273,11 +273,15 @@ nodes:
   unit: GB
   metric_sql: SELECT IF(updated_at > NOW() - INTERVAL 5 MINUTE, ROUND(used_bytes/1073741824,1),
     ROUND(total_bytes/1073741824,1)) FROM storage_capacity WHERE name='image-ram-47'
-  # 分母は tmpfs 実容量ではなく **warn ライン** (= 実容量 x 80%) を返す。
+  # 分母は tmpfs 実容量ではなく **warn ライン** (= 実容量 x 90%) を返す。
   # 満杯を分母にすると液面 70% が 「まだ余裕」 に見えるが、 .47 は満杯にすると
   # MinIO が ENOSPC になり画像パイプラインが両側から止まる (2026-08-15)。
   # 実容量に追随させたいので固定値ではなく SQL 側で係数を掛ける。
-  capacity_sql: SELECT ROUND(total_bytes*0.8/1073741824,1) FROM storage_capacity
+  # 係数は **hub の asset_spill high_pct と同じ値**にする。 ここを超えると hub は
+  # .17 へ spill して取得が遅くなるので、 液面 100% = spill 開始点で一致する。
+  # 2026-08-24 に 0.8 → 0.9 (high_pct を 80 → 90 に上げたのに追随しておらず、
+  # spill の 14G 手前で警告が鳴っていた)。 flow.py の _TANK_WARN_PCT と対。
+  capacity_sql: SELECT ROUND(total_bytes*0.9/1073741824,1) FROM storage_capacity
     WHERE name='image-ram-47'
   capacity_warn: 80
 - id: minio-video-ram

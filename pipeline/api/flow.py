@@ -466,18 +466,29 @@ def _refresh_ramdisk_health() -> None:
 # いる (repositories/storage_capacity.py の image-ram-47)。 tank ゲージが動いて
 # いるのはこれのおかげなので、 赤ボックスも同じソースから出す。
 #
-# 対象 tank の capacity_sql は 「warn ライン」 (= tmpfs 実容量 x _RAMDISK_WARN_PCT)
+# 対象 tank の capacity_sql は 「warn ライン」 (= tmpfs 実容量 x _TANK_WARN_PCT)
 # を返す約束にしてある。 よって pending >= capacity_warn がそのまま warn 到達で、
 # crit はその CRIT/WARN 倍。 tank の fill_ratio は 1.0 で頭打ちになる (液面表示の
 # ため) ので、 crit 判定には使えない。 pending と capacity_warn から直接出すこと。
+#
+# .47 の warn は **hub の asset_spill high_pct と同じ線**に置く。 ここを超えると
+# hub は .17 (ディスク) へ spill し、 image-pull の取得が目に見えて遅くなる ——
+# つまり「まだ壊れていないが経路が変わった」= 警告に値する状態そのもの。
+# 2026-08-24 に high_pct を 80 → 90 へ上げた際、 ここが 80 のままだったため
+# **spill (126G) より 14G 手前で警告が鳴り**、 「溢れた」と誤読させていた。
+# high_pct を動かすときは flow_layout.yaml の capacity_sql の係数と
+# _TANK_WARN_PCT を必ず一緒に動かすこと (3 箇所が同じ数字を持っている)。
+# probe 経路 (.48) は tmpfs の性格が違うので _RAMDISK_*_PCT のまま据え置く。
 _TANK_RAMDISK_ALERTS = {"minio-image-ram": "image-ram:.47"}
-_RAMDISK_CRIT_OVER_WARN = _RAMDISK_CRIT_PCT / _RAMDISK_WARN_PCT
+_TANK_WARN_PCT = 90.0
+_TANK_CRIT_PCT = 95.0
+_TANK_CRIT_OVER_WARN = _TANK_CRIT_PCT / _TANK_WARN_PCT
 
 
 def _tank_ramdisk_alerts(nodes: list["FlowNode"]) -> list[dict[str, Any]]:
     """tank の実測値から RAM ディスク逼迫を出す。 probe が使えない .47 用。"""
     out: list[dict[str, Any]] = []
-    warn_frac = _RAMDISK_WARN_PCT / 100.0
+    warn_frac = _TANK_WARN_PCT / 100.0
     for node in nodes:
         label = _TANK_RAMDISK_ALERTS.get(node.id)
         if not label or node.pending is None or not node.capacity_warn:
@@ -492,7 +503,7 @@ def _tank_ramdisk_alerts(nodes: list["FlowNode"]) -> list[dict[str, Any]]:
             "name": f"ramdisk:{node.id}",
             "kind": "storage_full",
             "endpoint": label,
-            "severity": ("crit" if used >= warn_at * _RAMDISK_CRIT_OVER_WARN
+            "severity": ("crit" if used >= warn_at * _TANK_CRIT_OVER_WARN
                          else "warn"),
             "detail": f"{used:.1f}G / {total:.1f}G ({pct:.1f}%) — tmpfs 逼迫",
         })
