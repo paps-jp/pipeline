@@ -109,23 +109,39 @@ def test_put_blob_is_timed():
     assert "_w_put_n += 1" in body
 
 
-def test_put_blob_timing_is_inside_the_post_phase():
-    """ワーカ側ではなくメインスレッド上で起きていることを固定する。"""
+def test_thumb_handoff_timing_is_inside_the_post_phase():
+    """サムネ処理がメインスレッド上で起きていることを固定する。
+
+    2026-08-24: 当初この計器は `_put_blob` を直に挟んでいた。 計測の結果
+    「その同期 PUT が download 段の 94%」 と分かったので、 送信は別スレッドへ
+    逃がした ([[test_image_pull_thumb_gate]])。 いまメインスレッドに残るのは
+    受け渡し (_thumb_submit) だけだが、 **ここが再び重くなったら窓が飢える**
+    ことに変わりは無いので、 計測点はメインスレッド側に置き続ける。
+    """
     body = _window_loop()
     i = body.index("_t_p0 = time.perf_counter()")
     j = body.index("_w_post_s +=")
-    assert "_put_blob(" in body[i:j]
+    seg = body[i:j]
+    assert "_thumb_submit(" in seg
+    assert "_put_blob(" not in seg, (
+        "メインスレッドへ同期 PUT が戻っている (窓が止まる)")
 
 
-def test_put_blob_failure_still_counted():
-    """例外で計測が飛ぶと 「速い」 と誤読する。 加算は except の外。"""
+def test_both_outcomes_are_counted():
+    """送った数と捨てた数を分けて積むこと。
+
+    捨てたぶんを 「送った」 に混ぜると、 レート制限が効きすぎていても
+    put_blob_n が減らないので気づけない。 逆に捨てたぶんを数えないと
+    「PUT が減った = 速くなった」 が本当に届いた枚数なのか分からない。
+    """
     body = _window_loop()
-    i = body.index("_put_blob(")
-    seg = body[i:i + 500]
-    assert "log.debug(\"viz thumb upload failed" in seg
+    i = body.index("_thumb_submit(")
+    seg = body[i:i + 400]
+    assert "_w_put_drop += 1" in seg
+    assert "_w_put_n += 1" in seg
     k = seg.index("_w_put_s +=")
-    assert seg.index("except Exception as _e:") < k, (
-        "_w_put_s の加算は except の後 (= 失敗時も積む) に置くこと")
+    assert k < seg.index("_w_put_drop += 1"), (
+        "受け渡しの所要時間は結果に関わらず積むこと")
 
 
 # ------------------------------------------------------ 出力に出ること --
