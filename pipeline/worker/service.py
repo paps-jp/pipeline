@@ -353,6 +353,12 @@ class ControlClient:
         )
         r.raise_for_status()
 
+    async def record_run_batch(self, worker_id: str, runs: list[dict]) -> None:
+        r = await self._client.post(
+            f"{self.base}/api/v1/workers/{worker_id}/runs/batch", json={"runs": runs}
+        )
+        r.raise_for_status()
+
     async def poll_admin_cmd(self, worker_id: str, host: str) -> dict | None:
         """long poll: pending admin cmd を待つ (= 最大 25s)、 無ければ None."""
         try:
@@ -1181,21 +1187,10 @@ class WorkerDaemon:
         は tasks と同じ長さの list[dict] を返す約束。
         """
         started = _utcnow_iso()
-
-        run_ids: dict[str, str | None] = {}
-        for t in tasks:
-            try:
-                rid = await self._client.start_run(self.worker_id, {
-                    "workload_slug": w["slug"],
-                    "pk": t["pk"],
-                    "attempt": int(t["attempt"]),
-                    "started_at": started,
-                })
-                run_ids[t["pk"]] = rid
-            except Exception:
-                log.exception("start_run HTTP failed for pk=%s", t["pk"])
-                run_ids[t["pk"]] = None
-
+        # run 記録はバッチ完了後に record_run_batch で 1 回だけ一括 INSERT する。
+        # 旧実装は start_run×N + finish_run×N で 1 バッチ 2N 往復し、 制御プレーン
+        # SQLite の単一接続 + RLock (= 全 DB 操作の直列化点) を奪い合って律速していた
+        # (2026-08-25)。 進行中 (finished_at=NULL) 行は作らない。
         workdir = Path(tempfile.mkdtemp(prefix=f"pipeline-{w['slug']}-batch-"))
         deadline = datetime.now(timezone.utc) + timedelta(seconds=int(w["lease_secs"]))
         ctx = ExecutionContext(
@@ -1226,6 +1221,7 @@ class WorkerDaemon:
         if any(_looks_like_oom(r.error or "", r.stderr or "") for r in results):
             await self._report_oom_bump(w["slug"])
         success_pks: list[str] = []
+        run_records: list[dict] = []
         for t, result in zip(tasks, results):
             is_success = _eval_success(w["success_criteria"], result)
             self.processed_total += 1
@@ -1243,34 +1239,32 @@ class WorkerDaemon:
                     )
                 except Exception:
                     log.exception("fail HTTP failed; will rely on lease expiry")
-            rid = run_ids.get(t["pk"])
+            run_records.append({
+                "workload_slug": w["slug"],
+                "pk": t["pk"],
+                "attempt": int(t["attempt"]),
+                "started_at": started,
+                "success": is_success,
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "stdout": result.stdout or None,
+                "stderr": result.stderr or None,
+                "output_json": result.output_json,
+                "error": result.error,
+            })
+        # 全 run を 1 リクエスト = 1 transaction で一括記録 (= ロック取得 2N→1)。
+        # batch endpoint を持たない旧サーバへの rolling deploy 中は per-task record_run に
+        # fallback し、 メトリクス欠損を防ぐ。
+        if run_records:
             try:
-                if rid:
-                    await self._client.finish_run(self.worker_id, rid, {
-                        "success": is_success,
-                        "exit_code": result.exit_code,
-                        "duration_ms": result.duration_ms,
-                        "stdout": result.stdout or None,
-                        "stderr": result.stderr or None,
-                        "output_json": result.output_json,
-                        "error": result.error,
-                    })
-                else:
-                    await self._client.record_run(self.worker_id, {
-                        "workload_slug": w["slug"],
-                        "pk": t["pk"],
-                        "attempt": int(t["attempt"]),
-                        "started_at": started,
-                        "success": is_success,
-                        "exit_code": result.exit_code,
-                        "duration_ms": result.duration_ms,
-                        "stdout": result.stdout or None,
-                        "stderr": result.stderr or None,
-                        "output_json": result.output_json,
-                        "error": result.error,
-                    })
+                await self._client.record_run_batch(self.worker_id, run_records)
             except Exception:
-                log.exception("finish_run HTTP failed; lost")
+                log.warning("record_run_batch failed; per-task fallback", exc_info=True)
+                for rr in run_records:
+                    try:
+                        await self._client.record_run(self.worker_id, rr)
+                    except Exception:
+                        log.exception("record_run fallback failed; lost")
         # 成功分は 1 リクエストで一括 complete (= 軽量化)
         if success_pks:
             try:

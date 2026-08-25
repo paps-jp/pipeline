@@ -204,6 +204,24 @@ class RunFinishRequest(BaseModel):
     error: str | None = None
 
 
+class RunBatchItem(BaseModel):
+    workload_slug: str
+    pk: str
+    attempt: int
+    started_at: str
+    success: bool
+    exit_code: int | None = None
+    duration_ms: int = 0
+    stdout: str | None = None
+    stderr: str | None = None
+    output_json: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class RunBatchRequest(BaseModel):
+    runs: list[RunBatchItem]
+
+
 class WorkloadsForWorkerResponse(BaseModel):
     workloads: list[Workload]
 
@@ -1132,3 +1150,16 @@ def record_run(worker_id: str, body: RunRecordRequest, request: Request) -> dict
         error=body.error,
     )
     return {"id": rid}
+
+
+@router.post("/{worker_id}/runs/batch", status_code=status.HTTP_201_CREATED)
+def record_run_batch(worker_id: str, body: RunBatchRequest, request: Request) -> dict[str, int]:
+    """完了済み run を 1 リクエスト = 1 transaction で一括記録する。
+
+    batch worker の per-task start_run/finish_run 往復 (1 バッチ 2N 回) が制御プレーン
+    SQLite の単一接続ロックを奪い合う律速を解消するための経路 (2026-08-25)。
+    """
+    _get_worker_or_404(request, worker_id)
+    runs = [{**item.model_dump(), "worker_id": worker_id} for item in body.runs]
+    n = _rrepo(request).record_batch(runs)
+    return {"recorded": n}

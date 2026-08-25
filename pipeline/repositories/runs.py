@@ -136,6 +136,55 @@ class RunsRepository:
         )
         return run_id
 
+    def record_batch(self, runs: list[dict[str, Any]]) -> int:
+        """完了済み run を **1 transaction** で一括 INSERT する。
+
+        batch worker (= hash/embed 等) は 1 バッチ N task を start_run×N + finish_run×N の
+        per-task 往復で記録していたため、 制御プレーン SQLite の単一接続 + RLock
+        (= 全 DB 操作の直列化点) を 1 バッチ 2N 回も奪い合って律速していた (2026-08-25)。
+        ここで N 件を 1 lock / 1 commit にまとめる。 進行中 (finished_at=NULL) 行は作らず
+        完了行を直接 INSERT する (dashboard の in-flight 表示は失うが throughput 系
+        メトリクスは started_at + success=1 の COUNT なので不変)。
+        各 run dict は record() と同じ key + worker_id を持つ。 返り値 = 記録件数。
+        """
+        if not runs:
+            return 0
+        now = _utcnow_iso()
+        with self.db.transaction() as conn:
+            for r in runs:
+                conn.execute(
+                    """
+                    INSERT INTO runs (
+                        id, workload_slug, pk, worker_id, attempt,
+                        started_at, finished_at,
+                        success, exit_code, duration_ms,
+                        stdout, stderr, output_json, error
+                    ) VALUES (
+                        :id, :ws, :pk, :wid, :att,
+                        :s_at, :f_at,
+                        :ok, :ec, :dur,
+                        :so, :se, :oj, :er
+                    )
+                    """,
+                    {
+                        "id": _new_run_id(),
+                        "ws": r["workload_slug"],
+                        "pk": str(r["pk"]),
+                        "wid": r["worker_id"],
+                        "att": int(r["attempt"]),
+                        "s_at": r["started_at"],
+                        "f_at": now,
+                        "ok": 1 if r["success"] else 0,
+                        "ec": r.get("exit_code"),
+                        "dur": int(r.get("duration_ms") or 0),
+                        "so": r.get("stdout"),
+                        "se": r.get("stderr"),
+                        "oj": json.dumps(r["output_json"]) if r.get("output_json") else None,
+                        "er": r.get("error"),
+                    },
+                )
+        return len(runs)
+
     def list_for_workload(self, slug: str, limit: int = 50) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
             cur = conn.execute(
