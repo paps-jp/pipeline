@@ -133,8 +133,13 @@ function CreateRowModal({
               key={c.name}
               label={label}
               value={draft[c.name] ?? ""}
-              onChange={(e) =>
-                setDraft((d) => ({ ...d, [c.name]: e.currentTarget.value }))}
+              onChange={(e) => {
+                // e.currentTarget はハンドラの同期実行が終わると null にリセットされる
+                // (React の仕様)。 functional updater 内で遅延参照すると paste 等で
+                // null 参照になりうるので、 同期的に読み取ってから渡す。
+                const value = e.currentTarget.value;
+                setDraft((d) => ({ ...d, [c.name]: value }));
+              }}
             />
           );
         })}
