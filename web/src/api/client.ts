@@ -660,6 +660,7 @@ export const hostApi = {
 export interface MariadbColumn {
   name: string;
   editable: boolean;
+  creatable: boolean;
   kind: "str" | "int";
 }
 
@@ -669,6 +670,7 @@ export interface MariadbTableMeta {
   pk: string;
   columns: MariadbColumn[];
   searchable: string[];
+  create_required: string[];
 }
 
 export interface MariadbRowsResponse {
@@ -696,6 +698,11 @@ export const mariadbTablesApi = {
     request<Record<string, unknown>>(
       `/api/v1/mariadb-tables/tables/${encodeURIComponent(table)}/rows/${pk}`,
       { method: "PATCH", json: fields },
+    ),
+  createRow: (table: string, fields: Record<string, unknown>) =>
+    request<Record<string, unknown>>(
+      `/api/v1/mariadb-tables/tables/${encodeURIComponent(table)}/rows`,
+      { method: "POST", json: fields },
     ),
 };
 

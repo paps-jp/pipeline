@@ -20,6 +20,10 @@ from pipeline.control.server import create_app
 from pipeline.db.mariadb_admin import (
     TABLE_REGISTRY,
     ColumnNotEditableError,
+    DuplicateRowError,
+    MissingRequiredFieldError,
+    RowCreationNotSupportedError,
+    create_row,
     list_rows,
     update_row,
 )
@@ -35,6 +39,8 @@ class FakeDb:
         pass
 
     def execute(self, sql: str, params: tuple = ()):
+        # sqlite は "INSERT IGNORE" ではなく "INSERT OR IGNORE" (MariaDB 固有構文の吸収)。
+        sql = sql.replace("INSERT IGNORE INTO", "INSERT OR IGNORE INTO")
         return self._conn.execute(sql.replace("%s", "?"), params)
 
 
@@ -61,6 +67,7 @@ def fake_db() -> FakeDb:
         "domain TEXT, top_url TEXT, status TEXT, last_error_type TEXT, last_error TEXT, "
         "last_http_status INTEGER, next_retry_at TEXT)"
     )
+    conn.execute("CREATE TABLE crawl (id INTEGER PRIMARY KEY, site TEXT, url TEXT)")
     conn.commit()
     return FakeDb(conn)
 
@@ -112,6 +119,64 @@ def test_update_row_rejects_non_editable_column(fake_db: FakeDb) -> None:
         update_row(fake_db, lock, spec, 1, {"next_no": 999})
 
 
+def test_create_row_applies_defaults_and_seeds_crawl(fake_db: FakeDb) -> None:
+    spec = TABLE_REGISTRY["crawl_config"]
+    lock = threading.Lock()
+    row = create_row(fake_db, lock, spec,
+                      {"site": "new_site", "url": "https://new.example",
+                       "domain": "new.example"})
+    assert row["type"] == "image"
+    assert row["next_no"] == 1
+    assert row["enabled"] == 1
+
+    seeded = fake_db._conn.execute(
+        "SELECT site, url FROM crawl WHERE site = ?", ("new_site",)).fetchall()
+    assert seeded == [("new_site", "https://new.example")]
+
+
+def test_create_row_missing_required_field(fake_db: FakeDb) -> None:
+    spec = TABLE_REGISTRY["crawl_config"]
+    lock = threading.Lock()
+    with pytest.raises(MissingRequiredFieldError):
+        create_row(fake_db, lock, spec, {"site": "no_url_site"})
+
+
+def test_create_row_rejects_non_creatable_column(fake_db: FakeDb) -> None:
+    spec = TABLE_REGISTRY["crawl_config"]
+    lock = threading.Lock()
+    with pytest.raises(ColumnNotEditableError):
+        create_row(fake_db, lock, spec,
+                    {"site": "x", "url": "https://x.example", "domain": "x.example",
+                     "next_no": 999})
+
+
+def test_create_row_not_supported_for_readonly_table(fake_db: FakeDb) -> None:
+    spec = TABLE_REGISTRY["host_import_queue"]
+    lock = threading.Lock()
+    with pytest.raises(RowCreationNotSupportedError):
+        create_row(fake_db, lock, spec, {"domain": "x.example"})
+
+
+def test_create_row_duplicate_maps_to_duplicate_error() -> None:
+    """mariadb driver は errno=1062 の例外を投げる (sqlite3 とは形が違うので fake で模す)。"""
+
+    class _DupError(Exception):
+        errno = 1062
+
+    class FakeDuplicateDb:
+        def ping(self) -> None:
+            pass
+
+        def execute(self, sql: str, params: tuple = ()):
+            raise _DupError("Duplicate entry 'x' for key 'site'")
+
+    spec = TABLE_REGISTRY["crawl_config"]
+    lock = threading.Lock()
+    with pytest.raises(DuplicateRowError):
+        create_row(FakeDuplicateDb(), lock, spec,
+                    {"site": "dup", "url": "https://dup.example", "domain": "dup.example"})
+
+
 # ---------------- HTTP 層 ----------------
 
 
@@ -143,4 +208,26 @@ def test_patch_row_http(client: TestClient) -> None:
 
 def test_patch_row_rejects_bad_column(client: TestClient) -> None:
     r = client.patch("/api/v1/mariadb-tables/tables/crawl_config/rows/1", json={"next_no": 999})
+    assert r.status_code == 400
+
+
+def test_post_row_http(client: TestClient) -> None:
+    r = client.post("/api/v1/mariadb-tables/tables/crawl_config/rows", json={
+        "site": "http_new_site", "url": "https://http-new.example",
+        "domain": "http-new.example",
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["site"] == "http_new_site"
+    assert body["enabled"] == 1
+
+
+def test_post_row_missing_required_400(client: TestClient) -> None:
+    r = client.post("/api/v1/mariadb-tables/tables/crawl_config/rows", json={"site": "no_url"})
+    assert r.status_code == 400
+
+
+def test_post_row_unsupported_table_400(client: TestClient) -> None:
+    r = client.post("/api/v1/mariadb-tables/tables/host_import_queue/rows",
+                     json={"domain": "x.example"})
     assert r.status_code == 400

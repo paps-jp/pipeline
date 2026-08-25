@@ -22,7 +22,11 @@ from pydantic import BaseModel
 from pipeline.db.mariadb_admin import (
     TABLE_REGISTRY,
     ColumnNotEditableError,
+    DuplicateRowError,
+    MissingRequiredFieldError,
+    RowCreationNotSupportedError,
     TableNotFoundError,
+    create_row,
     get_spec,
     list_rows,
     update_row,
@@ -65,6 +69,7 @@ def get_backend(request: Request) -> _Backend:
 class ColumnView(BaseModel):
     name: str
     editable: bool
+    creatable: bool
     kind: str
 
 
@@ -74,6 +79,7 @@ class TableMeta(BaseModel):
     pk: str
     columns: list[ColumnView]
     searchable: list[str]
+    create_required: list[str]
 
 
 class TableListResponse(BaseModel):
@@ -89,9 +95,10 @@ def _table_meta(name: str) -> TableMeta:
     spec = TABLE_REGISTRY[name]
     return TableMeta(
         name=spec.name, label=spec.label, pk=spec.pk,
-        columns=[ColumnView(name=c.name, editable=c.editable, kind=c.kind)
+        columns=[ColumnView(name=c.name, editable=c.editable, creatable=c.creatable, kind=c.kind)
                 for c in spec.columns],
         searchable=list(spec.searchable),
+        create_required=list(spec.create_required),
     )
 
 
@@ -131,4 +138,20 @@ def patch_row(table: str, pk: int, payload: dict[str, Any],
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/tables/{table}/rows", status_code=201)
+def post_row(table: str, payload: dict[str, Any],
+             backend: _Backend = Depends(get_backend)) -> dict[str, Any]:
+    try:
+        spec = get_spec(table)
+    except TableNotFoundError:
+        raise HTTPException(status_code=404, detail=f"未登録のテーブル: {table}") from None
+    try:
+        return create_row(backend.db, backend.lock, spec, payload)
+    except DuplicateRowError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except (RowCreationNotSupportedError, ColumnNotEditableError,
+            MissingRequiredFieldError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

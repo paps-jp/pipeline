@@ -1,6 +1,8 @@
 import {
+  Button,
   Group,
   Loader,
+  Modal,
   NumberInput,
   Pagination,
   Paper,
@@ -10,8 +12,9 @@ import {
   Text,
   TextInput,
 } from "@mantine/core";
-import { useDebouncedValue } from "@mantine/hooks";
-import { IconSearch } from "@tabler/icons-react";
+import { useDebouncedValue, useDisclosure } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
+import { IconPlus, IconSearch } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -66,6 +69,92 @@ function EditableCell({
   );
 }
 
+/** 新規追加フォーム。 creatable な列だけを出す (id/next_no 等は defaults 側で埋まる)。 */
+function CreateRowModal({
+  meta,
+  opened,
+  onClose,
+  onCreated,
+}: {
+  meta: MariadbTableMeta;
+  opened: boolean;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const { t } = useTranslation();
+  const creatableColumns = meta.columns.filter((c) => c.creatable);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+
+  const createMutation = useMutation({
+    mutationFn: () => {
+      const fields: Record<string, unknown> = {};
+      for (const c of creatableColumns) {
+        const v = draft[c.name];
+        if (v === undefined || v === "") continue;
+        fields[c.name] = c.kind === "int" ? Number(v) : v;
+      }
+      return mariadbTablesApi.createRow(meta.name, fields);
+    },
+    onSuccess: () => {
+      setDraft({});
+      onCreated();
+      onClose();
+      notifications.show({
+        color: "teal",
+        message: t("mariadbTables.created", "新規追加しました"),
+      });
+    },
+    onError: (e: unknown) => {
+      notifications.show({ color: "red", message: String(e) });
+    },
+  });
+
+  const missingRequired = meta.create_required.filter((name) => !draft[name]?.trim());
+
+  return (
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title={t("mariadbTables.create_title", { defaultValue: "{{label}} を新規追加", label: meta.label })}
+    >
+      <Stack gap="sm">
+        {creatableColumns.map((c) => {
+          const required = meta.create_required.includes(c.name);
+          const label = required ? `${c.name} *` : c.name;
+          return c.kind === "int" ? (
+            <NumberInput
+              key={c.name}
+              label={label}
+              value={draft[c.name] ?? ""}
+              onChange={(v) => setDraft((d) => ({ ...d, [c.name]: v === "" ? "" : String(v) }))}
+            />
+          ) : (
+            <TextInput
+              key={c.name}
+              label={label}
+              value={draft[c.name] ?? ""}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, [c.name]: e.currentTarget.value }))}
+            />
+          );
+        })}
+        <Group justify="flex-end" mt="xs">
+          <Button variant="subtle" onClick={onClose}>
+            {t("mariadbTables.cancel", "キャンセル")}
+          </Button>
+          <Button
+            disabled={missingRequired.length > 0}
+            loading={createMutation.isPending}
+            onClick={() => createMutation.mutate()}
+          >
+            {t("mariadbTables.create_submit", "追加")}
+          </Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
+
 function TableView({ meta }: { meta: MariadbTableMeta }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -73,8 +162,10 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
   const [debouncedQ] = useDebouncedValue(q, 300);
   const [enabledFilter, setEnabledFilter] = useState<number | "">("");
   const [page, setPage] = useState(1);
+  const [createOpened, { open: openCreate, close: closeCreate }] = useDisclosure(false);
 
   const hasEnabledColumn = meta.columns.some((c) => c.name === "enabled");
+  const isCreatable = meta.columns.some((c) => c.creatable);
 
   const rowsQ = useQuery({
     queryKey: ["mariadb-rows", meta.name, debouncedQ, enabledFilter, page],
@@ -95,9 +186,10 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
       qc.invalidateQueries({ queryKey: ["mariadb-rows", meta.name] });
     },
     onError: (e: unknown) => {
-      // eslint-disable-next-line no-console
-      console.error(e);
-      window.alert(t("mariadbTables.save_failed", { defaultValue: "保存に失敗しました: {{msg}}", msg: String(e) }));
+      notifications.show({
+        color: "red",
+        message: t("mariadbTables.save_failed", { defaultValue: "保存に失敗しました: {{msg}}", msg: String(e) }),
+      });
     },
   });
 
@@ -139,7 +231,19 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
           {t("mariadbTables.total", { defaultValue: "{{n}} 件", n: total })}
         </Text>
         {rowsQ.isFetching && <Loader size="xs" />}
+        {isCreatable && (
+          <Button size="xs" leftSection={<IconPlus size={14} />} ml="auto" onClick={openCreate}>
+            {t("mariadbTables.create_button", "新規追加")}
+          </Button>
+        )}
       </Group>
+
+      <CreateRowModal
+        meta={meta}
+        opened={createOpened}
+        onClose={closeCreate}
+        onCreated={() => qc.invalidateQueries({ queryKey: ["mariadb-rows", meta.name] })}
+      />
 
       {rowsQ.error && <ErrorState error={rowsQ.error} onRetry={() => rowsQ.refetch()} />}
 
