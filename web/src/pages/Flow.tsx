@@ -177,6 +177,20 @@ function relTime(iso: string | null | undefined): string {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
+// last_output.watermark (= image-pull 等の自己 tick カーソル位置) と現在時刻の差を
+// 時間単位で返す。 バックログ処理中の workload はここが実時刻より大きく遅れる
+// (= 「何時間前の hub 結果を処理しているか」)。 SQLite 由来の値は
+// "2026-08-25 07:36:33.899000+00:00" のようにスペース区切りで来ることがあり、
+// 一部ブラウザの Date parser がそのままでは解釈できないため "T" 区切りに正規化する。
+function backlogAgeHours(watermark: unknown): number | null {
+  if (typeof watermark !== "string" || !watermark) return null;
+  const normalized = watermark.includes("T") ? watermark : watermark.replace(" ", "T");
+  const t = new Date(normalized).getTime();
+  if (!Number.isFinite(t)) return null;
+  const h = (Date.now() - t) / 3_600_000;
+  return h >= 0 ? h : null;
+}
+
 // ---------- カスタムノード ----------
 
 // 接続されていない handle は完全に消す (= dot 残骸を出さない)。
@@ -315,6 +329,7 @@ function WorkloadNode({
   const label = t(STATE_KEY[data.state ?? "idle"]);
   const nodeLabel = useNodeLabel(data);
   const adapt = (data.adapt ?? {}) as Record<string, number>;
+  const backlogH = backlogAgeHours(data.last_output?.watermark);
   const active = useMemo(() => new Set(data.activeHandles ?? []), [data.activeHandles]);
   // theme-aware 色: dark = 工業 / light = やさしいパステル白系
   const cardBg = isLight
@@ -388,6 +403,16 @@ function WorkloadNode({
             {fmtNum(data.throughput_per_min)}{t("flow.per_min")}
           </Text>
         </Group>
+        {data.raw_throughput_per_min != null && (
+          <Group gap={4} wrap="nowrap">
+            <Tooltip label={t("flow.tip_raw_throughput")}>
+              <Text size="xs" c="dimmed">{t("flow.raw_throughput")}</Text>
+            </Tooltip>
+            <Text size="xs" fw={600} c="dimmed" style={{ fontFamily: "ui-monospace, monospace" }}>
+              {fmtNum(data.raw_throughput_per_min)}{t("flow.per_min")}
+            </Text>
+          </Group>
+        )}
         {data.submitted_window_min !== undefined && (
           <Group gap={4} wrap="nowrap">
             <Text size="xs" c="dimmed">{t("flow.submitted", "投入")}</Text>
@@ -423,6 +448,20 @@ function WorkloadNode({
                 <Badge size="xs" variant="light" color="indigo">🧵 {adapt.hard_cap_eff}</Badge>
               </Tooltip>
             )}
+          </Group>
+        )}
+        {backlogH !== null && backlogH >= 0.05 && (
+          <Group gap={6} wrap="wrap">
+            <Tooltip label={t("flow.tip_backlog_age")}>
+              <Badge
+                size="xs"
+                variant="light"
+                color={backlogH >= 6 ? "red" : backlogH >= 2 ? "orange" : "gray"}
+              >
+                🕰 {backlogH < 1 ? `${Math.round(backlogH * 60)}m` : `${backlogH.toFixed(1)}h`}
+                {t("flow.backlog_age_suffix", "遅れ")}
+              </Badge>
+            </Tooltip>
           </Group>
         )}
       </Stack>

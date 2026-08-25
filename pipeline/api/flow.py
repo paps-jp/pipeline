@@ -62,6 +62,9 @@ class FlowNode(BaseModel):
     url: str | None = None
     state: str | None = None
     throughput_per_min: float | None = None
+    # 重複排除前の実件数/分 (2026-08-25)。 RAW_METRIC_FIELDS 宣言 slug のみ付く
+    # (= 現状 paprika-image-pull のみ)。 未宣言 slug は常に None (= UI 非表示)。
+    raw_throughput_per_min: float | None = None
     last_run_at: str | None = None
     last_output: dict[str, Any] | None = None
     adapt: dict[str, Any] | None = None
@@ -1026,6 +1029,7 @@ def snapshot(req: Request) -> FlowSnapshot:
 
     rt_items_1m = _avg_1m("items_per_min")
     rt_runs_1m = _avg_1m("runs_per_min")
+    rt_raw_items_1m = _avg_1m("raw_items_per_min")
     # paprika-job-submit は hub の「直近60秒に queued→running へ遷移した数」で置換する
     # (server の _hub_submit_rate_loop が 30s 毎に upsert)。 submitted 件数は
     # failed_other(hub timeout)/adopted のノイズを含み legacy fleet 分も欠くため。
@@ -1135,6 +1139,11 @@ def snapshot(req: Request) -> FlowSnapshot:
                         or rate_by_slug.get(slug)
                         or throughput_by_slug.get(slug, 0.0)
                     )
+                # 重複排除前の実件数/分 (RAW_METRIC_FIELDS 宣言 slug のみ)。 バケットが
+                # 無い長tick直後は None のままにし、 UI 側で「表示しない」 に倒す
+                # (throughput_per_min のような多段フォールバックは今のところ不要 —
+                # 未宣言 slug は元々出さない値なので 0 に埋めると誤解を招く)。
+                node.raw_throughput_per_min = rt_raw_items_1m.get(slug)
                 fin = r.get("finished_at")
                 if not fin:
                     # 現 run が進行中(未完了)なら、 最後に完了した tick の finished_at を出す
@@ -1142,6 +1151,12 @@ def snapshot(req: Request) -> FlowSnapshot:
                 if fin:
                     node.last_run_at = fin.isoformat() if hasattr(fin, "isoformat") else str(fin)
                 node.last_output = r.get("output_json")
+                if not isinstance(node.last_output, dict):
+                    # 現 run が進行中(未完了)で output_json が無い場合、 last_run_at と
+                    # 同じく最後に完了した tick の output_json にフォールバック
+                    # (image-pull 等の interval_s が短い self_loop は常に進行中に
+                    # 見えてしまい、 adapt バッジ/watermark が出せなくなるため)。
+                    node.last_output = (last_completed_by_slug.get(slug) or {}).get("output_json")
                 if isinstance(node.last_output, dict):
                     a = node.last_output.get("adapt")
                     if isinstance(a, dict):
@@ -1160,6 +1175,7 @@ def snapshot(req: Request) -> FlowSnapshot:
             if slug in disabled_slugs:
                 node.state = "idle"
                 node.throughput_per_min = 0.0
+                node.raw_throughput_per_min = 0.0
         elif node.kind == "tank":
             v, err = tank_results.get(node.id, (None, "no metric"))
             node.pending = v

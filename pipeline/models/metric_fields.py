@@ -47,3 +47,18 @@ WORKLOAD_METRIC_FIELDS: dict[str, list[str]] = {
 def metric_fields_for(slug: str) -> list[str]:
     """slug の宣言 fields を返す (= 未宣言なら空 list)。"""
     return WORKLOAD_METRIC_FIELDS.get(slug, [])
+
+
+# slug → 「重複排除前」 の実件数として SUM すべき field 名のリスト (2026-08-25)。
+# WORKLOAD_METRIC_FIELDS (= dedup 後の inserted 等) とは別集計で、
+# flow_rate_1m に metric="raw_items_per_min" として書く。 宣言した slug だけ
+# flow snapshot の node に raw_throughput_per_min が付く。
+RAW_METRIC_FIELDS: dict[str, list[str]] = {
+    # crawl_image dedup (known_urls 判定) 前の候補数 = inserted + dup。
+    "paprika-image-pull": ["seen"],
+}
+
+
+def raw_metric_fields_for(slug: str) -> list[str]:
+    """slug の「重複排除前」 宣言 fields を返す (= 未宣言なら空 list)。"""
+    return RAW_METRIC_FIELDS.get(slug, [])
