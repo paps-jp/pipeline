@@ -25,8 +25,10 @@ from pipeline.db.mariadb_admin import (
     DuplicateRowError,
     MissingRequiredFieldError,
     RowCreationNotSupportedError,
+    RowDeletionNotSupportedError,
     TableNotFoundError,
     create_row,
+    delete_row,
     get_spec,
     list_rows,
     update_row,
@@ -80,6 +82,9 @@ class TableMeta(BaseModel):
     columns: list[ColumnView]
     searchable: list[str]
     create_required: list[str]
+    deletable: bool
+    soft_delete_column: str | None
+    soft_delete_value: Any = None
 
 
 class TableListResponse(BaseModel):
@@ -99,6 +104,9 @@ def _table_meta(name: str) -> TableMeta:
                 for c in spec.columns],
         searchable=list(spec.searchable),
         create_required=list(spec.create_required),
+        deletable=spec.deletable,
+        soft_delete_column=spec.soft_delete_column,
+        soft_delete_value=spec.soft_delete_value,
     )
 
 
@@ -155,3 +163,24 @@ def post_row(table: str, payload: dict[str, Any],
     except (RowCreationNotSupportedError, ColumnNotEditableError,
             MissingRequiredFieldError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.delete("/tables/{table}/rows/{pk}")
+def delete_row_endpoint(table: str, pk: int,
+                        backend: _Backend = Depends(get_backend)) -> dict[str, Any]:
+    """deletable なテーブルは本当に DELETE、 soft_delete_column 設定があるテーブルは
+    その列を固定値に書き換える (crawl_config は enabled=99 = 恒久除外)。
+    """
+    try:
+        spec = get_spec(table)
+    except TableNotFoundError:
+        raise HTTPException(status_code=404, detail=f"未登録のテーブル: {table}") from None
+    try:
+        row = delete_row(backend.db, backend.lock, spec, pk)
+    except RowDeletionNotSupportedError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    if row is not None:
+        return row
+    return {"deleted": True, "id": pk}

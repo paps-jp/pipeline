@@ -39,6 +39,15 @@ class TableSpec:
     # 同じ罠を admin 画面からの手動追加でも踏まないため)。
     seed_table: str | None = None
     seed_columns: dict[str, str] | None = None         # {このテーブルの列: seed_table の列}
+    # ---- 削除 (delete) ----
+    # 本当に DELETE FROM してよいテーブルだけ deletable=True にする。 crawl_config の
+    # ように他テーブル (crawl_image/crawl_video 等) から site を参照されうる行は
+    # 孤児データを残すので対象外。 その代わり soft_delete_* で「削除」を固定値の
+    # UPDATE に読み替える (crawl_config は enabled=99 が既存運用の恒久除外と同じ意味、
+    # 2026-08-25 実測で 23 件が既にこの値)。
+    deletable: bool = False
+    soft_delete_column: str | None = None
+    soft_delete_value: Any = None
 
     def column(self, name: str) -> ColumnSpec | None:
         return next((c for c in self.columns if c.name == name), None)
@@ -79,6 +88,10 @@ TABLE_REGISTRY: dict[str, TableSpec] = {
         # の docstring 参照)。 admin から手動追加するときも同じ種まきをする。
         seed_table="crawl",
         seed_columns={"site": "site", "url": "url"},
+        # 「削除」= enabled=99 (恒久除外) への変更。 crawl_image 等が site を参照
+        # したままになりうるので本当の DELETE はしない。
+        soft_delete_column="enabled",
+        soft_delete_value=99,
     ),
     "host_import_queue": TableSpec(
         name="host_import_queue", label="取り込み候補キュー", pk="id",
@@ -95,6 +108,8 @@ TABLE_REGISTRY: dict[str, TableSpec] = {
         ],
         searchable=("domain", "status", "last_error_type"),
         # 全列 editable=False (今回は可視化のみ: classify がなぜ skip したか追える)
+        # 他テーブルから参照されない使い捨てデータなので本当の DELETE で問題ない。
+        deletable=True,
     ),
 }
 
@@ -116,6 +131,10 @@ class MissingRequiredFieldError(ValueError):
 
 
 class DuplicateRowError(ValueError):
+    pass
+
+
+class RowDeletionNotSupportedError(ValueError):
     pass
 
 
@@ -269,3 +288,26 @@ def create_row(db: Any, lock: threading.Lock, spec: TableSpec,
         finally:
             cur.close()
     return dict(zip(all_col_names, row))
+
+
+def delete_row(db: Any, lock: threading.Lock, spec: TableSpec,
+                pk_value: Any) -> dict[str, Any] | None:
+    """行を削除する。 soft_delete_column 設定があれば本当の DELETE はせず、
+    その列を固定値に書き換える UPDATE として扱う (更新後の行を返す)。
+    deletable でも soft_delete でもないテーブルは拒否する。
+    """
+    if spec.soft_delete_column is not None:
+        return update_row(db, lock, spec, pk_value,
+                          {spec.soft_delete_column: spec.soft_delete_value})
+    if not spec.deletable:
+        raise RowDeletionNotSupportedError(f"{spec.name} は削除に対応していません")
+
+    with lock:
+        db.ping()
+        cur = db.execute(
+            f"DELETE FROM {spec.name} WHERE {spec.pk} = %s", (pk_value,))
+        rowcount = cur.rowcount
+        cur.close()
+    if not rowcount:
+        raise KeyError(f"{spec.name}.{spec.pk}={pk_value} が見つかりません")
+    return None

@@ -671,6 +671,11 @@ export interface MariadbTableMeta {
   columns: MariadbColumn[];
   searchable: string[];
   create_required: string[];
+  /** true = DELETE で行そのものを消せる。false でも soft_delete_column があれば
+   *  「削除」操作自体は可能 (実体はその列への固定値 UPDATE)。 */
+  deletable: boolean;
+  soft_delete_column: string | null;
+  soft_delete_value: unknown;
 }
 
 export interface MariadbRowsResponse {
@@ -703,6 +708,11 @@ export const mariadbTablesApi = {
     request<Record<string, unknown>>(
       `/api/v1/mariadb-tables/tables/${encodeURIComponent(table)}/rows`,
       { method: "POST", json: fields },
+    ),
+  deleteRow: (table: string, pk: number) =>
+    request<Record<string, unknown>>(
+      `/api/v1/mariadb-tables/tables/${encodeURIComponent(table)}/rows/${pk}`,
+      { method: "DELETE" },
     ),
 };
 

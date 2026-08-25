@@ -1,5 +1,7 @@
 import {
+  ActionIcon,
   Button,
+  Code,
   Group,
   Loader,
   Modal,
@@ -11,10 +13,12 @@ import {
   Table,
   Text,
   TextInput,
+  Tooltip,
 } from "@mantine/core";
 import { useDebouncedValue, useDisclosure } from "@mantine/hooks";
+import { modals } from "@mantine/modals";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconSearch } from "@tabler/icons-react";
+import { IconPlus, IconSearch, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -171,6 +175,7 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
 
   const hasEnabledColumn = meta.columns.some((c) => c.name === "enabled");
   const isCreatable = meta.columns.some((c) => c.creatable);
+  const isDeletable = meta.deletable || Boolean(meta.soft_delete_column);
 
   const rowsQ = useQuery({
     queryKey: ["mariadb-rows", meta.name, debouncedQ, enabledFilter, page],
@@ -197,6 +202,54 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
       });
     },
   });
+
+  const deleteMutation = useMutation({
+    mutationFn: (pk: number) => mariadbTablesApi.deleteRow(meta.name, pk),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["mariadb-rows", meta.name] });
+      notifications.show({
+        color: "teal",
+        message: meta.deletable
+          ? t("mariadbTables.deleted", "削除しました")
+          : t("mariadbTables.disabled", "無効化しました"),
+      });
+    },
+    onError: (e: unknown) => {
+      notifications.show({ color: "red", message: String(e) });
+    },
+  });
+
+  const askDelete = (pk: number, row: Record<string, unknown>) => {
+    const identifier = String(row.site ?? row.domain ?? row[meta.pk] ?? pk);
+    modals.openConfirmModal({
+      title: meta.deletable
+        ? t("mariadbTables.delete_title", "削除しますか")
+        : t("mariadbTables.disable_title", "無効化しますか"),
+      children: (
+        <Text size="sm">
+          {meta.deletable ? (
+            <>
+              <Code>{identifier}</Code>{" "}
+              {t("mariadbTables.delete_body", "を完全に削除します。この操作は元に戻せません。")}
+            </>
+          ) : (
+            <>
+              <Code>{identifier}</Code> の <Code>{meta.soft_delete_column}</Code> を{" "}
+              <Code>{String(meta.soft_delete_value)}</Code>{" "}
+              {t("mariadbTables.disable_body",
+                "に変更します(行自体は残り、後から編集で元に戻せます)。")}
+            </>
+          )}
+        </Text>
+      ),
+      labels: {
+        confirm: meta.deletable ? t("mariadbTables.delete_confirm", "削除") : t("mariadbTables.disable_confirm", "無効化"),
+        cancel: t("mariadbTables.cancel", "キャンセル"),
+      },
+      confirmProps: { color: "red" },
+      onConfirm: () => deleteMutation.mutate(pk),
+    });
+  };
 
   const rows = rowsQ.data?.rows ?? [];
   const total = rowsQ.data?.total ?? 0;
@@ -259,7 +312,7 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
       {!rowsQ.error && (rows.length > 0 || rowsQ.isLoading) && (
         <Paper withBorder style={{ overflowX: "auto" }}>
           {rowsQ.isLoading ? (
-            <TableSkeleton rows={8} cols={meta.columns.length} />
+            <TableSkeleton rows={8} cols={meta.columns.length + (isDeletable ? 1 : 0)} />
           ) : (
             <Table striped highlightOnHover withTableBorder stickyHeader>
               <Table.Thead>
@@ -267,6 +320,7 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
                   {meta.columns.map((c) => (
                     <Table.Th key={c.name}>{c.name}</Table.Th>
                   ))}
+                  {isDeletable && <Table.Th style={{ width: 60 }} />}
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -293,6 +347,24 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
                           )}
                         </Table.Td>
                       ))}
+                      {isDeletable && (
+                        <Table.Td>
+                          <Tooltip
+                            label={meta.deletable
+                              ? t("mariadbTables.delete_confirm", "削除")
+                              : t("mariadbTables.disable_confirm", "無効化")}
+                          >
+                            <ActionIcon
+                              size="sm"
+                              color="red"
+                              variant="subtle"
+                              onClick={() => askDelete(pk, row)}
+                            >
+                              <IconTrash size={14} />
+                            </ActionIcon>
+                          </Tooltip>
+                        </Table.Td>
+                      )}
                     </Table.Tr>
                   );
                 })}
