@@ -201,24 +201,32 @@ class PipelineClient:
 
     # ---------------- 画像 ----------------
 
-    def upload_image(self, path: str | Path, *, source_url: str | None = None) -> CreateResult:
+    def upload_image(self, path: str | Path, *, source_url: str | None = None,
+                     page_url: str | None = None) -> CreateResult:
         """ローカルの画像ファイルを 1 枚投入する。
 
         `source_url` を渡すとその URL で dedup される (既存クローラーが取得済みの
-        同一 URL と自然に重複排除される)。
+        同一 URL と自然に重複排除される)。 `page_url` は出所ページ URL の記録用 (任意)。
         """
         p = Path(path)
         content = p.read_bytes()
         ctype = mimetypes.guess_type(p.name)[0] or "image/jpeg"
-        body, hdr = _encode_multipart({"url": source_url} if source_url else {},
-                                      "file", p.name, content, ctype)
+        fields = {}
+        if source_url:
+            fields["url"] = source_url
+        if page_url:
+            fields["page_url"] = page_url
+        body, hdr = _encode_multipart(fields, "file", p.name, content, ctype)
         return CreateResult.from_dict(
             self._request("POST", "/api/v1/create/images", data=body, content_type=hdr))
 
-    def create_image_urls(self, urls: list[str]) -> CreateResult:
+    def create_image_urls(self, urls: list[str], *, page_url: str | None = None) -> CreateResult:
         """URL から画像を取得して投入する (1 リクエスト最大 100 件)。"""
+        payload: dict[str, Any] = {"urls": list(urls)}
+        if page_url:
+            payload["page_url"] = page_url
         return CreateResult.from_dict(
-            self._post_json("/api/v1/create/images/url", {"urls": list(urls)}))
+            self._post_json("/api/v1/create/images/url", payload))
 
     def image_status(self, image_id: int) -> dict:
         return self._request("GET", f"/api/v1/create/images/{int(image_id)}")
@@ -337,11 +345,13 @@ def main() -> int:
     p = sub.add_parser("image", help="画像ファイルを投入")
     p.add_argument("paths", nargs="+")
     p.add_argument("--source-url", help="出所 URL (dedup に使われる)")
+    p.add_argument("--page-url", help="出所ページ URL (記録用)")
     p.add_argument("--wait", action="store_true", help="embedding 完了まで待つ")
     p.add_argument("--timeout", type=float, default=3600.0)
 
     p = sub.add_parser("image-url", help="URL から画像を投入")
     p.add_argument("urls", nargs="+")
+    p.add_argument("--page-url", help="出所ページ URL (記録用)")
 
     p = sub.add_parser("video", help="動画ファイルを投入")
     p.add_argument("paths", nargs="+")
@@ -366,7 +376,8 @@ def main() -> int:
             _print(c.limits())
         elif args.cmd == "image":
             for path in args.paths:
-                r = c.upload_image(path, source_url=args.source_url)
+                r = c.upload_image(path, source_url=args.source_url,
+                                   page_url=args.page_url)
                 print(f"== {path}")
                 _show_result(r)
                 if args.wait and r.ids:
@@ -376,7 +387,7 @@ def main() -> int:
                         print(f"    face_id={f['face_id']} embedded={f['embedded']} "
                               f"norm={f.get('adaface_norm')} ready={f['adaface_ready']}")
         elif args.cmd == "image-url":
-            _show_result(c.create_image_urls(args.urls))
+            _show_result(c.create_image_urls(args.urls, page_url=args.page_url))
         elif args.cmd == "video":
             for path in args.paths:
                 r = c.upload_video(path, source_url=args.source_url,

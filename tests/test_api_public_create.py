@@ -28,10 +28,11 @@ class FakeBackend:
         self.fail_with: CreateError | None = None
         self._next = 1000
 
-    def create_image(self, *, data, url, site, ext):
+    def create_image(self, *, data, url, site, ext, page_url=None):
         if self.fail_with:
             raise self.fail_with
-        self.images.append({"bytes": len(data), "url": url, "site": site, "ext": ext})
+        self.images.append({"bytes": len(data), "url": url, "site": site, "ext": ext,
+                            "page_url": page_url})
         self._next += 1
         return CreateResult(self._next, "image", dedup=False, state="queued")
 
@@ -140,7 +141,21 @@ def test_upload_image(client: TestClient) -> None:
 
         be = client.app.state.create_backend
         assert be.images == [{"bytes": len(JPEG), "url": None,
-                              "site": "create-acme", "ext": "jpg"}]
+                              "site": "create-acme", "ext": "jpg", "page_url": None}]
+
+
+def test_upload_image_records_page_url(client: TestClient) -> None:
+    with client:
+        key = _issue_key(client)
+        r = client.post("/api/v1/create/images",
+                        headers=_auth(key),
+                        files={"file": ("a.jpg", io.BytesIO(JPEG), "image/jpeg")},
+                        data={"url": "https://example.com/a.jpg",
+                              "page_url": "https://example.com/gallery/1"})
+        assert r.status_code == 201, r.text
+        img = client.app.state.create_backend.images[0]
+        assert img["url"] == "https://example.com/a.jpg"
+        assert img["page_url"] == "https://example.com/gallery/1"
 
 
 def test_upload_png_is_sniffed_not_trusted_from_name(client: TestClient) -> None:

@@ -147,21 +147,23 @@ curl -sS -X DELETE http://localhost:8001/api/v1/api-keys/a1b2c3d4e5f6
 |---|---|---|
 | `file` | ○ | 画像本体 |
 | `url` | | 出所 URL。指定すると URL でも重複排除される |
+| `page_url` | | 出所ページ URL（記録用・dedup には使わない） |
 
 ```bash
 curl -X POST http://localhost:8001/api/v1/create/images \
   -H "Authorization: Bearer $KEY" \
   -F 'file=@photo.jpg' \
-  -F 'url=https://example.com/photo.jpg'
+  -F 'url=https://example.com/photo.jpg' \
+  -F 'page_url=https://example.com/gallery/1'
 ```
 
 ### POST /api/v1/create/images/url
 
 ```json
-{ "urls": ["https://example.com/a.jpg", "https://example.com/b.jpg"] }
+{ "urls": ["https://example.com/a.jpg", "https://example.com/b.jpg"], "page_url": "https://example.com/gallery/1" }
 ```
 
-単数なら `{"url": "..."}` でも可。サーバ側が取得するので、**内部アドレス（10.x など）は拒否されます**。
+単数なら `{"url": "..."}` でも可。`page_url`（出所ページ・記録用）も任意で渡せます。サーバ側が取得するので、**内部アドレス（10.x など）は拒否されます**。
 
 ### 投入系の共通応答
 
@@ -202,6 +204,7 @@ curl -sS -H "Authorization: Bearer $KEY" \
   "state": "hashed",
   "downloaded_at": "2026-07-30 09:02:56",
   "ignore_reason": null,
+  "page_url": "https://example.com/gallery/1",
   "faces": [
     {
       "face_id": 87795528,
@@ -348,8 +351,8 @@ python pipeline_client.py status 125309008
 | メソッド | 戻り値 | 説明 |
 |---|---|---|
 | `limits()` | `dict` | 上限と残クォータ |
-| `upload_image(path, *, source_url=None)` | `CreateResult` | 画像ファイルを投入 |
-| `create_image_urls(urls)` | `CreateResult` | 画像 URL をまとめて投入（最大 100 件） |
+| `upload_image(path, *, source_url=None, page_url=None)` | `CreateResult` | 画像ファイルを投入 |
+| `create_image_urls(urls, *, page_url=None)` | `CreateResult` | 画像 URL をまとめて投入（最大 100 件） |
 | `image_status(image_id)` | `dict` | 画像の進行状況 |
 | `upload_video(path, *, source_url=None, page_url=None)` | `CreateResult` | 動画ファイルを投入 |
 | `create_video_urls(urls, *, page_url=None)` | `CreateResult` | 動画 URL を投入 |

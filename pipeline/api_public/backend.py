@@ -195,14 +195,20 @@ class CreateBackend:
         return int(rows[0][0]) if rows else None
 
     def _insert_image(self, store_url: str, site: str, file_no: int,
-                      sha: bytes, ext: str | None) -> int | None:
-        """crawl_image INSERT。 1062 (= 重複) は None。 それ以外は送出。"""
+                      sha: bytes, ext: str | None,
+                      page_url: str | None = None) -> int | None:
+        """crawl_image INSERT。 1062 (= 重複) は None。 それ以外は送出。
+
+        page_url は出所ページ URL の記録用 (crawl_video と同じ varchar(2048))。 画像経路の
+        下流 (hash → face → embed) はこの列を見ないので、 純粋にプロベナンス保存のための列。
+        """
         try:
             _, last = self._x(
                 "INSERT INTO crawl_image "
-                "(url, crawl_ids, site, file_no, ext, download_status, data_sha256) "
-                "VALUES (%s, '0', %s, %s, %s, 'processing', %s)",
-                (store_url, site, file_no, (ext or "")[:6] or None, sha),
+                "(url, crawl_ids, site, file_no, ext, download_status, data_sha256, page_url) "
+                "VALUES (%s, '0', %s, %s, %s, 'processing', %s, %s)",
+                (store_url, site, file_no, (ext or "")[:6] or None, sha,
+                 (page_url or "")[:2048] or None),
             )
             if not last:
                 # lastrowid が取れないと MinIO キーを組めない (= 実体の置き場が決まらない)。
@@ -214,7 +220,7 @@ class CreateBackend:
             raise
 
     def create_image(self, *, data: bytes, url: str | None, site: str,
-                     ext: str | None) -> CreateResult:
+                     ext: str | None, page_url: str | None = None) -> CreateResult:
         sha = hashlib.sha256(data).digest()
         # アップロードには URL が無いが url_sha256 が UNIQUE なので合成する。 URL 投入時は
         # 実 URL をそのまま入れる → 既存クローラーが取った同じ URL と自然に dedup される。
@@ -231,7 +237,7 @@ class CreateBackend:
             # ないので、 file_no を採番し直して retry する。 内容重複なら再 SELECT で当たる。
             for _ in range(3):
                 file_no = self._next_file_no(site)
-                image_id = self._insert_image(store_url, site, file_no, sha, ext)
+                image_id = self._insert_image(store_url, site, file_no, sha, ext, page_url)
                 if image_id is not None:
                     break
                 existing = self._find_image(store_url, sha)
@@ -279,7 +285,8 @@ class CreateBackend:
         with self._lock:
             self._alive()
             rows = self._q(
-                "SELECT id, site, url, hash_id, download_status, downloaded_at, ignore_reason "
+                "SELECT id, site, url, hash_id, download_status, downloaded_at, ignore_reason, "
+                "       page_url "
                 "FROM crawl_image WHERE id=%s", (image_id,))
             if not rows:
                 return None
@@ -293,6 +300,7 @@ class CreateBackend:
             "download_status": r[4],
             "downloaded_at": str(r[5]) if r[5] else None,
             "ignore_reason": r[6],
+            "page_url": r[7],
             "state": _image_state(r),
             "faces": faces,
         }

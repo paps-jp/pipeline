@@ -191,6 +191,21 @@ def test_real_url_is_stored_verbatim(be: CreateBackend) -> None:
     assert params[0] == "https://example.com/a.jpg"
 
 
+def test_page_url_is_stored_when_given(be: CreateBackend) -> None:
+    be.create_image(data=JPEG, url="https://example.com/a.jpg", site="s", ext="jpg",
+                    page_url="https://example.com/gallery/1")
+    sql, params = be.db.find("INSERT INTO crawl_image")
+    assert "page_url" in sql
+    assert params[-1] == "https://example.com/gallery/1"
+
+
+def test_page_url_defaults_to_null(be: CreateBackend) -> None:
+    be.create_image(data=JPEG, url=None, site="s", ext="jpg")
+    _, params = be.db.find("INSERT INTO crawl_image")
+    # 未指定なら空文字でなく NULL を入れる (crawl_video.page_url と同じ扱い)
+    assert params[-1] is None
+
+
 def test_dedup_short_circuits_before_insert(be: CreateBackend) -> None:
     be.db.existing_image = 42
     r = be.create_image(data=JPEG, url=None, site="s", ext="jpg")

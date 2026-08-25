@@ -72,7 +72,7 @@ def get_backend(request: Request) -> CreateBackend:
 class UrlCreateRequest(BaseModel):
     url: str | None = Field(None, description="単一 URL")
     urls: list[str] | None = Field(None, description="複数 URL (最大 100)")
-    page_url: str | None = Field(None, description="出所ページ URL (任意・動画のみ利用)")
+    page_url: str | None = Field(None, description="出所ページ URL (任意)")
 
     def targets(self) -> list[str]:
         out = [u.strip() for u in ([self.url] if self.url else []) + (self.urls or []) if u and u.strip()]
@@ -123,7 +123,7 @@ def _one(be: CreateBackend, *, kind: str, data: bytes, url: str | None,
                             detail=f"{kind} として判別できない先頭バイト")
     try:
         if kind == "image":
-            r = be.create_image(data=data, url=url, site=site, ext=sniffed)
+            r = be.create_image(data=data, url=url, site=site, ext=sniffed, page_url=page_url)
         else:
             r = be.create_video(data=data, url=url, site=site, ext=sniffed,
                                 mime=mime, page_url=page_url)
@@ -171,13 +171,14 @@ def create_image_file(
     principal: Annotated[dict, Depends(require_api_key)],
     file: Annotated[UploadFile, File(description="画像ファイル")],
     url: Annotated[str | None, Form(description="出所 URL (任意・dedup に使われる)")] = None,
+    page_url: Annotated[str | None, Form(description="出所ページ URL (任意)")] = None,
 ) -> CreateResponse:
     """multipart で画像ファイルを 1 枚投入する。"""
     be = get_backend(request)
     consume_quota(principal["id"])
     site = site_for(principal["user_slug"])
     data = file.file.read(MAX_IMAGE_BYTES + 1)
-    item = _one(be, kind="image", data=data, url=url, site=site, ext=None)
+    item = _one(be, kind="image", data=data, url=url, site=site, ext=None, page_url=page_url)
     return _summarize([item])
 
 
@@ -193,7 +194,7 @@ def create_image_urls(
     urls = body.targets()
     consume_quota(principal["id"], len(urls))
     site = site_for(principal["user_slug"])
-    return _summarize(_create_urls(be, urls, kind="image", site=site, page_url=None))
+    return _summarize(_create_urls(be, urls, kind="image", site=site, page_url=body.page_url))
 
 
 @router.get("/images/{image_id}")

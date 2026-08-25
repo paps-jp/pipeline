@@ -25,11 +25,13 @@ revoke_key() { curl -sS -X DELETE "${BASE}/api/v1/api-keys/$1" -o /dev/null -w '
 limits() { curl -sS "${AUTH[@]}" "${BASE}/api/v1/create/limits"; }
 
 # ---------------------------------------------------------------- 画像
-# ファイルを 1 枚。 -F file=@... が本体、 url= は任意 (dedup 用の出所 URL)。
+# ファイルを 1 枚。 -F file=@... が本体、 url= は任意 (dedup 用の出所 URL)、
+# page_url= は任意 (出所ページ URL・記録用)。
 put_image() {
   curl -sS -X POST "${BASE}/api/v1/create/images" "${AUTH[@]}" \
     -F "file=@$1" \
-    ${2:+-F "url=$2"}
+    ${2:+-F "url=$2"} \
+    ${3:+-F "page_url=$3"}
 }
 
 # URL から (単数)
