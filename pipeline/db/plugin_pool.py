@@ -54,15 +54,24 @@ class MariaPool:
         (paprika-video-pull 等) は False を渡す。
     mariadb_mod:
         テスト/DI 用に mariadb モジュールを注入できる。 省略時は import mariadb。
+    init_sql:
+        新規に張った物理接続へ 1 回だけ流す SQL (例:
+        ``SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED``)。
+        REPEATABLE READ (既定) は UNIQUE 索引への並列 INSERT で gap-lock を取り
+        1213 (deadlock) を頻発させる ([[insert-ignore-deadlock-hotspot-fixes]])。
+        pool は接続を使い回すので session 変数として 1 回設定すれば以後の
+        acquire でも維持される (ping での再接続時は _connect() 経由で再度流れる)。
     """
 
     def __init__(self, db_cfg: dict, size: int = 12, *,
-                 autocommit: bool = True, mariadb_mod: Any = None):
+                 autocommit: bool = True, mariadb_mod: Any = None,
+                 init_sql: str | None = None):
         if mariadb_mod is None:
             import mariadb as mariadb_mod  # type: ignore
         self._mariadb = mariadb_mod
         self._cfg = dict(db_cfg)
         self._autocommit = bool(autocommit)
+        self._init_sql = init_sql
         self._size = max(1, int(size))
         self._q: "_queue.LifoQueue" = _queue.LifoQueue(maxsize=self._size)
         for _ in range(self._size):
@@ -80,6 +89,12 @@ class MariaPool:
     def _connect(self):
         db = self._mariadb.connect(**self._cfg)
         db.autocommit = self._autocommit
+        if self._init_sql:
+            cur = db.cursor()
+            try:
+                cur.execute(self._init_sql)
+            finally:
+                cur.close()
         return db
 
     def acquire(self, timeout: float = DEFAULT_POOL_TIMEOUT_S):
