@@ -14,6 +14,7 @@ import {
   IconChartLine,
   IconBook2,
   IconDashboard,
+  IconDatabase,
   IconLanguage,
   IconList,
   IconMoon,
@@ -38,6 +39,7 @@ import Dashboard from "./pages/Dashboard";
 import Deploy from "./pages/Deploy";
 import Flow from "./pages/Flow";
 import Hosts from "./pages/Hosts";
+import MariadbTables from "./pages/MariadbTables";
 import Supervisor from "./pages/Supervisor";
 import Throughput from "./pages/Throughput";
 import PluginPanel from "./pages/PluginPanel";
@@ -242,6 +244,12 @@ export default function App() {
           to="/supervisor"
         />
         <NavLink
+          label={t("nav.crawlTables", "クロール設定")}
+          leftSection={<IconDatabase size={18} />}
+          component={RouterNavLink}
+          to="/crawl-tables"
+        />
+        <NavLink
           label={t("nav.logs")}
           leftSection={<IconScript size={18} />}
           component={RouterNavLink}
@@ -292,6 +300,7 @@ export default function App() {
             <Route path="/workloads/:slug/runs" element={<Workloads />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/hosts" element={<Hosts />} />
+            <Route path="/crawl-tables" element={<MariadbTables />} />
             <Route path="/supervisor" element={<Supervisor />} />
             <Route path="/logs" element={<ServiceLog />} />
             <Route path="/deploy" element={<Deploy />} />

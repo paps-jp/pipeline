@@ -359,6 +359,8 @@ export interface FlowNode {
   url?: string | null;
   state?: "running" | "idle" | "failed" | "backoff" | null;
   throughput_per_min?: number | null;
+  /** 重複排除前の実件数/分 (RAW_METRIC_FIELDS 宣言 slug のみ付く。現状 image-pull のみ)。 */
+  raw_throughput_per_min?: number | null;
   last_run_at?: string | null;
   last_output?: Record<string, unknown> | null;
   adapt?: Record<string, unknown> | null;
@@ -648,6 +650,52 @@ export const hostApi = {
     request<{ host: string; ok: boolean }>(
       `/api/v1/agents/${encodeURIComponent(host)}/effective`,
       { method: "PUT", json: { workloads } },
+    ),
+};
+
+// ============================================================
+// mariadb-tables (外部 MariaDB 上の crawl_config 等、宣言的レジストリ駆動の汎用 admin)
+// ============================================================
+
+export interface MariadbColumn {
+  name: string;
+  editable: boolean;
+  kind: "str" | "int";
+}
+
+export interface MariadbTableMeta {
+  name: string;
+  label: string;
+  pk: string;
+  columns: MariadbColumn[];
+  searchable: string[];
+}
+
+export interface MariadbRowsResponse {
+  rows: Record<string, unknown>[];
+  total: number;
+}
+
+export const mariadbTablesApi = {
+  listTables: () => request<{ tables: MariadbTableMeta[] }>("/api/v1/mariadb-tables/tables"),
+  listRows: (
+    table: string,
+    params: { q?: string; enabled?: number; limit?: number; offset?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.q) qs.set("q", params.q);
+    if (params.enabled !== undefined) qs.set("enabled", String(params.enabled));
+    if (params.limit !== undefined) qs.set("limit", String(params.limit));
+    if (params.offset !== undefined) qs.set("offset", String(params.offset));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return request<MariadbRowsResponse>(
+      `/api/v1/mariadb-tables/tables/${encodeURIComponent(table)}/rows${suffix}`,
+    );
+  },
+  updateRow: (table: string, pk: number, fields: Record<string, unknown>) =>
+    request<Record<string, unknown>>(
+      `/api/v1/mariadb-tables/tables/${encodeURIComponent(table)}/rows/${pk}`,
+      { method: "PATCH", json: fields },
     ),
 };
 

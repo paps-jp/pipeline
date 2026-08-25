@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from pipeline import __version__
-from pipeline.api import admin_cmds, admin_deploy, agents as agents_api, dashboard, fleet, flow, host_policy as host_policy_api, plugin_runtime, plugins_local, service_logs, settings as settings_api, system, workers, workloads
+from pipeline.api import admin_cmds, admin_deploy, agents as agents_api, dashboard, fleet, flow, host_policy as host_policy_api, mariadb_tables, plugin_runtime, plugins_local, service_logs, settings as settings_api, system, workers, workloads
 from pipeline.config import Settings
 from pipeline.db import get_db
 from pipeline.worker.drain import Worker
@@ -231,12 +231,13 @@ def create_app(settings: Settings) -> FastAPI:
         _flow_rate_stop = _asyncio.Event()
         async def _flow_rate_1m_loop() -> None:
             from pipeline.repositories.flow_rate import FlowRateRepository as _FRR
+            from pipeline.models.metric_fields import RAW_METRIC_FIELDS as _WMF_RAW
             frepo = _FRR(db)
             while not _flow_rate_stop.is_set():
                 try:
                     base = _dt.datetime.now(_dt.timezone.utc).replace(second=0, microsecond=0)
                     for k in range(1, 4):   # 直近3分を再集約 (upsert で late 完了を反映)
-                        frepo.sample_minute(base - _dt.timedelta(minutes=k), _WMF)
+                        frepo.sample_minute(base - _dt.timedelta(minutes=k), _WMF, _WMF_RAW)
                 except Exception:
                     log.exception("flow_rate_1m aggregator failed")
                 try:
@@ -392,6 +393,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(plugin_runtime.router)
     app.include_router(settings_api.router)
     app.include_router(host_policy_api.router)
+    app.include_router(mariadb_tables.router)
     app.include_router(fleet.router)
     # MinIO プロキシ (= プラグイン UI が顔サムネ等を <img> で見るため)
     from pipeline.api import minio_proxy as _mp
