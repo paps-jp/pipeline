@@ -12,6 +12,7 @@ import "./styles.css";
 import "./i18n";
 
 import App from "./App";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { theme } from "./theme";
 
 const queryClient = new QueryClient({
@@ -31,7 +32,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Notifications position="top-right" />
         <QueryClientProvider client={queryClient}>
           <BrowserRouter>
-            <App />
+            <ErrorBoundary>
+              <App />
+            </ErrorBoundary>
           </BrowserRouter>
         </QueryClientProvider>
       </ModalsProvider>
