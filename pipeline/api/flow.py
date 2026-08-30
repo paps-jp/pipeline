@@ -460,14 +460,16 @@ def _refresh_ramdisk_health() -> None:
 
 
 # ── storage_capacity 由来の RAM ディスク逼迫 (.47 image-ram) ──────────────────
-# .47 の MinIO は Prometheus が 403 を返す (CT500 に MINIO_PROMETHEUS_AUTH_TYPE=public
-# の drop-in が無い) ので、 上の _ramdisk_probe_one 経路は使えない。 公開設定を入れる
-# には CT500 の MinIO 再起動が要り、 .47 は Paprika (producer) と image-pull
-# (consumer) が同時に叩いているホットパスなので止められない。
+# 元々 .47 の MinIO は Prometheus が 403 を返していた (CT500 に
+# MINIO_PROMETHEUS_AUTH_TYPE=public の drop-in が無かった) ため、 上の
+# _ramdisk_probe_one 経路が使えず、 storage_capacity テーブル (認証付き MinIO
+# クライアントで収集、 repositories/storage_capacity.py の image-ram-47) を
+# ソースにしてある。
 #
-# 一方 storage_capacity テーブルは認証付き MinIO クライアントで .47 を既に収集して
-# いる (repositories/storage_capacity.py の image-ram-47)。 tank ゲージが動いて
-# いるのはこれのおかげなので、 赤ボックスも同じソースから出す。
+# **2026-08-30 に .47 にも drop-in を入れたので probe 経路も使えるようになった**が、
+# ここは storage_capacity のまま据え置く。 閾値 (_TANK_WARN_PCT) が hub の
+# asset_spill high_pct と対になっていて、 probe 経路の _RAMDISK_*_PCT とは
+# 意味が違うため。 移すなら下記「3 箇所」を揃えてから。
 #
 # 対象 tank の capacity_sql は 「warn ライン」 (= tmpfs 実容量 x _TANK_WARN_PCT)
 # を返す約束にしてある。 よって pending >= capacity_warn がそのまま warn 到達で、
@@ -509,6 +511,50 @@ def _tank_ramdisk_alerts(nodes: list["FlowNode"]) -> list[dict[str, Any]]:
             "severity": ("crit" if used >= warn_at * _TANK_CRIT_OVER_WARN
                          else "warn"),
             "detail": f"{used:.1f}G / {total:.1f}G ({pct:.1f}%) — tmpfs 逼迫",
+        })
+    return out
+
+
+# ── RAM ディスク逼迫による投入停止 (supervisor の submit-gate) ────────────────
+# supervisor (_submit_gate_run) は .47 が crit を越えると workload の
+# executor_config.init_kwargs に submit_paused=1 を書いて Paprika 投入を止める。
+# 「止まっていること」が赤ボックスに出ないと、 スループットが落ちた理由が
+# 分からないまま放置される (2026-08-30 の障害では、 逆に **誰も止めていない**
+# ことが 3.6 時間気付かれなかった)。
+#
+# フラグそのものが状態なので、 supervisor の内部状態ではなく workloads テーブルを
+# 直接読む。 supervisor が死んでいても実際に止まっていれば必ず出る。
+def _submit_paused_alerts(db: Any) -> list[dict[str, Any]]:
+    """init_kwargs.submit_paused が立っている workload を赤ボックスに出す。"""
+    try:
+        with db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT slug, executor_config FROM workloads WHERE enabled = 1 "
+                "OR executor_config LIKE '%submit_paused%'"
+            ).fetchall()
+    except Exception as e:  # noqa: BLE001 — 表示用なので落とさない
+        log.warning("flow: submit-gate 状態の読み取りに失敗: %s", e)
+        return []
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        raw = r["executor_config"]
+        if not raw or "submit_paused" not in str(raw):
+            continue
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            paused = int((cfg.get("init_kwargs") or {}).get("submit_paused") or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        if not paused:
+            continue
+        out.append({
+            "name": f"submit-paused:{r['slug']}",
+            "kind": "storage_full",
+            "endpoint": r["slug"],
+            "severity": "warn",
+            "detail": ("RAM ディスク逼迫のため投入を一時停止中 — "
+                       "水位が resume 閾値まで下がれば supervisor が自動再開する"),
         })
     return out
 
@@ -1252,6 +1298,7 @@ def snapshot(req: Request) -> FlowSnapshot:
     infra_alerts = [InfraAlert(**a) for a in
                     (*_storage_alerts(), *_pve_alerts(), *_ramdisk_alerts(),
                      *_tank_ramdisk_alerts(nodes), *_faiss_alerts(),
+                     *_submit_paused_alerts(req.app.state.db),
                      *_gpu_alerts(req.app.state.db))]
     return FlowSnapshot(canvas=canvas, nodes=nodes, edges=edges, infra_alerts=infra_alerts)
 
