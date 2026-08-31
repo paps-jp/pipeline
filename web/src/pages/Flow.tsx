@@ -1352,6 +1352,7 @@ function AnnotationToolbar({
   setAnnoColor,
   annoFontSize,
   setAnnoFontSize,
+  selectedColor,
   onClear,
   isLight,
 }: {
@@ -1361,6 +1362,8 @@ function AnnotationToolbar({
   setAnnoColor: (c: string) => void;
   annoFontSize: number;
   setAnnoFontSize: (n: number) => void;
+  /** 選択中の図形の色。 null = 未選択 (= これから描くものの色を編集する)。 */
+  selectedColor: string | null;
   onClear: () => void;
   isLight: boolean;
 }) {
@@ -1415,12 +1418,19 @@ function AnnotationToolbar({
       {toolBtn('rect', '□', '四角を描く')}
       {toolBtn('erase', '✕', '加筆を消す（クリックで削除）')}
       {divider}
-      <Tooltip label="色">
+      {/* 図形を選択していればその色を編集、 未選択ならこれから描く色を決める。
+          どちらを編集しているのか分かる様に、 選択中は枠を光らせる。 */}
+      <Tooltip label={selectedColor ? '選択中の図形の色を変える' : 'これから描く色'}>
         <input
           type="color"
-          value={annoColor}
+          value={selectedColor ?? annoColor}
           onChange={(e) => setAnnoColor(e.target.value)}
-          style={{ width: 22, height: 22, border: 'none', background: 'none', cursor: 'pointer', padding: 0, flexShrink: 0 }}
+          style={{
+            width: 22, height: 22, background: 'none', cursor: 'pointer',
+            padding: 0, flexShrink: 0,
+            border: selectedColor ? '2px solid #38bdf8' : 'none',
+            borderRadius: 3,
+          }}
         />
       </Tooltip>
       {activeTool === 'text' && (
@@ -1949,6 +1959,15 @@ export default function Flow() {
     setSelAnno((cur) => (cur === id ? null : cur));
   }, [pushAnnos]);
 
+  // 選択中の図形の色替え。 ツールバーの色ピッカーから呼ぶ。
+  const recolorAnno = useCallback((id: string, color: string) => {
+    setAnnos((prev) => {
+      const next = prev.map((a) => a.id === id ? { ...a, color } : a);
+      pushAnnos(next);
+      return next;
+    });
+  }, [pushAnnos]);
+
   const moveAnno = useCallback((id: string, x: number, y: number, x2: number, y2: number) => {
     setAnnos((prev) => {
       const next = prev.map((a) => a.id === id ? { ...a, x, y, x2, y2 } : a);
@@ -2375,7 +2394,10 @@ export default function Flow() {
         activeTool={activeTool}
         setActiveTool={setActiveTool}
         annoColor={annoColor}
-        setAnnoColor={setAnnoColor}
+        // 図形を選択している時は、 その図形の色を書き換える (= 選択 → 色指定で変更)。
+        // 未選択なら従来通り 「これから描く色」 を決めるだけ。
+        setAnnoColor={(c) => { setAnnoColor(c); if (selAnno) recolorAnno(selAnno, c); }}
+        selectedColor={annos.find((a) => a.id === selAnno)?.color ?? null}
         annoFontSize={annoFontSize}
         setAnnoFontSize={setAnnoFontSize}
         onClear={() => { if (window.confirm('加筆を全て消去しますか?')) { setAnnos([]); setSelAnno(null); pushAnnos([]); } }}
