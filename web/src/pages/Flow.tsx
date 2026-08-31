@@ -1188,16 +1188,14 @@ function AnnotationCanvas({
   const ACCENT = '#38bdf8';
 
   return (
+    <>
     <svg
       style={{
         position: 'absolute',
         top: 0, left: 0, width: '100%', height: '100%',
-        // ツール非選択時も **React Flow の renderer (z-index 4) より上**に置く
-        // (2026-09-01)。 従来の z-index:1 だと pane が上に被さり、 描いた図形を
-        // クリックできず 「クリックしても何も起きない」 状態だった。 コンテナは
-        // pointerEvents:none なので、 図形そのもの (pointerEvents:all) だけが
-        // クリックを拾い、 それ以外は下の canvas / node に素通しする。
-        zIndex: isActive ? 1000 : 5,
+        // 描画レイヤは **フローより下** (z-index 1)。 加筆はノードの背面に敷く。
+        // クリック判定だけは別の透明レイヤ (下の hit svg) が上で受け持つ。
+        zIndex: isActive ? 1000 : 1,
         pointerEvents: isActive ? 'all' : 'none',
         cursor: activeTool === 'erase' ? 'not-allowed' : isActive ? 'crosshair' : 'default',
         overflow: 'visible',
@@ -1219,7 +1217,7 @@ function AnnotationCanvas({
                 x={a.x} y={a.y}
                 fill={a.color}
                 fontSize={a.fontSize / vp.zoom}
-                style={{ userSelect: 'none', pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
+                style={{ userSelect: 'none', pointerEvents: isActive ? 'all' : 'none', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
                 onClick={clickHandler}
               >
                 {a.text}
@@ -1232,7 +1230,7 @@ function AnnotationCanvas({
                 <line
                   x1={a.x} y1={a.y} x2={a.x2} y2={a.y2}
                   stroke={a.color} strokeWidth={sw} strokeLinecap="round"
-                  style={{ pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
+                  style={{ pointerEvents: isActive ? 'all' : 'none', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
                   onClick={clickHandler}
                 />
                 {selectedId === a.id && (
@@ -1252,7 +1250,7 @@ function AnnotationCanvas({
               <rect
                 x={rx} y={ry} width={rw} height={rh}
                 stroke={a.color} strokeWidth={sw} fill={`${a.color}22`}
-                style={{ pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
+                style={{ pointerEvents: isActive ? 'all' : 'none', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
                 onClick={clickHandler}
               />
               {/* 選択中は accent の破線を重ねる (= 元の色は保ったまま選択が分かる) */}
@@ -1283,6 +1281,67 @@ function AnnotationCanvas({
         })()}
       </g>
     </svg>
+    {/* クリック判定だけの透明レイヤ (2026-09-01)。
+        描画レイヤをフローの下 (z-index 1) に置くと pane がクリックを奪うので、
+        当たり判定だけを renderer (z-index 4) より上に薄く重ねる。
+        - コンテナは pointerEvents:none、 拾うのは図形の **枠線だけ**
+          (`fill=none` + `pointer-events:stroke`)。 矩形の内側は素通しなので、
+          囲んだ中の node は今まで通りクリックできる
+        - 線は掴みやすい様に太めの透明ストロークにする
+        - ツール使用中は描画レイヤ自身が最前面 (z 1000) に出るので、 この層は出さない
+          (= 消しゴムも従来通り描画レイヤ側で処理する) */}
+    {!isActive && (
+      <svg
+        style={{
+          position: 'absolute',
+          top: 0, left: 0, width: '100%', height: '100%',
+          zIndex: 5,
+          pointerEvents: 'none',
+          overflow: 'visible',
+        }}
+      >
+        <g transform={`translate(${vp.x},${vp.y}) scale(${vp.zoom})`}>
+          {annos.map((a) => {
+            const hitW = Math.max(14 / vp.zoom, sw * 3);
+            const onPick = (e: React.MouseEvent) => { e.stopPropagation(); onSelect(a.id); };
+            if (a.kind === 'text') {
+              return (
+                <text
+                  key={a.id}
+                  x={a.x} y={a.y} fill="transparent" fontSize={a.fontSize / vp.zoom}
+                  style={{ pointerEvents: 'all', cursor: 'pointer', userSelect: 'none' }}
+                  onClick={onPick}
+                >
+                  {a.text}
+                </text>
+              );
+            }
+            if (a.kind === 'line') {
+              return (
+                <line
+                  key={a.id}
+                  x1={a.x} y1={a.y} x2={a.x2} y2={a.y2}
+                  stroke="transparent" strokeWidth={hitW} strokeLinecap="round"
+                  style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
+                  onClick={onPick}
+                />
+              );
+            }
+            const rx = Math.min(a.x, a.x2), ry = Math.min(a.y, a.y2);
+            return (
+              <rect
+                key={a.id}
+                x={rx} y={ry} width={Math.abs(a.x2 - a.x)} height={Math.abs(a.y2 - a.y)}
+                fill="none" stroke="transparent" strokeWidth={hitW}
+                style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
+                onClick={onPick}
+              />
+            );
+          })}
+        </g>
+      </svg>
+    )}
+    </>
   );
 }
 
@@ -2268,8 +2327,9 @@ export default function Flow() {
         elementsSelectable
         // 選択中に Backspace を押しても node を消さない (= 表示専用の画面)。
         deleteKeyCode={null}
-        // 何もない所をクリックしたら加筆の選択を解除する。
+        // 何もない所 / node をクリックしたら加筆の選択を解除する。
         onPaneClick={() => setSelAnno(null)}
+        onNodeClick={() => setSelAnno(null)}
         style={{ background: bg }}
       >
         <Background gap={20} size={1} color={bgDotColor} />
