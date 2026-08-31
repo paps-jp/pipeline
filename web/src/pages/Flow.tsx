@@ -1456,6 +1456,12 @@ const EDGE_TYPES: EdgeTypes = {
 // ReactFlow の子要素としてレンダするが、HTML div で実装（SVG の pointer-events
 // より CSS pointer-events が優先されるブラウザ挙動を回避するため）。
 
+// 加筆の移動 / リサイズはこの刻みに吸着させる (2026-09-01)。 単位は **フロー座標**
+// なので、 ズームしても常に同じ格子に乗る (= 画面 px 基準にすると倍率ごとに
+// 刻みが変わって揃わない)。
+const ANNO_GRID = 5;
+const snapG = (v: number) => Math.round(v / ANNO_GRID) * ANNO_GRID;
+
 // リサイズのつまみ位置。 rect は 8 方向、 line は両端 (p1/p2)。
 type AnnoGrip = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'p1' | 'p2';
 const GRIP_CURSOR: Record<AnnoGrip, string> = {
@@ -1484,6 +1490,9 @@ function DragHandles({
     id: string;
     startCx: number; startCy: number;
     origX: number; origY: number; origX2: number; origY2: number;
+    // 吸着の基準点 (= rect/line は左上、 text はベースライン原点)。 これを格子に
+    // 乗せた分だけ全体を平行移動するので、 移動しても大きさは変わらない。
+    anchorX: number; anchorY: number;
   } | null>(null);
   // リサイズ中のつまみ (2026-09-01)。 移動と同じ onMove で 4 座標を書き換える。
   const [grip, setGrip] = useState<{
@@ -1498,7 +1507,11 @@ function DragHandles({
       const zoom = vpRef.current.zoom;
       const dx = (e.clientX - drag.startCx) / zoom;
       const dy = (e.clientY - drag.startCy) / zoom;
-      onMove(drag.id, drag.origX + dx, drag.origY + dy, drag.origX2 + dx, drag.origY2 + dy);
+      // 両端を個別に丸めると大きさが最大 5 ずれるので、 基準点だけ格子に乗せて
+      // その差分を全体に適用する。
+      const sdx = snapG(drag.anchorX + dx) - drag.anchorX;
+      const sdy = snapG(drag.anchorY + dy) - drag.anchorY;
+      onMove(drag.id, drag.origX + sdx, drag.origY + sdy, drag.origX2 + sdx, drag.origY2 + sdy);
     };
     const handleUp = () => setDrag(null);
     window.addEventListener('mousemove', handleMove);
@@ -1516,11 +1529,11 @@ function DragHandles({
       const dx = (e.clientX - grip.startCx) / zoom;
       const dy = (e.clientY - grip.startCy) / zoom;
       if (grip.dir === 'p1') {
-        onMove(grip.id, grip.origX + dx, grip.origY + dy, grip.origX2, grip.origY2);
+        onMove(grip.id, snapG(grip.origX + dx), snapG(grip.origY + dy), grip.origX2, grip.origY2);
         return;
       }
       if (grip.dir === 'p2') {
-        onMove(grip.id, grip.origX, grip.origY, grip.origX2 + dx, grip.origY2 + dy);
+        onMove(grip.id, grip.origX, grip.origY, snapG(grip.origX2 + dx), snapG(grip.origY2 + dy));
         return;
       }
       // rect: 正規化した左上/右下で計算してから戻す (= 反転して描いた矩形でも
@@ -1529,11 +1542,12 @@ function DragHandles({
       let r = Math.max(grip.origX, grip.origX2);
       let t = Math.min(grip.origY, grip.origY2);
       let b = Math.max(grip.origY, grip.origY2);
-      if (grip.dir.includes('w')) l += dx;
-      if (grip.dir.includes('e')) r += dx;
-      if (grip.dir.includes('n')) t += dy;
-      if (grip.dir.includes('s')) b += dy;
-      const MIN = 8 / zoom;          // 潰して見失わない様の下限
+      // 掴んだ辺だけ動かして格子に乗せる (= 触っていない辺は元の値のまま)。
+      if (grip.dir.includes('w')) l = snapG(l + dx);
+      if (grip.dir.includes('e')) r = snapG(r + dx);
+      if (grip.dir.includes('n')) t = snapG(t + dy);
+      if (grip.dir.includes('s')) b = snapG(b + dy);
+      const MIN = ANNO_GRID;         // 潰して見失わない様の下限 (= 格子 1 マス)
       if (r - l < MIN) { if (grip.dir.includes('w')) l = r - MIN; else r = l + MIN; }
       if (b - t < MIN) { if (grip.dir.includes('n')) t = b - MIN; else b = t + MIN; }
       onMove(grip.id, l, t, r, b);
@@ -1598,6 +1612,9 @@ function DragHandles({
                 startCx: e.clientX, startCy: e.clientY,
                 origX: a.x, origY: a.y,
                 origX2: a.x2, origY2: a.y2,
+                // text はベースライン原点、 line/rect は左上を格子の基準にする
+                anchorX: a.kind === 'text' ? a.x : Math.min(a.x, a.x2),
+                anchorY: a.kind === 'text' ? a.y : Math.min(a.y, a.y2),
               });
             }}
             style={{
