@@ -438,7 +438,15 @@ def create_app(settings: Settings) -> FastAPI:
                     return FileResponse(candidate)
             index = _WEB_STATIC_DIR / "index.html"
             if index.exists():
-                return HTMLResponse(index.read_text(encoding="utf-8"))
+                # index.html は **毎回検証させる** (2026-09-01)。 validator も
+                # Cache-Control も付けずに返していたため、 ブラウザが発見的
+                # キャッシュで古い index を持ち続け、 デプロイしても古い bundle の
+                # UI が出たままになる事故が起きた。 assets/ はファイル名に
+                # ハッシュが入るので従来通り強くキャッシュさせてよい。
+                return HTMLResponse(
+                    index.read_text(encoding="utf-8"),
+                    headers={"Cache-Control": "no-cache, must-revalidate"},
+                )
             return HTMLResponse(_FALLBACK_HTML % {"version": __version__})
     else:
 

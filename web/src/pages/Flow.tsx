@@ -303,7 +303,7 @@ function selectionStyle(isLight: boolean, selected: boolean) {
   const c = selectColor(isLight);
   return {
     border: `2px solid ${c}`,
-    boxShadow: `0 0 0 3px ${isLight ? "rgba(2,132,199,0.22)" : "rgba(56,189,248,0.25)"}`,
+    boxShadow: `0 0 0 4px ${isLight ? "rgba(2,132,199,0.30)" : "rgba(56,189,248,0.35)"}`,
   };
 }
 
@@ -322,10 +322,12 @@ function BoxResizer({ kind, isLight, visible }: {
       // 線は透明にして「掴める帯」 に徹させる (実体の枠線は選択色の border が担う)。
       // 太さは下の RESIZE_BAND_CSS で 10px にしてある。
       lineStyle={{ borderColor: "transparent" }}
+      // 隅のつまみは「掴める所」 と一目で分かる大きさ・塗りにする (小さい白抜きだと
+      // 背景に紛れて 「枠が出ていない」 と見えるため)。
       handleStyle={{
-        width: 9, height: 9, borderRadius: 1,
-        background: isLight ? "#ffffff" : "#0f172a",
-        border: `2px solid ${c}`,
+        width: 12, height: 12, borderRadius: 2,
+        background: c,
+        border: `2px solid ${isLight ? "#ffffff" : "#0f172a"}`,
       }}
     />
   );
@@ -353,6 +355,8 @@ const RESIZE_BAND_CSS = `
   .react-flow__resize-control.line.bottom { height: ${RESIZE_BAND}px; transform: none; }
   .react-flow__resize-control.line.top { top: 0; }
   .react-flow__resize-control.line.bottom { top: auto; bottom: 0; }
+  /* 掴める辺だと分かる様に、 マウスが乗ったら帯を光らせる。 */
+  .react-flow__resize-control.line:hover { background: rgba(56,189,248,0.30); }
 `;
 
 function NodeHandles({ active }: { active?: ReadonlySet<string> }) {
