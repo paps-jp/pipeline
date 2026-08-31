@@ -344,11 +344,32 @@ export const api = {
       method: "POST",
       json: { positions },
     }),
+  /** フロー図の加筆 (線/矩形/テキスト)。localStorage ではなく control plane が持つ
+   *  ので、どの端末から開いても同じものが見える。 */
+  flowAnnotations: () =>
+    request<{ annotations: FlowAnnotation[] }>("/api/v1/flow/annotations"),
+  saveFlowAnnotations: (annotations: FlowAnnotation[]) =>
+    request<{ saved: number }>("/api/v1/flow/annotations", {
+      method: "PUT",
+      json: { annotations },
+    }),
   flowRates: (sinceMin: number) =>
     request<{ since: string; count: number; series: FlowRateRow[] }>(
       `/api/v1/flow/rates?since_min=${sinceMin}`,
     ),
 };
+
+export interface FlowAnnotation {
+  id: string;
+  kind: "line" | "rect" | "text";
+  x: number;
+  y: number;
+  x2: number;
+  y2: number;
+  text: string;
+  color: string;
+  fontSize: number;
+}
 
 export interface FlowNode {
   id: string;

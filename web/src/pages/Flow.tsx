@@ -53,7 +53,7 @@ import {
   type IconProps,
 } from "@tabler/icons-react";
 
-import { api, type FlowEdge, type FlowNode, type FlowRateRow, type InfraAlert } from "@/api/client";
+import { api, type FlowAnnotation, type FlowEdge, type FlowNode, type FlowRateRow, type InfraAlert } from "@/api/client";
 import WorkloadControlPopover from "@/components/WorkloadControlPopover";
 import { ParticleEdge } from "./FlowEdge";
 
@@ -1868,6 +1868,8 @@ export default function Flow() {
   const rfBoxRef = useRef<HTMLDivElement>(null);
   // 加筆の選択中 id (= リサイズつまみを出す対象)。 pane クリックで解除する。
   const [selAnno, setSelAnno] = useState<string | null>(null);
+  // 加筆は control plane が持つ (2026-09-01)。 localStorage は
+  // **サーバ応答が来るまでの初期表示** と、 旧版から引き継ぐ移行元としてだけ使う。
   const [annos, setAnnos] = useState<Anno[]>(() => {
     try { return JSON.parse(localStorage.getItem(ANNO_LS_KEY) || '[]') as Anno[]; }
     catch { return []; }
@@ -1882,18 +1884,78 @@ export default function Flow() {
 
   useEffect(() => { localStorage.setItem(ANNO_LS_KEY, JSON.stringify(annos)); }, [annos]);
 
-  const addAnno = useCallback((a: Omit<Anno, 'id'>) => {
-    setAnnos((prev) => [...prev, { ...a, id: `${Date.now()}-${Math.random().toString(36).slice(2)}` }]);
+  // ---- 加筆のサーバ同期 ----
+  // 直近に自分が編集した直後はサーバ値を当てない (= 保存が往復する間に
+  // 描いたものが一瞬消える / 巻き戻るのを防ぐ)。
+  const annoEditedAt = useRef(0);
+  const annoLoaded = useRef(false);
+  const annoQ = useQuery({
+    queryKey: ["flow-annotations"],
+    queryFn: () => api.flowAnnotations(),
+    refetchInterval: 15_000,
+    refetchOnWindowFocus: true,
+  });
+  const saveAnnoMut = useMutation({
+    mutationFn: (list: Anno[]) => api.saveFlowAnnotations(list as unknown as FlowAnnotation[]),
+  });
+  useEffect(() => {
+    const remote = annoQ.data?.annotations as Anno[] | undefined;
+    if (!remote) return;
+    if (!annoLoaded.current) {
+      annoLoaded.current = true;
+      // 初回: サーバが空でローカルに残っていれば、 旧 localStorage 分を吸い上げる
+      // (= 今まで自分のブラウザだけに溜めていた加筆を消さない)。
+      const local = annos;
+      if (remote.length === 0 && local.length > 0) {
+        saveAnnoMut.mutate(local);
+        return;
+      }
+      setAnnos(remote);
+      return;
+    }
+    if (Date.now() - annoEditedAt.current < 5_000) return;   // 編集直後は触らない
+    setAnnos((cur) =>
+      JSON.stringify(cur) === JSON.stringify(remote) ? cur : remote);
+    // annos は初回判定にしか使わないので依存に入れない (入れると毎編集で再評価される)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [annoQ.data]);
+
+  // 変更を debounce してサーバへ (ドラッグ中は毎フレーム呼ばれるため)。
+  const annoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pushAnnos = useCallback((list: Anno[]) => {
+    annoEditedAt.current = Date.now();
+    if (annoSaveTimer.current) clearTimeout(annoSaveTimer.current);
+    annoSaveTimer.current = setTimeout(() => saveAnnoMut.mutate(list), 600);
+    // saveAnnoMut は毎 render で作り直されるが mutate は安定なので依存から外す
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 追加 / 削除 / 移動はどれも「新しい配列を作って push する」。 サーバ保存は
+  // pushAnnos が debounce するので、 ドラッグ中に毎フレーム呼ばれても問題ない。
+  const addAnno = useCallback((a: Omit<Anno, 'id'>) => {
+    setAnnos((prev) => {
+      const next = [...prev, { ...a, id: `${Date.now()}-${Math.random().toString(36).slice(2)}` }];
+      pushAnnos(next);
+      return next;
+    });
+  }, [pushAnnos]);
 
   const deleteAnno = useCallback((id: string) => {
-    setAnnos((prev) => prev.filter((a) => a.id !== id));
+    setAnnos((prev) => {
+      const next = prev.filter((a) => a.id !== id);
+      pushAnnos(next);
+      return next;
+    });
     setSelAnno((cur) => (cur === id ? null : cur));
-  }, []);
+  }, [pushAnnos]);
 
   const moveAnno = useCallback((id: string, x: number, y: number, x2: number, y2: number) => {
-    setAnnos((prev) => prev.map((a) => a.id === id ? { ...a, x, y, x2, y2 } : a));
-  }, []);
+    setAnnos((prev) => {
+      const next = prev.map((a) => a.id === id ? { ...a, x, y, x2, y2 } : a);
+      pushAnnos(next);
+      return next;
+    });
+  }, [pushAnnos]);
 
   const commitTextInput = useCallback(() => {
     if (textInput && textVal.trim()) {
@@ -2316,7 +2378,7 @@ export default function Flow() {
         setAnnoColor={setAnnoColor}
         annoFontSize={annoFontSize}
         setAnnoFontSize={setAnnoFontSize}
-        onClear={() => { if (window.confirm('加筆を全て消去しますか?')) { setAnnos([]); setSelAnno(null); } }}
+        onClear={() => { if (window.confirm('加筆を全て消去しますか?')) { setAnnos([]); setSelAnno(null); pushAnnos([]); } }}
         isLight={isLight}
       />
       <Modal

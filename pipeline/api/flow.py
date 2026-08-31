@@ -1168,6 +1168,68 @@ _snapshot_cache: tuple[float, Any] = (0.0, None)
 _snapshot_lock = threading.Lock()
 
 
+# ── 加筆 (アノテーション) の保存 ──────────────────────────────────────────
+# フロー図に手で描いた線 / 矩形 / テキスト。 以前はブラウザの localStorage に
+# 置いていたので **書いた本人のブラウザでしか見えなかった** (2026-09-01)。
+# control plane の settings 表 (key/value) に JSON で持たせて、 どの端末から
+# 開いても同じ加筆が見える様にする。 数十個の図形しか載らないので専用表は作らない。
+_ANNO_SETTING_KEY = "flow_annotations"
+_ANNO_MAX = 500            # 事故で無限に積まれない様の上限
+_ANNO_TEXT_MAX = 500
+
+
+class _Anno(BaseModel):
+    id: str
+    kind: str                  # 'line' | 'rect' | 'text'
+    x: float
+    y: float
+    x2: float = 0.0
+    y2: float = 0.0
+    text: str = ""
+    color: str = "#ef4444"
+    fontSize: float = 14.0
+
+
+class _AnnoReq(BaseModel):
+    annotations: list[_Anno]
+
+
+@router.get("/annotations")
+def get_annotations(req: Request) -> dict[str, Any]:
+    """保存済みの加筆を返す。 未保存 / 壊れている時は空配列 (画面は壊さない)。"""
+    from pipeline.repositories.settings import SettingsRepository
+
+    raw = SettingsRepository(req.app.state.db).get_raw(_ANNO_SETTING_KEY)
+    if not raw:
+        return {"annotations": []}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        log.warning("flow annotations: JSON が壊れています (空として扱います)")
+        return {"annotations": []}
+    return {"annotations": data if isinstance(data, list) else []}
+
+
+@router.put("/annotations")
+def put_annotations(req: Request, payload: _AnnoReq) -> dict[str, int]:
+    """加筆を丸ごと置き換える (= UI 側の状態をそのまま保存する)。"""
+    from pipeline.repositories.settings import SettingsRepository
+
+    if len(payload.annotations) > _ANNO_MAX:
+        raise HTTPException(400, f"annotations が多すぎます (max {_ANNO_MAX})")
+    items: list[dict[str, Any]] = []
+    for a in payload.annotations:
+        if a.kind not in ("line", "rect", "text"):
+            raise HTTPException(400, f"unknown kind: {a.kind}")
+        d = a.model_dump()
+        d["text"] = str(d.get("text") or "")[:_ANNO_TEXT_MAX]
+        items.append(d)
+    SettingsRepository(req.app.state.db).upsert_blob(
+        _ANNO_SETTING_KEY, json.dumps(items, ensure_ascii=False), updated_by="flow-ui",
+    )
+    return {"saved": len(items)}
+
+
 @router.get("/snapshot", response_model=FlowSnapshot)
 def snapshot(req: Request) -> FlowSnapshot:
     global _snapshot_cache

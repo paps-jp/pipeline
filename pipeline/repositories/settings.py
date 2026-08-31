@@ -139,6 +139,25 @@ class SettingsRepository:
             row["value"] = None
         return row
 
+    def upsert_blob(self, key: str, value: str, updated_by: str | None = None) -> None:
+        """UI が持ち主の JSON 塊を保存する (= 未登録キーでも作る)。
+
+        `set_value` は 「管理キーだけを更新する」 という約束なので、 そこを緩めずに
+        別口を用意する。 現状の用途はフロー図の加筆 (flow_annotations) だけで、
+        ブラウザの localStorage に置いていたものを control plane に寄せて
+        **どの端末からでも同じ加筆が見える様にする** ため (2026-09-01)。
+        secret ではないので is_secret=0 固定。
+        """
+        now = _utcnow_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value, description, is_secret, updated_at, updated_by) "
+                "VALUES (:k, :v, :d, 0, :t, :u) "
+                "ON CONFLICT(key) DO UPDATE SET value = :v, updated_at = :t, updated_by = :u",
+                {"k": key, "v": value, "d": "UI が保存する JSON (secret ではない)",
+                 "t": now, "u": (updated_by or "operator")[:64]},
+            )
+
     def get_llm_config(self) -> dict[str, Any]:
         """LLM advisor が使う設定を 1 dict にまとめて返す (生 API key 込み)。
         server-side 専用 (= secret 漏れに注意)。"""
