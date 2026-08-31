@@ -307,16 +307,29 @@ function selectionStyle(isLight: boolean, selected: boolean) {
   };
 }
 
-// リサイズ枠。 選択中の node にだけ出す (= 常時出すと 34 個 x 8 ハンドルで
-// 配線が見えなくなる)。 掴む所は工業計器に合わせて小さい四角。
+// リサイズ枠。 **マウスを乗せている間** と選択中に出す (= 常時出すと 34 個 x
+// 8 ハンドルで配線が見えなくなる)。 掴む所は工業計器に合わせて小さい四角。
+//
+// hover も条件に入れているのは、 選択に依存させると 「クリックが効かない状態」
+// (加筆ツールが有効・古い bundle 等) で機能ごと使えなくなるため (2026-09-01)。
+// 帯もつまみも overflow:hidden でカードの内側に収まっているので、 掴みに行く
+// 途中で mouseleave して消える心配は無い。 ドラッグ中はカード外へ出ても
+// 消えない様に、 resize 中フラグで保持する。
 function BoxResizer({ kind, isLight, visible }: {
   kind: string; isLight: boolean; visible: boolean;
 }) {
   const min = NODE_MIN[kind] ?? NODE_MIN.workload;
   const c = selectColor(isLight);
+  const [resizing, setResizing] = useState(false);
+  // useCallback で同一性を保つ (= NodeResizeControl の useEffect が毎 render
+  // 張り直され、 d3-drag が外れたままになるのを避ける)。
+  const onStart = useCallback(() => setResizing(true), []);
+  const onEnd = useCallback(() => setResizing(false), []);
   return (
     <NodeResizer
-      isVisible={visible}
+      isVisible={visible || resizing}
+      onResizeStart={onStart}
+      onResizeEnd={onEnd}
       minWidth={min.w}
       minHeight={min.h}
       // 線は透明にして「掴める帯」 に徹させる (実体の枠線は選択色の border が担う)。
@@ -416,6 +429,7 @@ function WorkloadNode({
   const adapt = (data.adapt ?? {}) as Record<string, number>;
   const backlogH = backlogAgeHours(data.last_output?.watermark);
   const active = useMemo(() => new Set(data.activeHandles ?? []), [data.activeHandles]);
+  const [hovered, setHovered] = useState(false);
   // 停滞しているか = **上流タンクが積み上がっているか** を背景色で示す (2026-08-31)。
   //   増加中 (trend > 0) → 薄ピンク (= 食う側が追いついていない = 停滞)
   //   減少中 (trend < 0) → 薄い緑  (= バックログを消化できている)
@@ -466,6 +480,8 @@ function WorkloadNode({
       initial={{ scale: 0.95, opacity: 0 }}
       animate={{ scale: 1, opacity: 1 }}
       title={biasTitle}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       style={{
         // 大きさは node 側 (= yaml の w/h か kind 既定) が決める。 中身はそれに従う。
         width: "100%",
@@ -589,7 +605,7 @@ function WorkloadNode({
       {/* リサイズ枠は **カード内の最後の子** に置く (2026-09-01)。 絶対配置なので
           レイアウトには影響しないが、 先頭に置くと本文が上に重なって辺の帯を
           掴めない (= 掴んだつもりが node のドラッグ移動になる)。 */}
-      <BoxResizer kind="workload" isLight={isLight} visible={!!selected} />
+      <BoxResizer kind="workload" isLight={isLight} visible={hovered || !!selected} />
     </motion.div>
   );
 }
@@ -904,6 +920,7 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
     return `#${hex(r)}${hex(g)}${hex(b)}`;
   })();
   const active = useMemo(() => new Set(data.activeHandles ?? []), [data.activeHandles]);
+  const [hovered, setHovered] = useState(false);
   const cardBg = isLight
     ? "linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%)"
     : "linear-gradient(180deg, #1e293b 0%, #0f172a 100%)";
@@ -917,6 +934,8 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
     <motion.div
       initial={{ scale: 0.95, opacity: 0 }}
       animate={{ scale: 1, opacity: 1 }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       style={{
         width: "100%",
         height: "100%",
@@ -1010,7 +1029,7 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
           </Text>
         )}
       </Stack>
-      <BoxResizer kind="tank" isLight={isLight} visible={!!selected} />
+      <BoxResizer kind="tank" isLight={isLight} visible={hovered || !!selected} />
     </motion.div>
   );
 }
@@ -1022,9 +1041,12 @@ function ExternalNode({ data, selected }: { data: FlowNode & { activeHandles?: s
   const isLight = colorScheme === "light";
   const nodeLabel = useNodeLabel(data);
   const active = useMemo(() => new Set(data.activeHandles ?? []), [data.activeHandles]);
+  const [hovered, setHovered] = useState(false);
   return (
     <Paper
       p={10}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       style={{
         width: "100%",
         height: data.h != null ? "100%" : undefined,
@@ -1055,7 +1077,7 @@ function ExternalNode({ data, selected }: { data: FlowNode & { activeHandles?: s
           </Text>
         )}
       </Stack>
-      <BoxResizer kind="external" isLight={isLight} visible={!!selected} />
+      <BoxResizer kind="external" isLight={isLight} visible={hovered || !!selected} />
     </Paper>
   );
 }
