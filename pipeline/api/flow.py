@@ -309,7 +309,7 @@ def _probe_pve_storages(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             detail = f"{used / gib:.1f}G / {total / gib:.1f}G ({pct:.1f}%)"
             eta_h = _pve_fill_eta_h(base, token, node, storage, total - used)
             if eta_h is not None and eta_h < 240:
-                detail += f" · 満杯まで約 {eta_h:.1f}h"
+                detail += f" · 満杯まで約 {eta_h:.1f} 時間です"
             alerts.append({
                 "name": f"{node}/{storage}",
                 "kind": "thinpool" if st.get("type") == "lvmthin" else "storage_full",
@@ -434,8 +434,8 @@ def _ramdisk_probe_one(name: str, base: str) -> dict[str, Any] | None:
         # _storage_alerts が別途見ているので、 ここでは「読めない」だけ warn。
         return {"name": f"ramdisk:{name}", "kind": "storage_full",
                 "endpoint": url, "severity": "warn",
-                "error": "capacity metrics を読めない "
-                         "(MINIO_PROMETHEUS_AUTH_TYPE=public が要る)"}
+                "error": "capacity metrics を読めません "
+                         "(MINIO_PROMETHEUS_AUTH_TYPE=public が必要です)"}
 
     used = max(0.0, total - free)
     pct = used / total * 100.0
@@ -452,7 +452,7 @@ def _ramdisk_probe_one(name: str, base: str) -> dict[str, Any] | None:
     # 瞬間すらあり、 内訳が 0 に潰れる。 誤った内訳は内訳が無いより有害なので出さない。
     # 内訳が要るときは CT で直接 du を取る (`du -sm /data/paprika
     # /data/.minio.sys/tmp/.trash`)。
-    detail = f"{used / g:.1f}G / {total / g:.1f}G ({pct:.1f}%) — tmpfs 逼迫"
+    detail = f"{used / g:.1f}G / {total / g:.1f}G ({pct:.1f}%) — tmpfs が逼迫しています"
     return {"name": f"ramdisk:{name}", "kind": "storage_full", "endpoint": base,
             "severity": "crit" if pct >= _RAMDISK_CRIT_PCT else "warn",
             "detail": detail}
@@ -525,7 +525,7 @@ def _tank_ramdisk_alerts(nodes: list["FlowNode"]) -> list[dict[str, Any]]:
             "endpoint": label,
             "severity": ("crit" if used >= warn_at * _TANK_CRIT_OVER_WARN
                          else "warn"),
-            "detail": f"{used:.1f}G / {total:.1f}G ({pct:.1f}%) — tmpfs 逼迫",
+            "detail": f"{used:.1f}G / {total:.1f}G ({pct:.1f}%) — tmpfs が逼迫しています",
         })
     return out
 
@@ -568,8 +568,8 @@ def _submit_paused_alerts(db: Any) -> list[dict[str, Any]]:
             "kind": "storage_full",
             "endpoint": r["slug"],
             "severity": "warn",
-            "detail": ("RAM ディスク逼迫のため投入を一時停止中 — "
-                       "水位が resume 閾値まで下がれば supervisor が自動再開する"),
+            "detail": ("RAM ディスクの逼迫により投入を一時停止しています。 "
+                       "水位が resume 閾値まで下がれば supervisor が自動で再開します"),
         })
     return out
 
@@ -624,20 +624,20 @@ def _probe_faiss(url: str, stale_h: float) -> list[dict[str, Any]]:
     except Exception as e:  # noqa: BLE001 — 不通そのものが検知したい事象
         return [{"name": "faiss:search", "kind": "faiss", "endpoint": url,
                  "severity": "crit", "error": str(e)[:200],
-                 "detail": "knn 検索不能 — face-person-link は止めること"}]
+                 "detail": "knn 検索ができません。 face-person-link は止めてください"}]
 
     if not data.get("ready") or data.get("error"):
         return [{"name": "faiss:search", "kind": "faiss", "endpoint": url,
                  "severity": "crit",
                  "error": str(data.get("error") or "ready=false")[:200],
-                 "detail": "index 未ロード — face-person-link は止めること"}]
+                 "detail": "index がロードされていません。 face-person-link は止めてください"}]
 
     age_h = _faiss_index_age_h(data.get("version"))
     if age_h is not None and age_h >= stale_h:
         return [{"name": "faiss:index", "kind": "faiss", "endpoint": url,
                  "severity": "warn",
-                 "error": f"index が {age_h / 24:.1f} 日前のまま",
-                 "detail": f"build={data.get('version')} — 以降の embedding は検索に出ない"}]
+                 "error": f"index が {age_h / 24:.1f} 日前のままです",
+                 "detail": f"build={data.get('version')} — 以降の embedding は検索に出ません"}]
     return []
 
 
@@ -727,10 +727,10 @@ def _probe_gpu_health(db: Any, window_min: int, min_samples: int) -> list[dict[s
         # detail は UI 側で 160 文字に切られるので、 効く情報から順に置く。
         alerts.append({
             "name": host, "kind": "gpu", "severity": "crit",
-            "error": "GPU センサー無応答 — `GPU requires reset` の可能性",
-            "detail": (f"直近 {window_min} 分の {st['n']} サンプル全てで温度/電力が NULL "
-                       "(VRAM 表示は凍結値)。 workload は CPU フォールバックで完走し続ける。 "
-                       "復旧は PVE で qm stop→qm start"),
+            "error": "GPU センサーが無応答です — `GPU requires reset` の可能性があります",
+            "detail": (f"直近 {window_min} 分の {st['n']} サンプル全てで温度/電力が NULL です "
+                       "(VRAM 表示は凍結値)。 workload は CPU フォールバックで完走し続けます。 "
+                       "復旧は PVE で qm stop→qm start してください"),
         })
     return alerts
 

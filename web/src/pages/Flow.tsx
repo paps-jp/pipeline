@@ -28,8 +28,11 @@ import { motion } from "framer-motion";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import {
+  IconAlertTriangle,
+  IconAlertTriangleFilled,
   IconArrowsSplit,
   IconBrain,
+  IconClockExclamation,
   IconCpu,
   IconDatabase,
   IconDatabaseImport,
@@ -39,8 +42,10 @@ import {
   IconPhoto,
   IconScan,
   IconSearch,
+  IconSearchOff,
   IconSend,
   IconServer,
+  IconServerOff,
   IconUsers,
   IconVideo,
   type Icon,
@@ -674,8 +679,9 @@ const HAZARD_RED_BG = hazardStripe("#ef4444");  // 赤黒: workload エラー
 // X / Y 軸 1 周期 = HAZARD_FULL * √2 = ちょうど 20px (= 整数)。
 const HAZARD_X_PERIOD = "20";
 
+// label を省くと 4 辺のトラテープだけを描く (= バー無しの枠として使える)。
 function HazardOverlay({ bg, barBg, barText, label, barBelow = false }: {
-  bg: string; barBg: string; barText: string; label: string; barBelow?: boolean;
+  bg: string; barBg?: string; barText?: string; label?: string; barBelow?: boolean;
 }) {
   return (
     <>
@@ -738,29 +744,32 @@ function HazardOverlay({ bg, barBg, barText, label, barBelow = false }: {
         }}
       />
       {/* ラベルバー。 barBelow=true は box の真下・box 全幅 (= ERROR 表示)、
-          false は box 内下部に inset (= 既存の WARNING 表示)。 */}
-      <div
-        style={{
-          position: "absolute",
-          ...(barBelow
-            ? { top: "100%", left: 0, right: 0 }
-            : { left: HAZARD_THICK, right: HAZARD_THICK, bottom: HAZARD_THICK }),
-          background: barBg,
-          color: barText,
-          padding: "3px 6px",
-          fontSize: 14,
-          fontFamily: "ui-monospace, monospace",
-          fontWeight: 900,
-          letterSpacing: "0.18em",
-          textAlign: "center",
-          zIndex: 5,
-          pointerEvents: "none",
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-        }}
-      >
-        {label}
-      </div>
+          false は box 内下部に inset (= 既存の WARNING 表示)。
+          label 省略時は描かない (= テープだけの枠)。 */}
+      {label && (
+        <div
+          style={{
+            position: "absolute",
+            ...(barBelow
+              ? { top: "100%", left: 0, right: 0 }
+              : { left: HAZARD_THICK, right: HAZARD_THICK, bottom: HAZARD_THICK }),
+            background: barBg,
+            color: barText,
+            padding: "3px 6px",
+            fontSize: 14,
+            fontFamily: "ui-monospace, monospace",
+            fontWeight: 900,
+            letterSpacing: "0.18em",
+            textAlign: "center",
+            zIndex: 5,
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+          }}
+        >
+          {label}
+        </div>
+      )}
     </>
   );
 }
@@ -1366,6 +1375,10 @@ function GpuAlertBox({
   );
   const total = gpu.length + hang.length + infraAlerts.length;
   if (total === 0) return null;
+  // 見た目は tank の ERROR ボックスに揃える (2026-08-31): 赤黒トラテープが
+  // 四辺を流れる工業計器の体裁。 旧版の 「赤地 + 赤い光が脈打つ枠」 は
+  // 他の警告表現 (hazard tape) と語彙が揃っておらず浮いていた。
+  // テープの下に文字が潜らない様、 中身は HAZARD_THICK ぶん内側に置く。
   return (
     <div
       style={{
@@ -1374,47 +1387,67 @@ function GpuAlertBox({
         left: 12,
         zIndex: 20,
         maxWidth: 400,
-        background: "#7f1d1d",
-        border: "2px solid #ef4444",
-        borderRadius: 8,
+        background: "#0f172a",
+        borderRadius: 2,          // 工業計器風: 角はキリッと (tank node と同じ)
         color: "#fff",
-        padding: "10px 12px",
-        animation: "gpuAlertPulse 1.6s ease-in-out infinite",
+        padding: HAZARD_THICK + 4,
+        overflow: "hidden",       // テープが角で溢れない様に
+        boxShadow: "0 4px 18px rgba(0,0,0,0.55)",
       }}
     >
-      <style>{`@keyframes gpuAlertPulse {
-        0%,100% { box-shadow: 0 0 0 3px rgba(239,68,68,0.35), 0 4px 16px rgba(0,0,0,0.45); }
-        50%     { box-shadow: 0 0 0 7px rgba(239,68,68,0.12), 0 4px 22px rgba(0,0,0,0.55); }
-      }`}</style>
+      <HazardOverlay bg={HAZARD_RED_BG} />
       <div
         style={{
-          fontWeight: 900,
-          letterSpacing: "0.06em",
+          position: "relative",
+          zIndex: 6,              // テープ (zIndex 4) より前に出す
+          background: "#ef4444",
+          color: "#ffffff",
+          padding: "3px 6px",
           fontSize: 14,
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
+          fontFamily: "ui-monospace, monospace",
+          fontWeight: 900,
+          letterSpacing: "0.18em",   // = tank の `✕ ERROR` バーと同じ字送り
+          textAlign: "center",
+          whiteSpace: "nowrap",
         }}
       >
-        <span style={{ fontSize: 18, lineHeight: 1 }}>🛑</span>
-        緊急アラート ({total})
+        ✕ ALERT ({total})
       </div>
-      <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{
+        position: "relative",
+        zIndex: 6,
+        marginTop: 6,
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}>
         {infraAlerts.map((a) => {
           const full = a.kind === "thinpool" || a.kind === "storage_full";
-          const icon = a.severity === "warn" ? "⚠" : "🛑";
-          const head = full
-            ? `${icon} ストレージ逼迫 · ${a.name}`
+          // 逼迫系だけ warn/crit で三角の塗りを分ける。 他は kind そのものを表す絵柄に。
+          const Ico = full
+            ? a.severity === "warn"
+              ? IconAlertTriangle
+              : IconAlertTriangleFilled
             : a.kind === "faiss"
-              ? `${icon} 顔検索 (FAISS) · ${a.name}`
+              ? IconSearchOff
               : a.kind === "gpu"
-                ? `${icon} GPU センサー無応答 · ${a.name}`
-                : `🗄 ストレージ停止 · ${a.name}`;
+                ? IconCpu
+                : IconServerOff;
+          const head = full
+            ? `ストレージ逼迫 · ${a.name}`
+            : a.kind === "faiss"
+              ? `顔検索 (FAISS) · ${a.name}`
+              : a.kind === "gpu"
+                ? `GPU センサー無応答 · ${a.name}`
+                : `ストレージ停止 · ${a.name}`;
           return (
             <div key={`infra-${a.name}`} style={{ fontSize: 12, lineHeight: 1.35 }}>
-              <div style={{ fontWeight: 700 }}>
-                {head}
-                {!full && a.endpoint ? ` (${a.endpoint})` : ""}
+              <div style={{ fontWeight: 700, display: "flex", alignItems: "center", gap: 5 }}>
+                <Ico size={14} style={{ flexShrink: 0 }} />
+                <span>
+                  {head}
+                  {!full && a.endpoint ? ` (${a.endpoint})` : ""}
+                </span>
               </div>
               <div
                 style={{
@@ -1424,16 +1457,19 @@ function GpuAlertBox({
                   wordBreak: "break-word",
                 }}
               >
-                {String(a.detail ?? a.error ?? "unreachable").slice(0, 160)}
+                {String(a.detail ?? a.error ?? "到達できません").slice(0, 160)}
               </div>
             </div>
           );
         })}
         {gpu.map((a) => (
           <div key={a.id} style={{ fontSize: 12, lineHeight: 1.35 }}>
-            <div style={{ fontWeight: 700 }}>
-              🎛 GPU · {a.label}
-              {a.error_worker ? ` · ${a.error_worker}` : ""}
+            <div style={{ fontWeight: 700, display: "flex", alignItems: "center", gap: 5 }}>
+              <IconCpu size={14} style={{ flexShrink: 0 }} />
+              <span>
+                GPU · {a.label}
+                {a.error_worker ? ` · ${a.error_worker}` : ""}
+              </span>
             </div>
             <div
               style={{
@@ -1449,9 +1485,12 @@ function GpuAlertBox({
         ))}
         {hang.map((a) => (
           <div key={`hang-${a.id}`} style={{ fontSize: 12, lineHeight: 1.35 }}>
-            <div style={{ fontWeight: 700 }}>
-              ⏱ ハング検知/復旧 · {a.label}
-              {a.error_worker ? ` · ${a.error_worker}` : ""}
+            <div style={{ fontWeight: 700, display: "flex", alignItems: "center", gap: 5 }}>
+              <IconClockExclamation size={14} style={{ flexShrink: 0 }} />
+              <span>
+                ハング検知/復旧 · {a.label}
+                {a.error_worker ? ` · ${a.error_worker}` : ""}
+              </span>
             </div>
             <div
               style={{
