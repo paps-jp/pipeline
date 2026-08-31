@@ -296,27 +296,64 @@ const NODE_MIN: Record<string, { w: number; h: number }> = {
   external: { w: 130, h: 64 },
 };
 
+// 選択中の box の見た目 (= 「今これを掴んでいる」 が一目で分かる様に色を変える)。
+const selectColor = (isLight: boolean) => (isLight ? "#0284c7" : "#38bdf8");
+function selectionStyle(isLight: boolean, selected: boolean) {
+  if (!selected) return {};
+  const c = selectColor(isLight);
+  return {
+    border: `2px solid ${c}`,
+    boxShadow: `0 0 0 3px ${isLight ? "rgba(2,132,199,0.22)" : "rgba(56,189,248,0.25)"}`,
+  };
+}
+
 // リサイズ枠。 選択中の node にだけ出す (= 常時出すと 34 個 x 8 ハンドルで
-// 配線が見えなくなる)。 掴む所は工業計器に合わせて小さい四角 + 細い実線。
+// 配線が見えなくなる)。 掴む所は工業計器に合わせて小さい四角。
 function BoxResizer({ kind, isLight, visible }: {
   kind: string; isLight: boolean; visible: boolean;
 }) {
   const min = NODE_MIN[kind] ?? NODE_MIN.workload;
-  const c = isLight ? "#64748b" : "#94a3b8";
+  const c = selectColor(isLight);
   return (
     <NodeResizer
       isVisible={visible}
       minWidth={min.w}
       minHeight={min.h}
-      lineStyle={{ borderColor: c, borderWidth: 1 }}
+      // 線は透明にして「掴める帯」 に徹させる (実体の枠線は選択色の border が担う)。
+      // 太さは下の RESIZE_BAND_CSS で 10px にしてある。
+      lineStyle={{ borderColor: "transparent" }}
       handleStyle={{
-        width: 7, height: 7, borderRadius: 1,
+        width: 9, height: 9, borderRadius: 1,
         background: isLight ? "#ffffff" : "#0f172a",
-        border: `1.5px solid ${c}`,
+        border: `2px solid ${c}`,
       }}
     />
   );
 }
+
+// 辺を掴んでリサイズするための当たり判定。 React Flow の既定 (style.css) は
+//   `.line.right { width: 1px; left: 100%; transform: translate(-50%,0) }`
+// で、 **1px 幅で辺の上にまたがって**いる。 そのままだと
+//   1. 細すぎて掴めない
+//   2. カードが overflow:hidden なので外側半分が切り取られ、 実効 0.5px になる
+// ため、 太さを 14px にした上で **transform を消して枠の内側に寄せる**。
+// これで 14px 全部がカードの中に入り、 クリップされずに掴める (2026-09-01)。
+// カーソル (ew-resize / ns-resize) は React Flow の既定 CSS がそのまま効く。
+const RESIZE_BAND = 14;
+const RESIZE_BAND_CSS = `
+  /* カード内には液面(1) / hazard テープ(4,5) / 本文 Stack(6) が居るので、
+     それより前に出さないと帯が本文に隠れて掴めない。 */
+  .react-flow__resize-control { z-index: 10; }
+  .react-flow__resize-control.line { border: none; }
+  .react-flow__resize-control.line.left,
+  .react-flow__resize-control.line.right { width: ${RESIZE_BAND}px; transform: none; }
+  .react-flow__resize-control.line.left { left: 0; }
+  .react-flow__resize-control.line.right { left: auto; right: 0; }
+  .react-flow__resize-control.line.top,
+  .react-flow__resize-control.line.bottom { height: ${RESIZE_BAND}px; transform: none; }
+  .react-flow__resize-control.line.top { top: 0; }
+  .react-flow__resize-control.line.bottom { top: auto; bottom: 0; }
+`;
 
 function NodeHandles({ active }: { active?: ReadonlySet<string> }) {
   const { colorScheme } = useMantineColorScheme();
@@ -438,9 +475,9 @@ function WorkloadNode({
         fontSize: 12,
         position: "relative",
         overflow: "hidden",   // 縮めた時に中身が外へはみ出さない様に
+        ...selectionStyle(isLight, !!selected),
       }}
     >
-      <BoxResizer kind="workload" isLight={isLight} visible={!!selected} />
       <NodeHandles active={active} />
       <Group justify="space-between" gap={4} wrap="nowrap">
         <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
@@ -464,7 +501,9 @@ function WorkloadNode({
                   e.stopPropagation();
                   ctrl.openControl(data.workload_slug!);
                 }}
-                style={{ cursor: "pointer" }}
+                // 選択中はリサイズの帯 (z-index 10) が辺から 14px 内側まで
+                // 覆うので、 歯車はそれより前に出しておかないと押せなくなる。
+                style={{ cursor: "pointer", position: "relative", zIndex: 11 }}
                 aria-label="tune"
               >
                 <IconAdjustmentsHorizontal size={12} />
@@ -543,6 +582,10 @@ function WorkloadNode({
         )}
       </Stack>
       {data.state === "failed" && <ErrorOverlay />}
+      {/* リサイズ枠は **カード内の最後の子** に置く (2026-09-01)。 絶対配置なので
+          レイアウトには影響しないが、 先頭に置くと本文が上に重なって辺の帯を
+          掴めない (= 掴んだつもりが node のドラッグ移動になる)。 */}
+      <BoxResizer kind="workload" isLight={isLight} visible={!!selected} />
     </motion.div>
   );
 }
@@ -881,9 +924,9 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
         position: "relative",
         overflow: "hidden",
         boxShadow: isLight ? "0 1px 4px rgba(15,23,42,0.06)" : "none",
+        ...selectionStyle(isLight, !!selected),
       }}
     >
-      <BoxResizer kind="tank" isLight={isLight} visible={!!selected} />
       <NodeHandles active={active} />
       {/* タンクの液面 (= 水面に波アニメ。 borderTop は使わず TankWave で代用)。
           overflow 時は薄いグラデではなく hazard tape と同じ濃い黄 solid に統一
@@ -963,6 +1006,7 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
           </Text>
         )}
       </Stack>
+      <BoxResizer kind="tank" isLight={isLight} visible={!!selected} />
     </motion.div>
   );
 }
@@ -989,9 +1033,9 @@ function ExternalNode({ data, selected }: { data: FlowNode & { activeHandles?: s
         position: "relative",
         overflow: "hidden",
         boxShadow: isLight ? "0 1px 4px rgba(15,23,42,0.06)" : "none",
+        ...selectionStyle(isLight, !!selected),
       }}
     >
-      <BoxResizer kind="external" isLight={isLight} visible={!!selected} />
       <NodeHandles active={active} />
       <Stack gap={4}>
         <Text size="xs" c="dimmed">{t("flow.external")}</Text>
@@ -1007,6 +1051,7 @@ function ExternalNode({ data, selected }: { data: FlowNode & { activeHandles?: s
           </Text>
         )}
       </Stack>
+      <BoxResizer kind="external" isLight={isLight} visible={!!selected} />
     </Paper>
   );
 }
@@ -1670,9 +1715,14 @@ export default function Flow() {
     }
     setNodes((curr) => {
       const prevActiveHandles = new Map<string, string[]>();
+      // 選択状態も引き継ぐ (2026-09-01)。 ここで作り直す node は selected を
+      // 持たないので、 引き継がないと **3 秒ごとに選択が解除される**。 クリックして
+      // からハンドルへマウスを運ぶ間に消えるため、 リサイズが事実上できなかった。
+      const prevSelected = new Set<string>();
       for (const n of curr) {
         const ah = (n.data as Record<string, unknown> | undefined)?.activeHandles;
         if (Array.isArray(ah)) prevActiveHandles.set(n.id, ah as string[]);
+        if (n.selected) prevSelected.add(n.id);
       }
       return snap.nodes.map((n: FlowNode) => {
         const dirty = dirtyPositions.current.get(n.id);
@@ -1698,6 +1748,7 @@ export default function Flow() {
           position: dirty ?? { x: n.x, y: n.y },
           data: base,
           draggable: true,
+          selected: prevSelected.has(n.id),
           width: w,
           height: h,
         };
@@ -2005,6 +2056,7 @@ export default function Flow() {
   return (
     <FlowControlContext.Provider value={ctrlValue}>
     <Box ref={rfBoxRef} style={{ height: "calc(100vh - 80px)", background: bg, borderRadius: 8, overflow: "hidden", position: "relative" }}>
+      <style>{RESIZE_BAND_CSS}</style>
       <GpuAlertBox nodes={snapQ.data?.nodes ?? []} infraAlerts={snapQ.data?.infra_alerts ?? []} />
       <AnnotationToolbar
         activeTool={activeTool}
