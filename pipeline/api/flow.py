@@ -1126,8 +1126,54 @@ def save_layout(payload: _SaveLayoutReq) -> dict[str, int]:
     return {"updated": updated, "skipped": skipped}
 
 
+# ---- snapshot の TTL キャッシュ (2026-08-31) ----
+# snapshot は runs に 30 分窓 / 60 分窓のクエリを 2 本引く。 どちらも
+# ``ROW_NUMBER() OVER (PARTITION BY workload_slug ...)`` で **窓内の全行を
+# output_json ごと展開してから 1 slug 1 行だけ残す** 形なので、 19 行を得る
+# ために 60 分窓の 34 万行を読む。 実測 1 本 0.58 秒、 1 回の呼び出しで
+# 1.1 秒の CPU を焼く。
+#
+# 管理画面はこれを 4.1 秒に 1 回叩く (実測 3 分で 44 回)。 py-spy で制御
+# プレーンを 25 秒プロファイルすると **プロセス CPU の 73% が sqlite の
+# fetchall、 うち 72% がこの 2 クエリ** だった。
+#
+# 2026-08-25 に同じ結論が出ていたが放置され、 2026-08-31 に Paprika 投入を
+# 4 倍 (376→1,500/分) にしたところ **パイプライン全体の律速** に昇格した:
+# 制御プレーンが 1 コア飽和 → API が p90 3.6 秒 → 各段の enqueue
+# (timeout 5 秒) が間欠的に失敗 → img_hash_q が 12.7 万件まで滞留し、
+# GPU 6 枚が 0-9% で遊ぶ。
+#
+# フロー図は「今どこが詰まっているか」を見る画面で秒単位の精度は要らない。
+# TTL の間は同じ結果を返す。 0 で無効 (旧挙動)。
+#
+# 注意: これは呼び出し **頻度** を下げるだけで、 1 回のコストは変わらない。
+# 本丸はクエリ自体 (slug ごとに index seek すれば 19 回の seek で済む) で、
+# それは別途直すこと。
+_SNAPSHOT_TTL_S = float(os.environ.get("PIPELINE_FLOW_SNAPSHOT_TTL_S") or 10.0)
+_snapshot_cache: tuple[float, Any] = (0.0, None)
+_snapshot_lock = threading.Lock()
+
+
 @router.get("/snapshot", response_model=FlowSnapshot)
 def snapshot(req: Request) -> FlowSnapshot:
+    global _snapshot_cache
+    if _SNAPSHOT_TTL_S <= 0:
+        return _snapshot_uncached(req)
+    ts, cached = _snapshot_cache
+    if cached is not None and (time.monotonic() - ts) < _SNAPSHOT_TTL_S:
+        return cached
+    # 同時に来た複数リクエストで 2 重に計算しない (thundering herd 防止)。
+    # ロックを取れなかった側は、 解放後にもう一度キャッシュを見て返す。
+    with _snapshot_lock:
+        ts, cached = _snapshot_cache
+        if cached is not None and (time.monotonic() - ts) < _SNAPSHOT_TTL_S:
+            return cached
+        snap = _snapshot_uncached(req)
+        _snapshot_cache = (time.monotonic(), snap)
+        return snap
+
+
+def _snapshot_uncached(req: Request) -> FlowSnapshot:
     layout = _load_layout()
     canvas = layout.get("canvas") or {}
     nodes_raw = layout.get("nodes") or []
