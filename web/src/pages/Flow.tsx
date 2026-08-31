@@ -1357,6 +1357,8 @@ function GpuAlertBox({
   nodes: FlowNode[];
   infraAlerts?: InfraAlert[];
 }) {
+  const { colorScheme } = useMantineColorScheme();
+  const isLight = colorScheme === "light";
   const gpu = useMemo(
     () =>
       nodes.filter(
@@ -1387,12 +1389,17 @@ function GpuAlertBox({
         left: 12,
         zIndex: 20,
         maxWidth: 400,
-        background: "#0f172a",
-        borderRadius: 2,          // 工業計器風: 角はキリッと (tank node と同じ)
-        color: "#fff",
+        // light は canvas が #f6f7fb なので、 地を暗いままにすると 1 枚だけ
+        // 夜のパネルが浮く。 node と同じ配色に揃える (トラテープ自体は
+        // tank の ERROR と同じく両テーマ共通 = 赤黒のままで良い)。
+        background: isLight ? "#ffffff" : "#0f172a",
+        borderRadius: isLight ? 4 : 2,   // 工業計器風: 角はキリッと (node と同じ)
+        color: isLight ? "#1f2937" : "#ffffff",
         padding: HAZARD_THICK + 4,
         overflow: "hidden",       // テープが角で溢れない様に
-        boxShadow: "0 4px 18px rgba(0,0,0,0.55)",
+        boxShadow: isLight
+          ? "0 2px 10px rgba(15,23,42,0.18)"
+          : "0 4px 18px rgba(0,0,0,0.55)",
       }}
     >
       <HazardOverlay bg={HAZARD_RED_BG} />
