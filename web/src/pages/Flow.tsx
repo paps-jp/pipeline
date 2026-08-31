@@ -1112,12 +1112,16 @@ function AnnotationCanvas({
   annoColor,
   annoFontSize,
   rfBoxRef,
+  selectedId,
+  onSelect,
   onAdd,
   onDelete,
   onTextPlace,
 }: {
   annos: Anno[];
   activeTool: AnnoKind | null;
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
   annoColor: string;
   annoFontSize: number;
   rfBoxRef: { current: HTMLDivElement | null };
@@ -1176,14 +1180,24 @@ function AnnotationCanvas({
     setDraw(null);
   };
 
-  const handleAnnoClick = (id: string) => { if (activeTool === 'erase') onDelete(id); };
+  // 消しゴム中は消す。 それ以外はクリックで選択 (= リサイズつまみが出る)。
+  const handleAnnoClick = (id: string) => {
+    if (activeTool === 'erase') onDelete(id);
+    else onSelect(id);
+  };
+  const ACCENT = '#38bdf8';
 
   return (
     <svg
       style={{
         position: 'absolute',
         top: 0, left: 0, width: '100%', height: '100%',
-        zIndex: isActive ? 1000 : 1,
+        // ツール非選択時も **React Flow の renderer (z-index 4) より上**に置く
+        // (2026-09-01)。 従来の z-index:1 だと pane が上に被さり、 描いた図形を
+        // クリックできず 「クリックしても何も起きない」 状態だった。 コンテナは
+        // pointerEvents:none なので、 図形そのもの (pointerEvents:all) だけが
+        // クリックを拾い、 それ以外は下の canvas / node に素通しする。
+        zIndex: isActive ? 1000 : 5,
         pointerEvents: isActive ? 'all' : 'none',
         cursor: activeTool === 'erase' ? 'not-allowed' : isActive ? 'crosshair' : 'default',
         overflow: 'visible',
@@ -1214,24 +1228,43 @@ function AnnotationCanvas({
           }
           if (a.kind === 'line') {
             return (
-              <line
-                key={a.id}
-                x1={a.x} y1={a.y} x2={a.x2} y2={a.y2}
-                stroke={a.color} strokeWidth={sw} strokeLinecap="round"
-                style={{ pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
-                onClick={clickHandler}
-              />
+              <g key={a.id}>
+                <line
+                  x1={a.x} y1={a.y} x2={a.x2} y2={a.y2}
+                  stroke={a.color} strokeWidth={sw} strokeLinecap="round"
+                  style={{ pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
+                  onClick={clickHandler}
+                />
+                {selectedId === a.id && (
+                  <line
+                    x1={a.x} y1={a.y} x2={a.x2} y2={a.y2}
+                    stroke={ACCENT} strokeWidth={sw} strokeDasharray={dashArr}
+                    style={{ pointerEvents: 'none' }}
+                  />
+                )}
+              </g>
             );
           }
           const rx = Math.min(a.x, a.x2), ry = Math.min(a.y, a.y2);
+          const rw = Math.abs(a.x2 - a.x), rh = Math.abs(a.y2 - a.y);
           return (
-            <rect
-              key={a.id}
-              x={rx} y={ry} width={Math.abs(a.x2 - a.x)} height={Math.abs(a.y2 - a.y)}
-              stroke={a.color} strokeWidth={sw} fill={`${a.color}22`}
-              style={{ pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
-              onClick={clickHandler}
-            />
+            <g key={a.id}>
+              <rect
+                x={rx} y={ry} width={rw} height={rh}
+                stroke={a.color} strokeWidth={sw} fill={`${a.color}22`}
+                style={{ pointerEvents: 'all', cursor: activeTool === 'erase' ? 'not-allowed' : 'default' }}
+                onClick={clickHandler}
+              />
+              {/* 選択中は accent の破線を重ねる (= 元の色は保ったまま選択が分かる) */}
+              {selectedId === a.id && (
+                <rect
+                  x={rx} y={ry} width={rw} height={rh}
+                  stroke={ACCENT} strokeWidth={sw} fill="none"
+                  strokeDasharray={dashArr}
+                  style={{ pointerEvents: 'none' }}
+                />
+              )}
+            </g>
           );
         })}
         {/* Drawing preview */}
@@ -1364,11 +1397,23 @@ const EDGE_TYPES: EdgeTypes = {
 // ReactFlow の子要素としてレンダするが、HTML div で実装（SVG の pointer-events
 // より CSS pointer-events が優先されるブラウザ挙動を回避するため）。
 
+// リサイズのつまみ位置。 rect は 8 方向、 line は両端 (p1/p2)。
+type AnnoGrip = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'p1' | 'p2';
+const GRIP_CURSOR: Record<AnnoGrip, string> = {
+  nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+  n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
+  p1: 'move', p2: 'move',
+};
+
 function DragHandles({
   annos,
+  selectedId,
+  onSelect,
   onMove,
 }: {
   annos: Anno[];
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
   onMove: (id: string, x: number, y: number, x2: number, y2: number) => void;
 }) {
   const vp = useViewport();
@@ -1378,6 +1423,12 @@ function DragHandles({
 
   const [drag, setDrag] = useState<{
     id: string;
+    startCx: number; startCy: number;
+    origX: number; origY: number; origX2: number; origY2: number;
+  } | null>(null);
+  // リサイズ中のつまみ (2026-09-01)。 移動と同じ onMove で 4 座標を書き換える。
+  const [grip, setGrip] = useState<{
+    id: string; dir: AnnoGrip;
     startCx: number; startCy: number;
     origX: number; origY: number; origX2: number; origY2: number;
   } | null>(null);
@@ -1399,7 +1450,67 @@ function DragHandles({
     };
   }, [drag, onMove]);
 
+  useEffect(() => {
+    if (!grip) return;
+    const handleMove = (e: MouseEvent) => {
+      const zoom = vpRef.current.zoom;
+      const dx = (e.clientX - grip.startCx) / zoom;
+      const dy = (e.clientY - grip.startCy) / zoom;
+      if (grip.dir === 'p1') {
+        onMove(grip.id, grip.origX + dx, grip.origY + dy, grip.origX2, grip.origY2);
+        return;
+      }
+      if (grip.dir === 'p2') {
+        onMove(grip.id, grip.origX, grip.origY, grip.origX2 + dx, grip.origY2 + dy);
+        return;
+      }
+      // rect: 正規化した左上/右下で計算してから戻す (= 反転して描いた矩形でも
+      // 掴んだ辺が意図通りに動く)。
+      let l = Math.min(grip.origX, grip.origX2);
+      let r = Math.max(grip.origX, grip.origX2);
+      let t = Math.min(grip.origY, grip.origY2);
+      let b = Math.max(grip.origY, grip.origY2);
+      if (grip.dir.includes('w')) l += dx;
+      if (grip.dir.includes('e')) r += dx;
+      if (grip.dir.includes('n')) t += dy;
+      if (grip.dir.includes('s')) b += dy;
+      const MIN = 8 / zoom;          // 潰して見失わない様の下限
+      if (r - l < MIN) { if (grip.dir.includes('w')) l = r - MIN; else r = l + MIN; }
+      if (b - t < MIN) { if (grip.dir.includes('n')) t = b - MIN; else b = t + MIN; }
+      onMove(grip.id, l, t, r, b);
+    };
+    const handleUp = () => setGrip(null);
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+  }, [grip, onMove]);
+
   const SZ = 12; // ハンドルサイズ (px)
+  const GSZ = 10; // リサイズつまみのサイズ (px)
+  const ACCENT = '#38bdf8';
+
+  // 選択中のアノテーションに出すリサイズつまみ。 screen 座標で置く
+  // (SVG の中に置くと zoom でつまみ自体が伸縮して掴みにくいため)。
+  const gripsFor = (a: Anno): { dir: AnnoGrip; sx: number; sy: number }[] => {
+    const toS = (fx: number, fy: number) => ({ sx: fx * vp.zoom + vp.x, sy: fy * vp.zoom + vp.y });
+    if (a.kind === 'text') return [];
+    if (a.kind === 'line') {
+      const p1 = toS(a.x, a.y), p2 = toS(a.x2, a.y2);
+      return [{ dir: 'p1', ...p1 }, { dir: 'p2', ...p2 }];
+    }
+    const l = Math.min(a.x, a.x2), r = Math.max(a.x, a.x2);
+    const t = Math.min(a.y, a.y2), b = Math.max(a.y, a.y2);
+    const mx = (l + r) / 2, my = (t + b) / 2;
+    const pts: [AnnoGrip, number, number][] = [
+      ['nw', l, t], ['n', mx, t], ['ne', r, t],
+      ['w', l, my], ['e', r, my],
+      ['sw', l, b], ['s', mx, b], ['se', r, b],
+    ];
+    return pts.map(([dir, fx, fy]) => ({ dir, ...toS(fx, fy) }));
+  };
 
   return (
     <>
@@ -1418,10 +1529,11 @@ function DragHandles({
         return (
           <div
             key={a.id}
-            title="ドラッグで移動"
+            title="ドラッグで移動 / クリックで選択 (四隅・四辺をドラッグでリサイズ)"
             onMouseDown={(e) => {
               e.stopPropagation();
               e.preventDefault();
+              onSelect(a.id);          // 掴んだものを選択状態にする
               setDrag({
                 id: a.id,
                 startCx: e.clientX, startCy: e.clientY,
@@ -1435,7 +1547,8 @@ function DragHandles({
               top: hy,
               width: SZ,
               height: SZ,
-              background: drag?.id === a.id ? '#2563eb' : '#3b82f6',
+              background: drag?.id === a.id ? '#2563eb'
+                : selectedId === a.id ? ACCENT : '#3b82f6',
               border: '1.5px solid rgba(255,255,255,0.85)',
               borderRadius: 2,
               cursor: 'move',
@@ -1455,6 +1568,39 @@ function DragHandles({
           </div>
         );
       })}
+      {/* 選択中のアノテーションのリサイズつまみ (2026-09-01)。
+          rect = 四隅 + 四辺、 line = 両端。 text はサイズを持たないので無し。 */}
+      {annos.filter((a) => a.id === selectedId).flatMap((a) =>
+        gripsFor(a).map((g) => (
+          <div
+            key={`${a.id}-${g.dir}`}
+            title="ドラッグでリサイズ"
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              setGrip({
+                id: a.id, dir: g.dir,
+                startCx: e.clientX, startCy: e.clientY,
+                origX: a.x, origY: a.y, origX2: a.x2, origY2: a.y2,
+              });
+            }}
+            style={{
+              position: 'absolute',
+              left: g.sx - GSZ / 2,
+              top: g.sy - GSZ / 2,
+              width: GSZ,
+              height: GSZ,
+              background: ACCENT,
+              border: '2px solid rgba(255,255,255,0.9)',
+              borderRadius: 2,
+              cursor: GRIP_CURSOR[g.dir],
+              zIndex: grip?.id === a.id ? 1100 : 60,
+              pointerEvents: 'all',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
+            }}
+          />
+        )),
+      )}
     </>
   );
 }
@@ -1644,6 +1790,8 @@ export default function Flow() {
   const qc = useQueryClient();
   const [controlSlug, setControlSlug] = useState<string | null>(null);
   const rfBoxRef = useRef<HTMLDivElement>(null);
+  // 加筆の選択中 id (= リサイズつまみを出す対象)。 pane クリックで解除する。
+  const [selAnno, setSelAnno] = useState<string | null>(null);
   const [annos, setAnnos] = useState<Anno[]>(() => {
     try { return JSON.parse(localStorage.getItem(ANNO_LS_KEY) || '[]') as Anno[]; }
     catch { return []; }
@@ -1664,6 +1812,7 @@ export default function Flow() {
 
   const deleteAnno = useCallback((id: string) => {
     setAnnos((prev) => prev.filter((a) => a.id !== id));
+    setSelAnno((cur) => (cur === id ? null : cur));
   }, []);
 
   const moveAnno = useCallback((id: string, x: number, y: number, x2: number, y2: number) => {
@@ -2091,7 +2240,7 @@ export default function Flow() {
         setAnnoColor={setAnnoColor}
         annoFontSize={annoFontSize}
         setAnnoFontSize={setAnnoFontSize}
-        onClear={() => { if (window.confirm('加筆を全て消去しますか?')) setAnnos([]); }}
+        onClear={() => { if (window.confirm('加筆を全て消去しますか?')) { setAnnos([]); setSelAnno(null); } }}
         isLight={isLight}
       />
       <Modal
@@ -2119,6 +2268,8 @@ export default function Flow() {
         elementsSelectable
         // 選択中に Backspace を押しても node を消さない (= 表示専用の画面)。
         deleteKeyCode={null}
+        // 何もない所をクリックしたら加筆の選択を解除する。
+        onPaneClick={() => setSelAnno(null)}
         style={{ background: bg }}
       >
         <Background gap={20} size={1} color={bgDotColor} />
@@ -2129,11 +2280,13 @@ export default function Flow() {
           annoColor={annoColor}
           annoFontSize={annoFontSize}
           rfBoxRef={rfBoxRef}
+          selectedId={selAnno}
+          onSelect={setSelAnno}
           onAdd={addAnno}
           onDelete={deleteAnno}
           onTextPlace={handleTextPlace}
         />
-        <DragHandles annos={annos} onMove={moveAnno} />
+        <DragHandles annos={annos} selectedId={selAnno} onSelect={setSelAnno} onMove={moveAnno} />
         <MiniMap
           nodeColor={(n) => {
             const d = n.data as unknown as FlowNode;
