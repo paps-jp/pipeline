@@ -88,6 +88,10 @@ class FlowNode(BaseModel):
     # elastic scaler の pending (=want算定入力) に注入する。 dispatcher-elimination 後、
     # 自 queue が push-drain 済で 0 の workload の真の需要はここでしか見えない。
     demand_from: list[str] | None = None
+    # ボックスの大きさ (2026-08-31)。 UI でリサイズすると yaml に書き戻される。
+    # 未指定なら UI 側の kind ごとの既定サイズ (= 従来の見た目) にフォールバック。
+    w: float | None = None
+    h: float | None = None
     # 「停滞しているか」判定 (2026-08-31)。 workload node のみ。 この workload が食う
     # 上流 tank (demand_from 宣言、 無ければ tank→workload の実線 edge) の水位が
     # 直近 backlog_trend_span_min 分で何件/分 増減したか。
@@ -1054,6 +1058,9 @@ class _Pos(BaseModel):
     id: str
     x: float
     y: float
+    # リサイズ後の大きさ。 位置だけ動かした node には付かないので任意。
+    w: float | None = None
+    h: float | None = None
 
 
 class _SaveLayoutReq(BaseModel):
@@ -1062,8 +1069,9 @@ class _SaveLayoutReq(BaseModel):
 
 @router.post("/layout")
 def save_layout(payload: _SaveLayoutReq) -> dict[str, int]:
-    """ドラッグ後の位置を yaml に書き戻す。 既存ノードの x/y のみ更新、
-    他のフィールド/コメント/順序は維持 (ruamel が無い環境では PyYAML round-trip)。
+    """ドラッグ後の位置と大きさを yaml に書き戻す。 既存ノードの x/y (+ 送られて
+    きた node は w/h) のみ更新、 他のフィールド/コメント/順序は維持
+    (ruamel が無い環境では PyYAML round-trip)。
 
     安全策:
     - 同じ id がレイアウトに無ければ skip。
@@ -1097,6 +1105,12 @@ def save_layout(payload: _SaveLayoutReq) -> dict[str, int]:
             continue
         n["x"] = int(round(p.x))
         n["y"] = int(round(p.y))
+        # w/h はリサイズした node だけ送られてくる。 未送信の node の既存値は保つ
+        # (= 位置だけ動かしたときに大きさを消してしまわない)。
+        if p.w is not None:
+            n["w"] = int(round(p.w))
+        if p.h is not None:
+            n["h"] = int(round(p.h))
         updated += 1
     skipped = len(pos_map) - updated
 
@@ -1307,6 +1321,8 @@ def _snapshot_uncached(req: Request) -> FlowSnapshot:
             capacity_warn=n.get("capacity_warn"),
             unit=n.get("unit"),
             demand_from=n.get("demand_from"),
+            w=n.get("w"),
+            h=n.get("h"),
         )
         if node.kind == "workload":
             slug = node.workload_slug or node.id

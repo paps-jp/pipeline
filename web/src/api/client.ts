@@ -337,7 +337,9 @@ export const api = {
     }),
 
   flowSnapshot: () => request<FlowSnapshot>("/api/v1/flow/snapshot"),
-  saveFlowLayout: (positions: Array<{ id: string; x: number; y: number }>) =>
+  saveFlowLayout: (
+    positions: Array<{ id: string; x: number; y: number; w?: number; h?: number }>,
+  ) =>
     request<{ updated: number; skipped: number }>("/api/v1/flow/layout", {
       method: "POST",
       json: { positions },
@@ -378,6 +380,9 @@ export interface FlowNode {
   backlog_trend_span_min?: number | null;
   /** 集計に使った上流 tank id (= tooltip 表示用)。 */
   backlog_tanks?: string[] | null;
+  /** ボックスの大きさ。UI でリサイズすると yaml に書き戻される。未指定は kind 既定。 */
+  w?: number | null;
+  h?: number | null;
 }
 
 export interface FlowEdge {

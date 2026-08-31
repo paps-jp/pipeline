@@ -19,6 +19,7 @@ import {
   type Edge,
   type NodeChange,
   type EdgeTypes,
+  NodeResizer,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
@@ -281,6 +282,42 @@ function flangeStyle(
 // edge 側は sourceHandle / targetHandle で配線先を選ぶ (= 最短側を選択)。
 // active が指定されると、 その集合に含まれる handle だけがフランジ風に visible、
 // 他は完全に透明 (= 接続されてない辺に dot が残らない)。
+// ボックスの既定サイズ (= 従来の見た目)。 yaml に w/h があればそちらが勝つ。
+// height を undefined にしてある kind は「中身なり (auto)」 で、 ユーザが
+// リサイズして初めて高さが固定される (= 既定で中身が切れるのを避けるため)。
+const NODE_DEFAULT_W: Record<string, number> = { workload: 220, tank: 180, external: 180 };
+const NODE_DEFAULT_H: Record<string, number | undefined> = {
+  workload: undefined, tank: 110, external: undefined,
+};
+// これ以上小さくすると文字が潰れて読めなくなる下限。
+const NODE_MIN: Record<string, { w: number; h: number }> = {
+  workload: { w: 170, h: 96 },
+  tank: { w: 130, h: 84 },
+  external: { w: 130, h: 64 },
+};
+
+// リサイズ枠。 選択中の node にだけ出す (= 常時出すと 34 個 x 8 ハンドルで
+// 配線が見えなくなる)。 掴む所は工業計器に合わせて小さい四角 + 細い実線。
+function BoxResizer({ kind, isLight, visible }: {
+  kind: string; isLight: boolean; visible: boolean;
+}) {
+  const min = NODE_MIN[kind] ?? NODE_MIN.workload;
+  const c = isLight ? "#64748b" : "#94a3b8";
+  return (
+    <NodeResizer
+      isVisible={visible}
+      minWidth={min.w}
+      minHeight={min.h}
+      lineStyle={{ borderColor: c, borderWidth: 1 }}
+      handleStyle={{
+        width: 7, height: 7, borderRadius: 1,
+        background: isLight ? "#ffffff" : "#0f172a",
+        border: `1.5px solid ${c}`,
+      }}
+    />
+  );
+}
+
 function NodeHandles({ active }: { active?: ReadonlySet<string> }) {
   const { colorScheme } = useMantineColorScheme();
   const isLight = colorScheme === "light";
@@ -319,12 +356,14 @@ function NodeHandles({ active }: { active?: ReadonlySet<string> }) {
 
 function WorkloadNode({
   data,
+  selected,
 }: {
   data: FlowNode & {
     activeHandles?: string[];
     submitted_window?: number;
     submitted_window_min?: number;
   };
+  selected?: boolean;
 }) {
   const { t } = useTranslation();
   const { colorScheme } = useMantineColorScheme();
@@ -387,7 +426,9 @@ function WorkloadNode({
       animate={{ scale: 1, opacity: 1 }}
       title={biasTitle}
       style={{
-        width: 220,
+        // 大きさは node 側 (= yaml の w/h か kind 既定) が決める。 中身はそれに従う。
+        width: "100%",
+        height: data.h != null ? "100%" : undefined,
         background: cardBg,
         border: cardBorder,
         borderRadius: isLight ? 4 : 2,      // 工業計器風: 角はキリッと
@@ -396,8 +437,10 @@ function WorkloadNode({
         boxShadow: cardShadow,
         fontSize: 12,
         position: "relative",
+        overflow: "hidden",   // 縮めた時に中身が外へはみ出さない様に
       }}
     >
+      <BoxResizer kind="workload" isLight={isLight} visible={!!selected} />
       <NodeHandles active={active} />
       <Group justify="space-between" gap={4} wrap="nowrap">
         <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
@@ -784,9 +827,10 @@ function ErrorOverlay() {
   return <HazardOverlay bg={HAZARD_RED_BG} barBg="#ef4444" barText="#ffffff" label="✕ ERROR" barBelow />;
 }
 
-function TankNode({ data }: { data: FlowNode & { activeHandles?: string[];
-                                                    inflow_per_min?: number;
-                                                    outflow_per_min?: number } }) {
+function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: string[];
+                                                          inflow_per_min?: number;
+                                                          outflow_per_min?: number };
+                                       selected?: boolean }) {
   const { colorScheme } = useMantineColorScheme();
   const isLight = colorScheme === "light";
   const nodeLabel = useNodeLabel(data);
@@ -827,8 +871,8 @@ function TankNode({ data }: { data: FlowNode & { activeHandles?: string[];
       initial={{ scale: 0.95, opacity: 0 }}
       animate={{ scale: 1, opacity: 1 }}
       style={{
-        width: 180,
-        height: 110,
+        width: "100%",
+        height: "100%",
         background: cardBg,
         border: cardBorder,
         borderRadius: isLight ? 4 : 2,
@@ -839,6 +883,7 @@ function TankNode({ data }: { data: FlowNode & { activeHandles?: string[];
         boxShadow: isLight ? "0 1px 4px rgba(15,23,42,0.06)" : "none",
       }}
     >
+      <BoxResizer kind="tank" isLight={isLight} visible={!!selected} />
       <NodeHandles active={active} />
       {/* タンクの液面 (= 水面に波アニメ。 borderTop は使わず TankWave で代用)。
           overflow 時は薄いグラデではなく hazard tape と同じ濃い黄 solid に統一
@@ -922,7 +967,8 @@ function TankNode({ data }: { data: FlowNode & { activeHandles?: string[];
   );
 }
 
-function ExternalNode({ data }: { data: FlowNode & { activeHandles?: string[] } }) {
+function ExternalNode({ data, selected }: { data: FlowNode & { activeHandles?: string[] };
+                                           selected?: boolean }) {
   const { t } = useTranslation();
   const { colorScheme } = useMantineColorScheme();
   const isLight = colorScheme === "light";
@@ -932,7 +978,8 @@ function ExternalNode({ data }: { data: FlowNode & { activeHandles?: string[] } 
     <Paper
       p={10}
       style={{
-        width: 180,
+        width: "100%",
+        height: data.h != null ? "100%" : undefined,
         background: isLight
           ? "linear-gradient(135deg, #ffffff 0%, #f8fafc 100%)"
           : "linear-gradient(135deg, #1e293b 0%, #0f172a 100%)",
@@ -940,9 +987,11 @@ function ExternalNode({ data }: { data: FlowNode & { activeHandles?: string[] } 
         borderRadius: isLight ? 4 : 2,
         color: isLight ? "#1f2937" : "#e2e8f0",
         position: "relative",
+        overflow: "hidden",
         boxShadow: isLight ? "0 1px 4px rgba(15,23,42,0.06)" : "none",
       }}
     >
+      <BoxResizer kind="external" isLight={isLight} visible={!!selected} />
       <NodeHandles active={active} />
       <Stack gap={4}>
         <Text size="xs" c="dimmed">{t("flow.external")}</Text>
@@ -1592,7 +1641,13 @@ export default function Flow() {
   // ドラッグで動かしたローカル座標を保持。 サーバ snapshot は metric を上書きするが
   // 座標は最新のローカルを優先 (= drag 中に snapshot 来ても飛ばない)。
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  // debounce save は 800ms 後に走るので、 その時点の位置を読むための ref
+  // (= リサイズだけした node は dirtyPositions に居らず x/y を持たないため)。
+  const nodesRef = useRef<Node[]>([]);
   const dirtyPositions = useRef<Map<string, { x: number; y: number }>>(new Map());
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+  // リサイズ結果も位置と同じ扱い (= 3 秒ごとの snapshot rebuild で巻き戻さない)。
+  const dirtySizes = useRef<Map<string, { w: number; h: number }>>(new Map());
 
   // snapshot が来たら nodes を rebuild (= metric 部だけ反映、 位置は dirty 優先)。
   // setNodes の functional form で現 nodes を読み、 activeHandles (= edges
@@ -1631,12 +1686,20 @@ export default function Flow() {
           base.submitted_window = submittedBySlug.get(n.workload_slug || n.id) ?? 0;
           base.submitted_window_min = RATE_WINDOW_MIN;
         }
+        // 大きさ: ローカルのリサイズ中 > yaml の w/h > kind ごとの既定。
+        // height 既定が undefined の kind は「中身なり」 のまま (= 従来の見た目)。
+        const size = dirtySizes.current.get(n.id);
+        const w = size?.w ?? n.w ?? NODE_DEFAULT_W[n.kind] ?? NODE_DEFAULT_W.workload;
+        const h = size?.h ?? n.h ?? NODE_DEFAULT_H[n.kind];
+        if (h != null) base.h = h;
         return {
           id: n.id,
           type: n.kind,
           position: dirty ?? { x: n.x, y: n.y },
           data: base,
           draggable: true,
+          width: w,
+          height: h,
         };
       });
     });
@@ -1648,6 +1711,8 @@ export default function Flow() {
     // node 中心座標 + サイズ map (= handle 自動選択用)
     // kind ごとの実描画 width/height は WorkloadNode=220x150 / TankNode=180x110 /
     // ExternalNode≒180x90。 ここで小さくズレても dominant-axis 判定はぶれない。
+    // フォールバック値のみ。 実際は node の width/height (= yaml の w/h か
+    // React Flow の実測) を優先する (= リサイズした box でも配線がズレない)。
     const SIZE: Record<string, { w: number; h: number }> = {
       workload: { w: 220, h: 150 },
       tank: { w: 180, h: 110 },
@@ -1658,13 +1723,15 @@ export default function Flow() {
     const posMap = new Map<string, BBox>();
     for (const n of nodes) {
       const sz = SIZE[(n.type as string) ?? "workload"] ?? SIZE.workload;
+      const w = n.width ?? n.measured?.width ?? sz.w;
+      const h = n.height ?? n.measured?.height ?? sz.h;
       posMap.set(n.id, {
-        cx: n.position.x + sz.w / 2,
-        cy: n.position.y + sz.h / 2,
+        cx: n.position.x + w / 2,
+        cy: n.position.y + h / 2,
         x: n.position.x,
         y: n.position.y,
-        w: sz.w,
-        h: sz.h,
+        w,
+        h,
       });
     }
     // ----- obstacle-aware handle 自動選択 -----
@@ -1853,8 +1920,9 @@ export default function Flow() {
 
   // ---------- Phase 3: ドラッグで位置を YAML に PATCH ----------
   const saveLayoutMut = useMutation({
-    mutationFn: (positions: Array<{ id: string; x: number; y: number }>) =>
-      api.saveFlowLayout(positions),
+    mutationFn: (
+      positions: Array<{ id: string; x: number; y: number; w?: number; h?: number }>,
+    ) => api.saveFlowLayout(positions),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["flow-snapshot"] });
     },
@@ -1865,11 +1933,24 @@ export default function Flow() {
   const scheduleSave = useCallback(() => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      const payload = Array.from(dirtyPositions.current.entries()).map(([id, p]) => ({
-        id,
-        x: Math.round(p.x),
-        y: Math.round(p.y),
-      }));
+      // リサイズだけした node は dirtyPositions に居ないので、 両方の id を集める。
+      // 位置は現在値が要るので nodes から引く (= x/y は必須フィールド)。
+      const ids = new Set([
+        ...dirtyPositions.current.keys(),
+        ...dirtySizes.current.keys(),
+      ]);
+      const posOf = new Map(nodesRef.current.map((n) => [n.id, n.position]));
+      const payload = Array.from(ids).flatMap((id) => {
+        const p = dirtyPositions.current.get(id) ?? posOf.get(id);
+        if (!p) return [];
+        const sz = dirtySizes.current.get(id);
+        return [{
+          id,
+          x: Math.round(p.x),
+          y: Math.round(p.y),
+          ...(sz ? { w: Math.round(sz.w), h: Math.round(sz.h) } : {}),
+        }];
+      });
       if (payload.length > 0) {
         saveLayoutMut.mutate(payload);
       }
@@ -1884,9 +1965,16 @@ export default function Flow() {
         if (c.type === "position" && c.position) {
           dirtyPositions.current.set(c.id, c.position);
         }
+        // dimensions は「初回計測」 でも飛んでくる。 NodeResizer 由来のものだけ
+        // 拾いたいので resizing フラグの有無で区別する (計測由来には付かない)。
+        if (c.type === "dimensions" && c.dimensions && c.resizing !== undefined) {
+          dirtySizes.current.set(c.id, { w: c.dimensions.width, h: c.dimensions.height });
+        }
       }
-      // dragging=false の change が来たら save (drag 終了の signal)
-      if (changes.some((c) => c.type === "position" && c.dragging === false)) {
+      // drag / resize 終了の signal で save
+      if (changes.some((c) =>
+        (c.type === "position" && c.dragging === false) ||
+        (c.type === "dimensions" && c.resizing === false))) {
         scheduleSave();
       }
     },
@@ -1948,7 +2036,11 @@ export default function Flow() {
         proOptions={{ hideAttribution: true }}
         nodesConnectable={false}
         nodesDraggable
-        elementsSelectable={false}
+        // box をクリックで選択 → リサイズ枠が出る。 選択できないと NodeResizer の
+        // 表示条件が作れないので false から変更した (2026-08-31)。
+        elementsSelectable
+        // 選択中に Backspace を押しても node を消さない (= 表示専用の画面)。
+        deleteKeyCode={null}
         style={{ background: bg }}
       >
         <Background gap={20} size={1} color={bgDotColor} />
