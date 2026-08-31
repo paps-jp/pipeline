@@ -323,31 +323,50 @@ class RunsRepository:
                 out[slug] = total
         return out
 
+    def _slugs_since(self, conn: Any, since_iso: str) -> list[str]:
+        """窓内に run がある slug の一覧。 `idx_runs_wl_started` の先頭列を
+        skip-scan するだけなので、 窓に 30 万行あっても 1ms 未満で返る。"""
+        cur = conn.execute(
+            "SELECT DISTINCT workload_slug FROM runs WHERE started_at >= :since",
+            {"since": str(since_iso)},
+        )
+        return [r["workload_slug"] for r in cur.fetchall()]
+
     def latest_by_slug(self, since_iso: str) -> dict[str, dict[str, Any]]:
         """直近窓で slug ごとの最新 run 1 件を返す (= flow の state/last_output 用)。
 
-        window 関数 (ROW_NUMBER) で slug 数分の行だけ返すため、 全行ロードしない。
+        **slug ごとに 1 回ずつ seek する** (2026-08-31)。 旧実装は ROW_NUMBER() の
+        window 関数 1 発で書いていたが、 WHERE が started_at 単独で slug を縛らない
+        ため `idx_runs_wl_started` があっても各パーティションの並べ替えで TEMP
+        B-TREE が走り、 **窓内 31万行で 1.2 秒**かかっていた (flow snapshot は 3 秒
+        ごとに叩かれるので、 これだけで control plane の CPU が定常的に埋まる)。
+        slug は 18 種と少数なので、 index を端から seek する方が桁違いに速い:
+        実測 1.223s → 0.001s。
+
         必要列のみ (stdout/stderr は除外)。 返り値 = {slug: row dict}。
+        error / worker_id も返す (= flow の緊急アラートが GPU 故障文言を走査する)。
         """
         out: dict[str, dict[str, Any]] = {}
         with self.db.transaction() as conn:
-            cur = conn.execute(
-                "SELECT workload_slug, started_at, finished_at, success, output_json FROM ("
-                "  SELECT workload_slug, started_at, finished_at, success, output_json,"
-                "         ROW_NUMBER() OVER (PARTITION BY workload_slug"
-                "                            ORDER BY started_at DESC) AS rn"
-                "  FROM runs WHERE started_at >= :since"
-                ") t WHERE rn = 1",
-                {"since": str(since_iso)},
-            )
-            for r in cur.fetchall():
+            for slug in self._slugs_since(conn, since_iso):
+                r = conn.execute(
+                    "SELECT workload_slug, started_at, finished_at, success, "
+                    "       output_json, error, worker_id FROM runs "
+                    "WHERE workload_slug = :slug AND started_at >= :since "
+                    "ORDER BY started_at DESC LIMIT 1",
+                    {"slug": slug, "since": str(since_iso)},
+                ).fetchone()
+                if r is None:
+                    continue
                 oj = r["output_json"]
-                out[r["workload_slug"]] = {
-                    "workload_slug": r["workload_slug"],
+                out[slug] = {
+                    "workload_slug": slug,
                     "started_at": r["started_at"],
                     "finished_at": r["finished_at"],
                     "success": bool(r["success"]) if r["success"] is not None else None,
                     "output_json": json.loads(oj) if oj else None,
+                    "error": r["error"],
+                    "worker_id": r["worker_id"],
                 }
         return out
 
@@ -357,21 +376,23 @@ class RunsRepository:
         latest_by_slug は最新 run(= 進行中の未完了 self_loop tick)を返すので metric が無い。
         長 tick workload (image-pull 等) の実レートは、 この最後に完了した tick の
         output_json(inserted 等)/ dispatch_secs から算定できる (flow の throughput fallback 用)。
+
+        `latest_by_slug` と同じ理由で slug ごとの seek に書き換えてある
+        (window 関数版は実測 1.136s、 seek 版は 0.001s)。
         """
         out: dict[str, dict[str, Any]] = {}
         with self.db.transaction() as conn:
-            cur = conn.execute(
-                "SELECT workload_slug, finished_at, output_json FROM ("
-                "  SELECT workload_slug, finished_at, output_json,"
-                "         ROW_NUMBER() OVER (PARTITION BY workload_slug"
-                "                            ORDER BY started_at DESC) AS rn"
-                "  FROM runs WHERE started_at >= :since AND success = 1"
-                ") t WHERE rn = 1",
-                {"since": str(since_iso)},
-            )
-            for r in cur.fetchall():
+            for slug in self._slugs_since(conn, since_iso):
+                r = conn.execute(
+                    "SELECT finished_at, output_json FROM runs "
+                    "WHERE workload_slug = :slug AND started_at >= :since "
+                    "AND success = 1 ORDER BY started_at DESC LIMIT 1",
+                    {"slug": slug, "since": str(since_iso)},
+                ).fetchone()
+                if r is None:
+                    continue
                 oj = r["output_json"]
-                out[r["workload_slug"]] = {
+                out[slug] = {
                     "finished_at": r["finished_at"],
                     "output_json": json.loads(oj) if oj else None,
                 }
