@@ -240,6 +240,15 @@ def create_app(settings: Settings) -> FastAPI:
                         frepo.sample_minute(base - _dt.timedelta(minutes=k), _WMF, _WMF_RAW)
                 except Exception:
                     log.exception("flow_rate_1m aggregator failed")
+                # tank 水位の 1 分サンプル (2026-08-31): フロー画面の「停滞判定」用。
+                # metric='tank_level' で同じ long-format 表に載せる。 tank SQL は
+                # delian への同期クエリなので **必ず別スレッド**で回す (event loop を
+                # 止めるとフリート全体の heartbeat が滞留する — 過去に事故済)。
+                try:
+                    from pipeline.api.flow import sample_tank_levels as _sample_tanks
+                    await _asyncio.to_thread(_sample_tanks, db)
+                except Exception:
+                    log.exception("tank_level sampling failed")
                 try:
                     await _asyncio.wait_for(_flow_rate_stop.wait(), timeout=60)
                 except _asyncio.TimeoutError:

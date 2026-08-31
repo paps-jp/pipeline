@@ -45,6 +45,12 @@ _TANK_CACHE_TTL_S = 30.0
 # heartbeat が滞留」を再現してしまう。 重い tank は stale 値を返しつつ裏で更新する。
 _TANK_SYNC_MAX_TTL_S = 120.0
 _TANK_BG_STMT_TIMEOUT_MS = 120000   # 2min — 1.8億行 COUNT(*) 用 (背景実行のみ)
+# 上流バックログ (= tank 水位) の増減トレンド用 (2026-08-31)。 flow_rate_1m の
+# metric='tank_level' 系列 (server の _flow_rate_1m_loop が 60s 毎に記録) を窓の
+# 両端で差分して 件/分 を出す。 窓が短いと 30s cache の階段でブレるので 10 分。
+# span が最低 3 分に満たない (= 起動直後・サンプル欠け) 間は None = 中立表示。
+_TANK_TREND_WINDOW_MIN = 10
+_TANK_TREND_MIN_SPAN_MIN = 3.0
 _tank_cache: dict[str, tuple[float, int | None, str | None]] = {}
 _tank_cache_lock = threading.Lock()
 _tank_refresh_inflight: set[str] = set()
@@ -82,6 +88,15 @@ class FlowNode(BaseModel):
     # elastic scaler の pending (=want算定入力) に注入する。 dispatcher-elimination 後、
     # 自 queue が push-drain 済で 0 の workload の真の需要はここでしか見えない。
     demand_from: list[str] | None = None
+    # 「停滞しているか」判定 (2026-08-31)。 workload node のみ。 この workload が食う
+    # 上流 tank (demand_from 宣言、 無ければ tank→workload の実線 edge) の水位が
+    # 直近 backlog_trend_span_min 分で何件/分 増減したか。
+    #   > 0 = 積み上がっている (= 捌けていない)  / < 0 = 減らせている
+    # edge の rate_per_min は宣言 metric が欠けると隣の workload の throughput を
+    # 借りる「借り物」なので判定には使わない (= 実 SQL count の時系列だけを使う)。
+    backlog_trend_per_min: float | None = None
+    backlog_trend_span_min: float | None = None
+    backlog_tanks: list[str] | None = None
 
 
 class FlowEdge(BaseModel):
@@ -933,6 +948,92 @@ def _tank_query(to_query: dict[str, str],
     return results
 
 
+def _trend_tank_sqls(nodes_raw: list[dict[str, Any]],
+                     ) -> tuple[dict[str, str], dict[str, float]]:
+    """トレンドを取る tank の (id→SQL, id→TTL)。
+
+    除外するもの:
+    - `accumulator: true` = 単調増加する総数タンク (crawl / *_hash / final 等)。
+      「増えている」 のが正常なのでバックログ判定に混ぜると常時 赤 になる。
+    - `unit` 付き (= GB 等 件数でない tank)。 件/分 として足し合わせられない。
+    """
+    sqls: dict[str, str] = {}
+    ttls: dict[str, float] = {}
+    for n in nodes_raw:
+        if n.get("kind") != "tank" or not n.get("metric_sql"):
+            continue
+        if n.get("accumulator") or n.get("unit"):
+            continue
+        sqls[n["id"]] = n["metric_sql"]
+        if n.get("metric_ttl_s"):
+            ttls[n["id"]] = float(n["metric_ttl_s"])
+    return sqls, ttls
+
+
+def sample_tank_levels(db: Any) -> int:
+    """各 tank の現在水位を flow_rate_1m (metric='tank_level') へ 1 分バケットで記録。
+
+    server の _flow_rate_1m_loop から 60s 毎に呼ぶ。 **同期 SQL を投げるので
+    必ず別スレッドで呼ぶこと** (event loop を止めるとフリートの heartbeat が滞留する)。
+    `_exec_tanks` 経由なので tank ごとの TTL cache を尊重する (= 画面を開いている
+    間は cache hit で追加クエリ 0、 誰も見ていない間だけ実際に COUNT が走る)。
+    戻り値 = 書けた tank 数。
+    """
+    from pipeline.repositories.flow_rate import FlowRateRepository
+
+    layout = _load_layout()
+    sqls, ttls = _trend_tank_sqls(layout.get("nodes") or [])
+    if not sqls:
+        return 0
+    results = _exec_tanks(sqls, ttls)
+    frr = FlowRateRepository(db)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    written = 0
+    for tid, (val, err) in results.items():
+        if err is not None or val is None:
+            continue          # 初回 (背景更新待ち) / クエリ失敗は書かない
+        frr.upsert(now, tid, "tank_level", float(val))
+        written += 1
+    return written
+
+
+def _tank_level_trends(frr: Any, now_dt: _dt.datetime,
+                       ) -> dict[str, tuple[float, float]]:
+    """tank_id → (件/分, 実 span 分)。 flow_rate_1m の tank_level 系列を窓の両端で差分。
+
+    窓内のサンプルが 1 点だけ / span が _TANK_TREND_MIN_SPAN_MIN 未満の tank は
+    返さない (= UI は中立表示)。 回帰でなく両端差分にしているのは、 水位が 30s
+    cache 由来の階段状で、 中間点を重み付けしても意味が増えないため。
+    """
+    since = (now_dt - _dt.timedelta(minutes=_TANK_TREND_WINDOW_MIN + 1)).isoformat()
+    try:
+        rows = frr.read_series(since, metric="tank_level")
+    except Exception as e:                       # 履歴が無くても snapshot は壊さない
+        log.warning("tank_level series read failed: %s", e)
+        return {}
+    first: dict[str, tuple[_dt.datetime, float]] = {}
+    last: dict[str, tuple[_dt.datetime, float]] = {}
+    for r in rows:
+        tid = r.get("slug")
+        try:
+            ts = _dt.datetime.fromisoformat(str(r["ts_min"]))
+            v = float(r["value"])
+        except Exception:
+            continue
+        if tid not in first or ts < first[tid][0]:
+            first[tid] = (ts, v)
+        if tid not in last or ts > last[tid][0]:
+            last[tid] = (ts, v)
+    out: dict[str, tuple[float, float]] = {}
+    for tid, (t0, v0) in first.items():
+        t1, v1 = last[tid]
+        span = (t1 - t0).total_seconds() / 60.0
+        if span < _TANK_TREND_MIN_SPAN_MIN:
+            continue
+        out[tid] = ((v1 - v0) / span, span)
+    return out
+
+
 def _classify_state(latest_run: dict[str, Any] | None) -> str:
     if not latest_run:
         return "idle"
@@ -1236,6 +1337,39 @@ def snapshot(req: Request) -> FlowSnapshot:
                 node.fill_ratio = min(1.0, v / float(node.capacity_warn))
         nodes.append(node)
 
+    # 3.5 「停滞しているか」= 上流バックログの増減 (2026-08-31)
+    # その workload が食う tank の水位が積み上がっていれば停滞、 減っていれば捌けている。
+    # 上流 tank は demand_from 宣言を最優先する (dispatcher-elimination 後、 自 queue が
+    # push-drain 済で 0 の workload の真の需要はそこにしか書いていない)。 宣言が無ければ
+    # tank → workload の **実線** edge から拾う (dashed は参照線であって流路ではない)。
+    tank_nodes = {n.id: n for n in nodes if n.kind == "tank"}
+    trend_ids = set(_trend_tank_sqls(nodes_raw)[0])   # accumulator / 単位付きを除外済
+    upstream_by_wl: dict[str, list[str]] = {}
+    for e in edges_raw:
+        if e.get("dashed") or e["from"] not in tank_nodes:
+            continue
+        upstream_by_wl.setdefault(e["to"], []).append(e["from"])
+    tank_trends = _tank_level_trends(_frr, now_dt)
+    for node in nodes:
+        if node.kind != "workload":
+            continue
+        total = 0.0
+        span = 0.0
+        used: list[str] = []
+        for tid in (node.demand_from or upstream_by_wl.get(node.id) or []):
+            if tid not in trend_ids:
+                continue
+            tr = tank_trends.get(tid)
+            if tr is None:
+                continue
+            total += tr[0]
+            span = max(span, tr[1])
+            used.append(tid)
+        if used:
+            node.backlog_trend_per_min = round(total, 2)
+            node.backlog_trend_span_min = round(span, 1)
+            node.backlog_tanks = used
+
     # 4. edges
     nodes_by_id = {n.id: n for n in nodes}
     edges: list[FlowEdge] = []
@@ -1327,4 +1461,9 @@ def flow_rates(
     ).replace(second=0, microsecond=0).isoformat()
     repo = FlowRateRepository(req.app.state.db)
     series = repo.read_series(since, slug=slug, metric=metric)
+    if metric is None:
+        # tank_level は rate ではなく「水位」 (slug も workload でなく tank id)。
+        # 既定の rate 系列に混ぜると Throughput 画面の凡例に tank が並ぶので、
+        # 明示的に metric='tank_level' を指定した時だけ返す。
+        series = [r for r in series if r.get("metric") != "tank_level"]
     return {"since": since, "count": len(series), "series": series}

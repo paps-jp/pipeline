@@ -17,6 +17,8 @@ nodes:
   label: crawl (URL総数)
   icon: link
   metric_sql: SELECT COUNT(*) FROM crawl
+  # 単調増加する総数タンク = バックログではない (停滞判定から除外)
+  accumulator: true
   metric_ttl_s: 900
   capacity_warn: 500000000
 - id: paprika-job-submit
@@ -139,6 +141,8 @@ nodes:
   label: crawl_embedding_index (final)
   icon: database
   metric_sql: SELECT COUNT(*) FROM crawl_embedding_index
+  # 単調増加する総数タンク = バックログではない (停滞判定から除外)
+  accumulator: true
   metric_ttl_s: 900
   capacity_warn: 500000000
 - id: faiss_unindexed
@@ -188,6 +192,8 @@ nodes:
   label: crawl_person (集約)
   icon: users-group
   metric_sql: SELECT COUNT(*) FROM crawl_person
+  # 単調増加する総数タンク = バックログではない (停滞判定から除外)
+  accumulator: true
   metric_ttl_s: 900
   capacity_warn: 500000000
 - id: crawl_video_hash
@@ -197,6 +203,8 @@ nodes:
   label: crawl_video_hash (binary 集約)
   icon: fingerprint
   metric_sql: SELECT COUNT(*) FROM crawl_video_hash
+  # 単調増加する総数タンク = バックログではない (停滞判定から除外)
+  accumulator: true
   metric_ttl_s: 300
   capacity_warn: 500000000
 - id: crawl_image_hash
@@ -206,6 +214,8 @@ nodes:
   label: crawl_image_hash (binary 集約)
   icon: fingerprint
   metric_sql: SELECT COUNT(*) FROM crawl_image_hash
+  # 単調増加する総数タンク = バックログではない (停滞判定から除外)
+  accumulator: true
   metric_ttl_s: 900
   capacity_warn: 500000000
 - id: image_embed_queue

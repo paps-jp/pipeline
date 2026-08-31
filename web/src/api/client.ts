@@ -371,6 +371,13 @@ export interface FlowNode {
   unit?: string | null;
   error?: string | null;
   error_worker?: string | null;
+  /** workload が食う上流 tank の水位変化 (件/分)。>0 = 積み上がり (停滞)、<0 = 消化中。
+   *  edge の IN/OUT は借り物なので、停滞判定はこの実 count 時系列だけを使う。 */
+  backlog_trend_per_min?: number | null;
+  /** 上記の実測 span (分)。履歴が足りない間は trend ごと null。 */
+  backlog_trend_span_min?: number | null;
+  /** 集計に使った上流 tank id (= tooltip 表示用)。 */
+  backlog_tanks?: string[] | null;
 }
 
 export interface FlowEdge {

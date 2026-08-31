@@ -331,10 +331,38 @@ function WorkloadNode({
   const adapt = (data.adapt ?? {}) as Record<string, number>;
   const backlogH = backlogAgeHours(data.last_output?.watermark);
   const active = useMemo(() => new Set(data.activeHandles ?? []), [data.activeHandles]);
+  // 停滞しているか = **上流タンクが積み上がっているか** を背景色で示す (2026-08-31)。
+  //   増加中 (trend > 0) → 薄ピンク (= 食う側が追いついていない = 停滞)
+  //   減少中 (trend < 0) → 薄い緑  (= バックログを消化できている)
+  //   横ばい / 履歴不足   → 中立 (= 従来の白/紺)
+  // 判定値は server 側で「上流 tank の実 SQL count の時系列 (flow_rate_1m の
+  // tank_level)」 から出している。 edge の IN/OUT は宣言 metric が欠けると隣の
+  // workload の throughput を借りる借り物なので使わない。
+  // deadband は絶対値 1 件/分 (= 水位が 30s cache 由来の階段なので、 端数の揺れで
+  // 色がチラつかない程度)。
+  const trend = data.backlog_trend_per_min;
+  const TREND_EPS = 1.0;
+  const bias =
+    trend == null || Math.abs(trend) < TREND_EPS ? "flat" : trend > 0 ? "piling" : "draining";
   // theme-aware 色: dark = 工業 / light = やさしいパステル白系
   const cardBg = isLight
-    ? "linear-gradient(135deg, #ffffff 0%, #f8fafc 100%)"
-    : "linear-gradient(135deg, #1e293b 0%, #0f172a 100%)";
+    ? bias === "piling"
+      ? "linear-gradient(135deg, #fff5f7 0%, #ffe4e6 100%)"
+      : bias === "draining"
+      ? "linear-gradient(135deg, #f4fdf7 0%, #dcfce7 100%)"
+      : "linear-gradient(135deg, #ffffff 0%, #f8fafc 100%)"
+    : bias === "piling"
+      ? "linear-gradient(135deg, #3b2130 0%, #1b0f16 100%)"
+      : bias === "draining"
+      ? "linear-gradient(135deg, #17352a 0%, #0b1a14 100%)"
+      : "linear-gradient(135deg, #1e293b 0%, #0f172a 100%)";
+  // 色の根拠 (どのタンクが 何件/分 動いたか) はネイティブ tooltip で出す。 node は
+  // ドラッグ対象なので Mantine の Tooltip で包むと掴みにくくなるため title 属性。
+  const biasTitle =
+    trend == null
+      ? t("flow.backlog_trend_none", "上流バックログ: 履歴待ち")
+      : `${t("flow.backlog_trend", "上流バックログ")} ${trend > 0 ? "+" : ""}${fmtNum(trend)}/分` +
+        ` (${data.backlog_trend_span_min ?? 0}分, ${(data.backlog_tanks ?? []).join(", ")})`;
   const cardText = isLight ? "#1f2937" : "#e2e8f0";
   const cardBorder = isLight ? `1.5px solid ${color}cc` : `2px solid ${color}`;
   // 旧版は running 時に `0 0 18px ${color}66` の強い neon glow が出て
@@ -352,6 +380,7 @@ function WorkloadNode({
     <motion.div
       initial={{ scale: 0.95, opacity: 0 }}
       animate={{ scale: 1, opacity: 1 }}
+      title={biasTitle}
       style={{
         width: 220,
         background: cardBg,
