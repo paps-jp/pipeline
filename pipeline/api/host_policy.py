@@ -43,6 +43,7 @@ def _fetch_agent_auto(request: Request) -> dict[str, dict[str, Any]]:
     with db.transaction() as conn:
         cur = conn.execute(
             "SELECT host, last_vram_total_mb, last_vram_free_mb, last_gpu_model, "
+            "last_disk_total_mb, last_disk_free_mb, "
             "last_children_json, last_seen_at FROM agent_desired"
         )
         for r in cur.fetchall():
@@ -53,11 +54,18 @@ def _fetch_agent_auto(request: Request) -> dict[str, dict[str, Any]]:
                 children = []
             gpu_alive = sum(1 for c in children
                             if isinstance(c, dict) and c.get("gpu") and c.get("alive"))
+            dt, df = r["last_disk_total_mb"], r["last_disk_free_mb"]
             out[r["host"]] = {
                 "vram_total_mb": r["last_vram_total_mb"],
                 "vram_free_mb": r["last_vram_free_mb"],
                 "gpu_model": r["last_gpu_model"],
                 "gpu_children_alive": gpu_alive,
+                "disk_total_mb": dt,
+                "disk_free_mb": df,
+                # 使用率は「非特権が使える空き」基準。 root 予約 5% を空きに数えないので
+                # 100% に届く前に警告が出る (= ENOENT で全 workload が死ぬ手前で気付ける)。
+                "disk_used_pct": (round(100.0 * (dt - df) / dt, 1)
+                                  if dt and df is not None and dt > 0 else None),
                 "last_seen_at": r["last_seen_at"],
             }
     return out
@@ -70,6 +78,9 @@ class HostView(BaseModel):
     vram_total_mb: int | None = None
     vram_free_mb: int | None = None
     gpu_children_alive: int | None = None
+    disk_total_mb: int | None = None
+    disk_free_mb: int | None = None
+    disk_used_pct: float | None = None
     last_seen_at: str | None = None
     # manual 面
     tier: str | None = None
@@ -109,6 +120,9 @@ def _merge(host: str, auto: dict[str, Any], pol: dict[str, Any] | None) -> HostV
         vram_total_mb=auto.get("vram_total_mb"),
         vram_free_mb=auto.get("vram_free_mb"),
         gpu_children_alive=auto.get("gpu_children_alive"),
+        disk_total_mb=auto.get("disk_total_mb"),
+        disk_free_mb=auto.get("disk_free_mb"),
+        disk_used_pct=auto.get("disk_used_pct"),
         last_seen_at=auto.get("last_seen_at"),
         tier=pol.get("tier"),
         max_gpu_workers=pol.get("max_gpu_workers"),

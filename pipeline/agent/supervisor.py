@@ -95,6 +95,25 @@ class AgentSupervisor:
         except Exception:
             return None
 
+    def _disk_stats(self) -> tuple[int | None, int | None]:
+        """ルート FS の (total_mb, free_mb)。 取得不能なら (None, None)。
+
+        VRAM だけ報告していた時代は、 ローカル FS が満杯になっても制御プレーンから
+        一切見えなかった。 worker は heartbeat を出し続けるので alive に見え、
+        実際には ``tempfile.mkdtemp()`` が ENOENT で全 batch が落ちている
+        (2026-09-02 ai-gpu3: / が 100% で 1 週間無音停止)。
+
+        free は **非特権プロセスが実際に使える量** (f_bavail) を採る。 ext4 は既定で
+        5% を root 予約に残すので f_bfree だと 「まだ空きがある」 と誤報告になる。
+        """
+        try:
+            st = os.statvfs("/")
+        except OSError as e:
+            log.warning("[agent] statvfs('/') failed: %s", e)
+            return (None, None)
+        mb = st.f_frsize / (1024 * 1024)
+        return (int(st.f_blocks * mb), int(st.f_bavail * mb))
+
     def children_status(self) -> list[dict]:
         """sync packet 用: 子一覧 (child_id, workload, gpu, alive)。"""
         out = []

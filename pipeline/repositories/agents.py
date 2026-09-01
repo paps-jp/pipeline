@@ -28,18 +28,23 @@ class AgentRepository:
         vram_total_mb: int | None,
         vram_free_mb: int | None,
         children: list[dict[str, Any]] | None,
+        disk_total_mb: int | None = None,
+        disk_free_mb: int | None = None,
     ) -> dict[str, Any] | None:
         """agent の sync: 最新状態を記録し、 現在の desired (dict) を返す (無ければ None)。"""
         ch_json = json.dumps(children or [], ensure_ascii=False)
         with self.db.transaction() as conn:
             conn.execute(
                 "INSERT INTO agent_desired "
-                "  (host, last_seen_at, last_vram_total_mb, last_vram_free_mb, last_children_json) "
-                "VALUES (:h, :now, :vt, :vf, :ch) "
+                "  (host, last_seen_at, last_vram_total_mb, last_vram_free_mb, "
+                "   last_disk_total_mb, last_disk_free_mb, last_children_json) "
+                "VALUES (:h, :now, :vt, :vf, :dt, :df, :ch) "
                 "ON CONFLICT(host) DO UPDATE SET last_seen_at=:now, "
-                "  last_vram_total_mb=:vt, last_vram_free_mb=:vf, last_children_json=:ch",
+                "  last_vram_total_mb=:vt, last_vram_free_mb=:vf, "
+                "  last_disk_total_mb=:dt, last_disk_free_mb=:df, last_children_json=:ch",
                 {"h": host, "now": _now(), "vt": vram_total_mb,
-                 "vf": vram_free_mb, "ch": ch_json},
+                 "vf": vram_free_mb, "dt": disk_total_mb, "df": disk_free_mb,
+                 "ch": ch_json},
             )
             row = conn.execute(
                 "SELECT desired_json FROM agent_desired WHERE host=:h", {"h": host}

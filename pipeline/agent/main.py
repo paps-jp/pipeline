@@ -118,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
                     sync_control_url, host,
                     vram_total_mb=sup._gpu_total_mb(), vram_free_mb=sup._gpu_free_mb(),
                     children=sup.children_status(),
+                    **dict(zip(("disk_total_mb", "disk_free_mb"), sup._disk_stats())),
                 )
                 if last_synced is not None:
                     log.info("[agent] 起動時 sync 確立 (%d 回目)", attempt)
@@ -146,6 +147,8 @@ def main(argv: list[str] | None = None) -> int:
                             vram_total_mb=sup._gpu_total_mb(),
                             vram_free_mb=sup._gpu_free_mb(),
                             children=sup.children_status(),
+                            **dict(zip(("disk_total_mb", "disk_free_mb"),
+                                       sup._disk_stats())),
                         )
                     except Exception as e:
                         sync_fail_streak += 1

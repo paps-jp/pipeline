@@ -35,6 +35,9 @@ class AgentChild(BaseModel):
 class AgentSyncBody(BaseModel):
     vram_total_mb: int | None = None
     vram_free_mb: int | None = None
+    # ルート FS の実測 (2026-09-02 追加)。 旧 agent は送ってこないので None 許容。
+    disk_total_mb: int | None = None
+    disk_free_mb: int | None = None
     children: list[AgentChild] = []
 
 
@@ -51,6 +54,8 @@ def agent_sync(host: str, body: AgentSyncBody, req: Request) -> dict[str, Any]:
         host,
         vram_total_mb=body.vram_total_mb,
         vram_free_mb=body.vram_free_mb,
+        disk_total_mb=body.disk_total_mb,
+        disk_free_mb=body.disk_free_mb,
         children=[c.model_dump() for c in body.children],
     )
     return {"host": host, "desired": desired}

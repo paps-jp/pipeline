@@ -75,6 +75,8 @@ def fetch_desired_via_sync(
     vram_total_mb: int | None,
     vram_free_mb: int | None,
     children: list,
+    disk_total_mb: int | None = None,
+    disk_free_mb: int | None = None,
     timeout: float = 10.0,
 ) -> Desired | None:
     """P2: POST /agents/{host}/sync で状態を報告し desired を受領。
@@ -88,6 +90,8 @@ def fetch_desired_via_sync(
     body = json.dumps({
         "vram_total_mb": vram_total_mb,
         "vram_free_mb": vram_free_mb,
+        "disk_total_mb": disk_total_mb,
+        "disk_free_mb": disk_free_mb,
         "children": children,
     }).encode()
     req = urllib.request.Request(

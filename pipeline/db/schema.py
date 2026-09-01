@@ -494,6 +494,11 @@ AGENT_DESIRED_ALTERS = [
     "ALTER TABLE agent_desired ADD COLUMN template_json TEXT",
     # agent が nvidia-smi で自動検出する GPU 型番 (= host capability の auto 面)。
     "ALTER TABLE agent_desired ADD COLUMN last_gpu_model TEXT",
+    # ルート FS の空き (2026-09-02)。 VRAM しか見ていなかったので、 ai-gpu3 が
+    # / 満杯 (tempfile が ENOENT) で 1 週間無音停止しても誰も気付けなかった。
+    # 「計器の無いリソースは壊れても見えない」 の実例。
+    "ALTER TABLE agent_desired ADD COLUMN last_disk_total_mb INTEGER",
+    "ALTER TABLE agent_desired ADD COLUMN last_disk_free_mb INTEGER",
 ]
 
 
