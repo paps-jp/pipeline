@@ -331,7 +331,16 @@ class AgentSupervisor:
                     log.info("[agent] DRAIN child=%s workload=%s (超過 %d>%d)",
                              c.child_id, wd.slug, cur, wd.count)
 
-        # desired に無い workload の子は全部 graceful kill
+        # desired に無い workload の子は全部 graceful kill。
+        # ただし 「信用できない desired」 (= control plane と話せないまま bootstrap の
+        # desired.json へ落ちた状態) では削除しない。 あのファイルは実運用 desired の
+        # 部分集合でしかないので、 載っていない workload を 「desired 外」 と読むと
+        # 稼働中の子を巻き添えに殺す。 増やす方向 (spawn / 超過 DRAIN) はそのまま。
+        if not desired.authoritative:
+            if active.keys() - desired_slugs:
+                log.warning("[agent] desired が非信用 (sync 未確立) のため 「desired 外」 "
+                            "削除を抑止: %s", sorted(active.keys() - desired_slugs))
+            return
         for slug, children in active.items():
             if slug not in desired_slugs:
                 for c in children:

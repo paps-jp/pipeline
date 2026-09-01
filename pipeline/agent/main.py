@@ -105,8 +105,33 @@ def main(argv: list[str] | None = None) -> int:
     # 「ファイルに書いていない workload = desired 外」 とみなされ、 稼働中の子が
     # SIGTERM → SIGKILL される。 faiss-index-build が数時間かけたビルドを
     # 毎回それで飛ばしていた (2026-09-02)。
-    last_synced: "Desired | None" = None
+    last_synced: Desired | None = None
     sync_fail_streak = 0
+
+    if not args.no_sync:
+        # 起動直後の 1 発目が失敗すると bootstrap ファイルへ落ちてしまうので、
+        # reconcile に入る前に少しだけ粘って last_synced を種付けする。
+        # (control plane は重いクエリで数十秒詰まることがある)
+        for attempt in range(1, 7):
+            try:
+                last_synced = fetch_desired_via_sync(
+                    sync_control_url, host,
+                    vram_total_mb=sup._gpu_total_mb(), vram_free_mb=sup._gpu_free_mb(),
+                    children=sup.children_status(),
+                )
+                if last_synced is not None:
+                    log.info("[agent] 起動時 sync 確立 (%d 回目)", attempt)
+                    break
+                log.warning("[agent] 起動時 sync: desired 未設定 (%d/6)", attempt)
+            except Exception as e:
+                log.warning("[agent] 起動時 sync 失敗 (%d/6): %s", attempt, e)
+            if stop["v"]:
+                break
+            time.sleep(5.0)
+        else:
+            log.warning("[agent] 起動時 sync を確立できず — bootstrap desired.json で開始する "
+                        "(「desired 外」 削除は抑止)")
+
     try:
         while not stop["v"]:
             tick += 1
@@ -140,7 +165,10 @@ def main(argv: list[str] | None = None) -> int:
                             last_synced = d
                 if d is None:
                     # sync 実績があるならそれを据え置く。 ローカルファイルへは落とさない。
-                    d = last_synced if last_synced is not None else load_desired(args.desired)
+                    # それも無い (起動直後に sync が通っていない) 場合だけファイルを使うが、
+                    # 非権威扱いにして 「desired 外」 削除は行わせない。
+                    d = last_synced if last_synced is not None else load_desired(
+                        args.desired, authoritative=args.no_sync)
                 if proxy is not None:
                     proxy.upstream = d.control_url.rstrip("/")  # 子は proxy 固定、 上流だけ追従
                 else:

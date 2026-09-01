@@ -35,6 +35,12 @@ class WorkloadDesired:
 class Desired:
     control_url: str
     workloads: list[WorkloadDesired]
+    # この desired を 「載っていない workload は消してよい」 とまで信じるか。
+    # sync 由来なら True。 bootstrap の desired.json は実運用 desired の部分集合
+    # でしかないので False で渡し、 reconcile の 「desired 外」 削除を抑止する
+    # (2026-09-02: sync 一発失敗でファイルへ落ち、 走行中の faiss ビルドを
+    #  SIGKILL していた)。 --no-sync ではファイルが唯一の権威なので True。
+    authoritative: bool = True
 
 
 def _parse_workloads(raw_workloads: dict) -> list[WorkloadDesired]:
@@ -54,11 +60,12 @@ def _parse_workloads(raw_workloads: dict) -> list[WorkloadDesired]:
     return wls
 
 
-def load_desired(path: str) -> Desired:
+def load_desired(path: str, *, authoritative: bool = True) -> Desired:
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     control_url = str(raw["control_url"]).rstrip("/")
-    return Desired(control_url=control_url, workloads=_parse_workloads(raw.get("workloads")))
+    return Desired(control_url=control_url, workloads=_parse_workloads(raw.get("workloads")),
+                   authoritative=authoritative)
 
 
 def fetch_desired_via_sync(
@@ -92,4 +99,5 @@ def fetch_desired_via_sync(
     d = resp.get("desired")
     if not d or not d.get("workloads"):
         return None
-    return Desired(control_url=base, workloads=_parse_workloads(d.get("workloads")))
+    return Desired(control_url=base, workloads=_parse_workloads(d.get("workloads")),
+                   authoritative=True)
