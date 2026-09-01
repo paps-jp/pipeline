@@ -317,18 +317,36 @@ _WATCHDOG_DEPLOY_KEY = os.environ.get(
     "PIPELINE_DEPLOY_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
 
 
+def _is_agent_child(worker_id: str, worker_host: str) -> bool:
+    """agent が spawn した子 worker か。 agent は `w_{host}_a<N>` で子を命名する
+    (pipeline/agent/supervisor.py の cleanup_orphans marker と同じ規約)。
+
+    agent の子は **systemd unit を持たない** (`pipeline-worker-gpu` は not-found) ので、
+    worker 単位の restart は成立しない。 ホスト単位の復旧は
+    `POST /api/v1/agents/{host}/restart` を使う。
+    """
+    import re
+    return bool(re.fullmatch(
+        rf"w_{re.escape((worker_host or '').replace('-', '_'))}_a\d+", worker_id or ""))
+
+
 def _restart_target(worker_host: str) -> tuple[str, str] | None:
     """worker.host → (ssh_ip, systemd_unit)。未対応形式・未登録 host は None。
-    ai-gpu1-cpu3→pipeline-worker-cpu@3 / ai-gpu1-2→pipeline-worker-gpu@2
-    / ai-gpu3→pipeline-worker-gpu。 接続先は PIPELINE_WATCHDOG_HOSTS から引く。"""
+    ai-gpu1-cpu3→pipeline-worker-cpu@3 / ai-gpu1-2→pipeline-worker-gpu@2。
+    接続先は PIPELINE_WATCHDOG_HOSTS から引く。
+
+    `ai-gpu3` のような素のホスト名は **agent 管理ホスト** で、 かつては
+    `pipeline-worker-gpu` (インスタンス無し) を返していたが、 このユニットは
+    どのホストにも存在しない (実測 LoadState=not-found)。 つまり watchdog の
+    restart は必ず失敗する no-op だった。 agent ホストは None を返して
+    呼び出し側に明示スキップさせ、 復旧は agents.restart_agent に任せる。
+    """
     import re
     m = re.fullmatch(r"(ai-gpu\d+)-cpu(\d+)", worker_host or "")
     if m:
         fam, unit = m.group(1), f"pipeline-worker-cpu@{m.group(2)}"
     elif (m := re.fullmatch(r"(ai-gpu\d+)-(\d+)", worker_host or "")):
         fam, unit = m.group(1), f"pipeline-worker-gpu@{m.group(2)}"
-    elif re.fullmatch(r"ai-gpu\d+", worker_host or ""):
-        fam, unit = worker_host, "pipeline-worker-gpu"
     else:
         return None
     ip = _WATCHDOG_HOST_IP.get(fam)
@@ -567,6 +585,14 @@ def restart_worker(worker_id: str, request: Request) -> dict[str, Any]:
     import subprocess
     worker = _get_worker_or_404(request, worker_id)
     host = worker.get("host") or ""
+    if _is_agent_child(worker_id, host):
+        # agent の子は systemd unit を持たない。 個別 restart は成立しないので、
+        # 黙って失敗させず呼び出し側に代替経路を返す。
+        raise HTTPException(
+            status_code=409,
+            detail=(f"{worker_id} は agent 管理の子 worker (host={host})。 "
+                    f"worker 単位の restart は不可 — POST /api/v1/agents/{host}/restart "
+                    f"でホストごと再起動すること"))
     tgt = _restart_target(host)
     if tgt is None:
         raise HTTPException(status_code=400, detail=f"restart 未対応の host 形式: {host}")
