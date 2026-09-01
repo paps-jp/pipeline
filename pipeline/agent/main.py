@@ -11,7 +11,7 @@ import signal
 import socket
 import time
 
-from pipeline.agent.desired import fetch_desired_via_sync, load_desired
+from pipeline.agent.desired import Desired, fetch_desired_via_sync, load_desired
 from pipeline.agent.supervisor import AgentSupervisor
 
 log = logging.getLogger("pipeline.agent")
@@ -99,12 +99,20 @@ def main(argv: list[str] | None = None) -> int:
         log.info("[agent] 起動時に孤児 %d を回収", n_orphan)
     sync_control_url = d0.control_url  # sync は本物の control plane へ (proxy 経由でない)
     tick = 0
+    # 直近で sync に成功した desired。 sync が落ちたときはこれを据え置く。
+    # ローカル desired.json は **bootstrap 専用** (control plane と一度も話せていない間だけ)
+    # であり、 実運用の desired の部分集合でしかない。 sync 一発の失敗でここへ落とすと
+    # 「ファイルに書いていない workload = desired 外」 とみなされ、 稼働中の子が
+    # SIGTERM → SIGKILL される。 faiss-index-build が数時間かけたビルドを
+    # 毎回それで飛ばしていた (2026-09-02)。
+    last_synced: "Desired | None" = None
+    sync_fail_streak = 0
     try:
         while not stop["v"]:
             tick += 1
             try:
                 # P2: control plane から desired を取得 (状態を報告しつつ)。 失敗/未設定なら
-                # ローカル desired.json に fallback (bootstrap + control plane 断時の保険)。
+                # 直近の sync 結果を据え置く (それも無い bootstrap 時だけローカルファイル)。
                 d = None
                 if not args.no_sync:
                     try:
@@ -115,9 +123,24 @@ def main(argv: list[str] | None = None) -> int:
                             children=sup.children_status(),
                         )
                     except Exception as e:
-                        log.debug("[agent] sync failed (fallback local): %s", e)
+                        sync_fail_streak += 1
+                        # 1発目は WARNING で出す。 以降は 1 分毎 (連続失敗中の氾濫を防ぐ)。
+                        if sync_fail_streak == 1 or sync_fail_streak % 6 == 0:
+                            log.warning("[agent] sync 失敗 (%d 回連続): %s — desired は %s",
+                                        sync_fail_streak, e,
+                                        "直近の sync 結果を据え置き" if last_synced is not None
+                                        else "ローカル desired.json (bootstrap)")
+                    else:
+                        # d is None = 「control plane は応答したが desired 未設定」。
+                        # これも据え置き対象にする (空応答で最後の desired を捨てない)。
+                        if d is not None:
+                            if sync_fail_streak:
+                                log.info("[agent] sync 復帰 (%d 回連続失敗のあと)", sync_fail_streak)
+                            sync_fail_streak = 0
+                            last_synced = d
                 if d is None:
-                    d = load_desired(args.desired)
+                    # sync 実績があるならそれを据え置く。 ローカルファイルへは落とさない。
+                    d = last_synced if last_synced is not None else load_desired(args.desired)
                 if proxy is not None:
                     proxy.upstream = d.control_url.rstrip("/")  # 子は proxy 固定、 上流だけ追従
                 else:
