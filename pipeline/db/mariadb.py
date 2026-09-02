@@ -308,6 +308,17 @@ class MariadbDatabase(Database):
           - state, claimed_by = VARCHAR
           - claimed_at, enqueued_at, updated_at = DATETIME(6)
           - INDEX は table 内に inline 定義 (= MariaDB syntax)
+
+        2026-08-29: ``_idx_claim`` covers the WHERE (state, claimed_at, attempt)
+        but claim()'s ``ORDER BY enqueued_at, pk`` isn't a prefix of it, so
+        MariaDB filesorts every claim ("Creating sort index" in processlist).
+        Harmless on a handful of rows, but under concurrent claim() calls the
+        filesort serializes behind SKIP LOCKED and stacks: seen live pegging
+        image_hash_extract_queue / image_embed_queue / video_face_extract_queue
+        claims at 8-50+s each with real InnoDB lock waits, at table sizes in
+        the thousands, not millions. ``_idx_claim_order`` lets the 'pending'
+        branch (the dominant one) satisfy WHERE+ORDER BY from a single index
+        range scan with no sort.
         """
         ddl = f"""
 CREATE TABLE IF NOT EXISTS {queue_table} (
@@ -321,7 +332,8 @@ CREATE TABLE IF NOT EXISTS {queue_table} (
     enqueued_at DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at  DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (pk),
-    KEY {queue_table}_idx_claim (state, claimed_at, attempt, pk)
+    KEY {queue_table}_idx_claim (state, claimed_at, attempt, pk),
+    KEY {queue_table}_idx_claim_order (state, enqueued_at, pk)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
         with self._ddl_lock:
