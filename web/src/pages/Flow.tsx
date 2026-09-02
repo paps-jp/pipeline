@@ -631,6 +631,23 @@ function WorkloadNode({
 // 負荷が YouTube のハードウェアビデオデコード枠を奪う問題を回避。
 // (CSS transform アニメは SVG <g> に対して Chromium で視覚適用されない既知制約が
 //  あるため SMIL のまま。 代わりに tab visibility ゲートで実効負荷を落とす)
+// 画面内に居るかどうか。 タンクの波は panning で画面外に出ても回り続けていたので、
+// タブ可視性 (useTabVisible) に加えてこれで止める (2026-09-02)。
+function useOnScreen(ref: { current: Element | null }): boolean {
+  const [onScreen, setOnScreen] = useState(true);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof IntersectionObserver === "undefined") return;
+    const io = new IntersectionObserver(
+      (entries) => setOnScreen(entries.some((e) => e.isIntersecting)),
+      { rootMargin: "80px" },   // 端で点滅しない様に少し余裕を持たせる
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [ref]);
+  return onScreen;
+}
+
 function useTabVisible(): boolean {
   const [visible, setVisible] = useState(() =>
     typeof document !== "undefined" ? document.visibilityState !== "hidden" : true
@@ -643,8 +660,10 @@ function useTabVisible(): boolean {
   return visible;
 }
 
-function TankWave({ color, isLight }: { color: string; isLight: boolean }) {
-  const tabVisible = useTabVisible();
+function TankWave({ color, isLight, live = true }: {
+  color: string; isLight: boolean; live?: boolean;
+}) {
+  const tabVisible = useTabVisible() && live;
   // viewBox 0..40 height で振幅 を大きく
   // main: baseline y=20, 振幅 = 16 (peak 4..36)
   const pathMain =
@@ -921,6 +940,9 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
   })();
   const active = useMemo(() => new Set(data.activeHandles ?? []), [data.activeHandles]);
   const [hovered, setHovered] = useState(false);
+  // 画面外のタンクは波を止める (= SMIL を張らない)。
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const onScreen = useOnScreen(cardRef);
   const cardBg = isLight
     ? "linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%)"
     : "linear-gradient(180deg, #1e293b 0%, #0f172a 100%)";
@@ -932,6 +954,7 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
   const cardText = isLight ? "#1f2937" : "#e2e8f0";
   return (
     <motion.div
+      ref={cardRef}
       initial={{ scale: 0.95, opacity: 0 }}
       animate={{ scale: 1, opacity: 1 }}
       onMouseEnter={() => setHovered(true)}
@@ -972,7 +995,7 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
           overflow: "visible",   // 波が縁を僅かに越えるため
         }}
       >
-        {ratio > 0.01 && <TankWave color={fillColor} isLight={isLight} />}
+        {ratio > 0.01 && <TankWave color={fillColor} isLight={isLight} live={onScreen} />}
       </motion.div>
       {overflow && <OverflowOverlay />}
       <Stack gap={2} style={{ position: "relative", zIndex: 6 }}>
@@ -2181,10 +2204,17 @@ export default function Flow() {
     // 1 度 build → 2 pass で lane offset を割当て (= 同じ handle から複数
     // 出る場合に並走させる)。 同 handle に対する edge を順番に並べて中央寄せ。
     const built = snap.edges.map((e: FlowEdge) => {
-      const rate = e.rate_per_min ?? 0;
+      // rate は 3 秒ごとに微動する。 そのまま渡すと配管の太さ / 粒子の速度が
+      // 毎回わずかに変わり、 34 edge 分の属性書き換え (実測 156/更新) と
+      // アニメの張り直しが起きる。 **有効数字 3 桁に量子化**して、 意味のある
+      // 変化があった時だけ描画が変わる様にする (2026-09-02)。
+      const rawRate = e.rate_per_min ?? 0;
+      const rate = rawRate > 0
+        ? Number(rawRate.toPrecision(3))
+        : 0;
       const labelText = e.label
-        ? rate > 0
-          ? `${e.label}: ${fmtNum(rate)}`
+        ? rawRate > 0
+          ? `${e.label}: ${fmtNum(rawRate)}`
           : e.label
         : null;
       const handles = pickHandles(e.source, e.target);

@@ -29,6 +29,42 @@ type EdgeData = {
 
 const LANE_GAP = 16;   // 同じ handle に集まる配管間のピクセル間隔
 
+// 粒子アニメを SMIL (`<animateMotion>`) から CSS motion path へ移した (2026-09-02)。
+//
+// 実測: フロー画面に SMIL が 290 個 (うち粒子 262) あり、 描画が数秒single止まる事象は
+// **粒子を消した時だけ消えた** (最悪フレーム間隔 4645ms → 93ms)。 SMIL は
+// メインスレッドでタイムラインを毎フレーム解決する上、 React が再 render する
+// たびに属性を書き戻すとアニメが張り直される。 CSS animation なら
+//   - offset-distance のアニメはコンポジタ側で走る
+//   - 同じ値を再代入しても animation は再スタートしない
+// ので、 3 秒ごとの snapshot 更新に巻き込まれない。
+//
+// 併せて粒子 1 個ずつに付けていた `drop-shadow` を撤去した。 フィルタ付き要素は
+// 毎フレーム個別にラスタライズされるため、 262 個分がそのまま描画コストだった。
+// 明るさは fill と opacity で担保する。
+const PARTICLE_KEYFRAMES_ID = "flow-particle-keyframes";
+if (typeof document !== "undefined" && !document.getElementById(PARTICLE_KEYFRAMES_ID)) {
+  const st = document.createElement("style");
+  st.id = PARTICLE_KEYFRAMES_ID;
+  st.textContent =
+    "@keyframes flowParticleFwd { from { offset-distance: 0% } to { offset-distance: 100% } }" +
+    "@keyframes flowParticleRev { from { offset-distance: 100% } to { offset-distance: 0% } }";
+  document.head.appendChild(st);
+}
+
+/** 粒子 1 個分の CSS。 delay を負にして 「既に流れている途中」 から始める。 */
+function particleStyle(
+  path: string, durationS: number, delayS: number, reverse: boolean,
+): React.CSSProperties {
+  return {
+    offsetPath: `path('${path}')`,
+    offsetRotate: "auto",
+    animation: `${reverse ? "flowParticleRev" : "flowParticleFwd"} ${durationS}s linear infinite`,
+    animationDelay: `${delayS}s`,
+    willChange: "offset-distance",
+  };
+}
+
 export function ParticleEdge(props: EdgeProps) {
   const {
     id,
@@ -89,8 +125,12 @@ export function ParticleEdge(props: EdgeProps) {
   const rate = Number(d.rate ?? 0);
   const isActive = rate > 0;
   const particleCount = isActive ? Math.min(8, Math.max(2, Math.ceil(Math.log10(rate + 1) * 2 + 1))) : 0;
-  // 速度: rate=1→6s / rate=10→4s / rate=100→2s / rate=1000→1s 程度
-  const duration = isActive ? Math.max(0.8, 6 - Math.log10(rate + 1) * 1.4) : 0;
+  // 速度: rate=1→6s / rate=10→4s / rate=100→2s / rate=1000→1s 程度。
+  // **0.25 秒刻みに量子化**する (2026-09-02)。 生の値だとレートが少し揺れる度に
+  // animation の指定文字列が変わり、 3 秒ごとにアニメが張り直されて粒子が飛ぶ。
+  const duration = isActive
+    ? Math.round(Math.max(0.8, 6 - Math.log10(rate + 1) * 1.4) * 4) / 4
+    : 0;
 
   // 配管風 3 層 stroke:
   //   dark: 工業金属 (dark shell + 落ち着き indigo fluid)
@@ -105,10 +145,13 @@ export function ParticleEdge(props: EdgeProps) {
   const shadowColor = isLight ? "#cbd5e1" : "#0b1220";
   // 配管直径 (log scale)。 base 太め + 流量で更に太る。 視覚的に "管" として
   // 認識できる下限 = 10px、 上限は ノードに対し主張しすぎない 22px に。
-  const baseWidth = Math.min(22, 10 + Math.log10(rate + 1) * 3);
+  // 0.5px 刻みに丸める (= rate の微動で stroke-width を毎回書き換えない)
+  const baseWidth = Math.round(Math.min(22, 10 + Math.log10(rate + 1) * 3) * 2) / 2;
   const shellWidth = baseWidth;
   const fluidWidth = Math.max(2, baseWidth - 6);
   const highlightWidth = Math.max(0.8, fluidWidth / 4);
+  // 半径も 0.5px 刻みに丸める (= 同じ理由で属性の無駄な書き換えを防ぐ)
+  const particleR = Math.round(Math.max(2, fluidWidth / 2.2) * 2) / 2;
 
   // rate=0 (= 停止中) では「死んでる」 視覚表現にする (= 全体 opacity を下げ、
   // 上面ハイライト(白点線)は描画しない)。 これで動いてないのに「流れて見える」
@@ -184,40 +227,25 @@ export function ParticleEdge(props: EdgeProps) {
         Array.from({ length: particleCount }).map((_, i) => (
           <circle
             key={i}
-            r={Math.max(2, fluidWidth / 2.2)}
+            r={particleR}
             fill={isLight ? "#ffffff" : "#ecfeff"}
             opacity={isLight ? 0.85 : 0.95}
-            style={{ filter: `drop-shadow(0 0 4px ${fluidColor}${isLight ? "88" : "cc"})` }}
-          >
-            <animateMotion
-              dur={`${duration}s`}
-              repeatCount="indefinite"
-              begin={`${(duration / particleCount) * i}s`}
-              path={edgePath}
-              rotate="auto"
-            />
-          </circle>
+            style={particleStyle(edgePath, duration, -(duration / particleCount) * i, false)}
+          />
         ))}
       {isActive && d.bidirectional &&
         Array.from({ length: particleCount }).map((_, i) => (
           <circle
             key={`rev-${i}`}
-            r={Math.max(2, fluidWidth / 2.2)}
+            r={particleR}
             fill={isLight ? "#ffffff" : "#ecfeff"}
             opacity={isLight ? 0.85 : 0.95}
-            style={{ filter: `drop-shadow(0 0 4px ${fluidColor}${isLight ? "88" : "cc"})` }}
-          >
-            <animateMotion
-              dur={`${duration}s`}
-              repeatCount="indefinite"
-              begin={`${(duration / particleCount) * i + duration / (particleCount * 2)}s`}
-              path={edgePath}
-              keyPoints="1;0"
-              keyTimes="0;1"
-              calcMode="linear"
-              rotate="auto"
-            />
-          </circle>
+            style={particleStyle(
+              edgePath, duration,
+              -((duration / particleCount) * i + duration / (particleCount * 2)),
+              true,
+            )}
+          />
         ))}
       {d.label && (() => {
         // edge の中央セグメントの向きに応じて perpendicular にずらす:
