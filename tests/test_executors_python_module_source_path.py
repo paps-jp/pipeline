@@ -76,7 +76,7 @@ def test_source_path_missing_module_raises(tmp_path: Path):
     """source_path 配下に module が無いと PluginConfigError。"""
     empty = tmp_path / "empty"
     empty.mkdir()
-    with pytest.raises(PluginConfigError, match="cannot import"):
+    with pytest.raises(PluginConfigError, match="cannot find"):
         create_executor("python_module", {
             "source_path": str(empty),
             "module": "does_not_exist",

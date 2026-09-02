@@ -123,7 +123,7 @@ def test_plugin_without_setup_uses_none_state(tmp_path: Path) -> None:
 
 
 def test_missing_module_raises_config_error(tmp_path: Path) -> None:
-    with pytest.raises(PluginConfigError, match="cannot import"):
+    with pytest.raises(PluginConfigError, match="cannot find"):
         PythonModuleExecutor({"module": "nope_does_not_exist_xyz", "module_search_path": str(tmp_path)})
 
 

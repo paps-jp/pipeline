@@ -36,7 +36,10 @@ def test_register_and_get(client: TestClient):
     r = client.post("/api/v1/workers", json={"host": "h1"})
     assert r.status_code == 201
     info = r.json()
-    assert info["id"].startswith("w_h1_")
+    # worker_id 未指定の登録は **host ごと決定論的** な id になる
+    # (repositories/workers.py の _new_worker_id)。再登録が重複を作らないため。
+    # ``_a{N}`` の連番が付くのは agent が spawn する子だけ (agent/supervisor.py)。
+    assert info["id"] == "w_h1"
     assert info["state"] == "active"
     # list
     lst = client.get("/api/v1/workers").json()
