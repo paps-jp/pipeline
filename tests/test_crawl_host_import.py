@@ -131,6 +131,21 @@ def _state(db, **over):
         "counter": 1,
         "shard_siblings": {},
         "exclude_roots": frozenset(),
+        # setup() が作るキーのうち process() が読むもの。plugin 側が後から
+        # 足した分をここに写していないと KeyError で落ちる (テストは setup()
+        # を通さず state を手で組むため、追随が要る)。
+        "drop_variants": True,
+        "drop_subdomain_of_registered": True,
+        "registered_domains": None,
+        "blog_platform_suffixes": frozenset(),
+        "file_host_suffixes": frozenset(),
+        "do_classify": True,
+        "do_import": True,
+        "interval_s": 300,
+        "miss_streak": 0,
+        "control_url": "http://control.invalid",
+        "workload_slug": "crawl-host-import",
+        "hostname": "test",
     }
     st.update(over)
     return st
