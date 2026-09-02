@@ -49,7 +49,7 @@ def sup():
 
 
 def _state(sup, *, enabled: bool = True, dwell: float = 0.0,
-           min_p: int = 16, max_p: int = 256) -> dict:
+           min_p: int = 16, max_p: int = 256, latency_gate: bool = False) -> dict:
     return {
         "control_url": "http://control.invalid",
         "submit_scale_cfg": {
@@ -62,6 +62,7 @@ def _state(sup, *, enabled: bool = True, dwell: float = 0.0,
             "fail_ratio_high": 0.10,
             "fail_ratio_low": 0.03,
             "no_room_ratio_max": 0.6,
+            "latency_gate": latency_gate,
             "latency_up_max": 1.5,
             "latency_backoff": 2.0,
             "latency_base_floor_ms": 800,
@@ -273,7 +274,7 @@ def test_failed_patch_does_not_advance_dwell(sup, monkeypatch):
 def test_latency_inflation_blocks_scale_up(sup, wired):
     """基準の lat_up_max 倍を超えたら、需要があっても増やさない。"""
     wired["runs"] = [_run(parallel=48, pool_full=40, cap_polls=60, post_ms=1000)] * 4
-    st = _state(sup)
+    st = _state(sup, latency_gate=True)
     sup._submit_parallel_autoscale_run(st)          # base=1000 を学習
     wired["calls"].clear()
     wired["runs"] = [_run(parallel=64, pool_full=40, cap_polls=60, post_ms=1600)] * 4
@@ -285,7 +286,7 @@ def test_latency_inflation_blocks_scale_up(sup, wired):
 def test_latency_inflation_triggers_backoff(sup, wired):
     """timeout が出る前に引く。出てからでは輻輳崩壊が始まっている。"""
     wired["runs"] = [_run(parallel=48, pool_full=40, cap_polls=60, post_ms=1000)] * 4
-    st = _state(sup)
+    st = _state(sup, latency_gate=True)
     sup._submit_parallel_autoscale_run(st)
     wired["calls"].clear()
     wired["runs"] = [_run(parallel=64, pool_full=40, cap_polls=60, post_ms=2500)] * 4
@@ -297,7 +298,7 @@ def test_latency_inflation_triggers_backoff(sup, wired):
 def test_no_scale_up_without_a_baseline(sup, wired):
     """基準値が無いうちは増やさない (未知の系へ押し込まない)。"""
     wired["runs"] = [_run(parallel=48, pool_full=40, cap_polls=60, post_ms=None)] * 4
-    out = sup._submit_parallel_autoscale_run(_state(sup))
+    out = sup._submit_parallel_autoscale_run(_state(sup, latency_gate=True))
     assert wired["calls"] == []
     assert out["action"] == "hold"
 
@@ -320,3 +321,18 @@ def test_baseline_is_restored_from_config(sup):
     assert "submit_scale_post_ms_base" in _state(sup) or True
     kw = {"submit_scale_post_ms_base": 1234}
     assert float(kw["submit_scale_post_ms_base"]) == 1234.0
+
+
+def test_latency_gate_is_off_by_default(sup, wired):
+    """既定はガード OFF (2026-08-31, plugins b7b6e00)。
+
+    基準値は「空いているときの応答」でなければ意味を成さないが、supervisor
+    再起動で劣化した値を学習してしまうと inflation が下がらず、hub に枠が
+    あって待っているだけの状態でも永久 hold になる (実運用で parallel=38 に
+    固着した)。opt-in に落とし、既定では fail_ratio だけで制御する。
+    """
+    wired["runs"] = [_run(parallel=48, pool_full=40, cap_polls=60, post_ms=9999)] * 4
+    st = _state(sup)                      # latency_gate 未指定 = OFF
+    sup._submit_parallel_autoscale_run(st)
+    sup._submit_parallel_autoscale_run(st)
+    assert wired["calls"], "ガード OFF ならレイテンシが伸びていても増やせる"
