@@ -45,6 +45,22 @@ def _is_deadlock(exc: BaseException) -> bool:
     return "deadlock" in msg or "try restarting transaction" in msg or "lock wait timeout" in msg
 
 
+def _is_duplicate_key(exc: BaseException) -> bool:
+    """PK/UNIQUE 制約違反 (MariaDB 1062 / SQLite UNIQUE constraint failed) を判定。
+
+    deadlock(1213) と混同すると「衝突」と誤カウントし、上流に「入った」と嘘を返す。
+    真の重複 = 1062 だけを collision として数える。
+    """
+    code = None
+    args = getattr(exc, "args", None)
+    if args:
+        code = args[0]
+    if code == 1062:
+        return True
+    msg = str(exc).lower()
+    return "duplicate entry" in msg or "unique constraint failed" in msg
+
+
 def _validate_queue_table(name: str) -> None:
     """インジェクション防止: 呼出側の slug 由来テーブル名を簡易チェック。"""
     if not name or not name.replace("_", "").isalnum():
@@ -126,20 +142,36 @@ class QueueRepository:
             return cur.rowcount == 1
 
     def enqueue_many(self, queue_table: str, items: list[tuple[str, dict[str, Any]]]) -> int:
-        """bulk 投入。挿入件数 (重複除く) を返す。"""
+        """bulk 投入。挿入件数 (重複除く) を返す。
+
+        strict と同じく multi-row INSERT + deadlock retry で組む。per-row ループは
+        (a) 途中で 1213 が飛ぶと巻き戻った成功分も inserted に嘘の数を残す、
+        (b) ロック取得回数が行数分でスケールし deadlock 頻発、の 2 つが同居する。
+        重複は `INSERT OR IGNORE` (MariaDB では `INSERT IGNORE` に変換される) が
+        黙って落とすので strict のような per-row fallback は要らない。
+        """
         _validate_queue_table(queue_table)
         if not items:
             return 0
-        inserted = 0
-        with self._get_db(queue_table).transaction() as conn:
-            for pk, extra in items:
+
+        # pk 昇順で並行 enqueuer 間のロック順を揃える (循環待ち抑制)。
+        batch = sorted(items, key=lambda x: str(x[0]))
+
+        def _bulk() -> int:
+            with self._get_db(queue_table).transaction() as conn:
+                placeholders = ", ".join(f"(:pk{i}, :extra{i})" for i in range(len(batch)))
+                params: dict[str, Any] = {}
+                for i, (pk, extra) in enumerate(batch):
+                    params[f"pk{i}"] = str(pk)
+                    params[f"extra{i}"] = json.dumps(extra or {})
                 cur = conn.execute(
-                    f"INSERT OR IGNORE INTO {queue_table} (pk, extra) VALUES (:pk, :extra)",
-                    {"pk": str(pk), "extra": json.dumps(extra or {})},
+                    f"INSERT OR IGNORE INTO {queue_table} (pk, extra) VALUES {placeholders}",
+                    params,
                 )
-                if cur.rowcount == 1:
-                    inserted += 1
-        return inserted
+                # rowcount = 実際に挿入された行数 (IGNORE で落ちた重複は含まない)。
+                return int(cur.rowcount or 0)
+
+        return self._retry_on_deadlock(f"enqueue_many({queue_table})", _bulk)
 
     def enqueue_many_strict(
         self, queue_table: str, items: list[tuple[str, dict[str, Any]]]
@@ -147,27 +179,75 @@ class QueueRepository:
         """bulk 投入の strict 版。INSERT OR IGNORE を使わず plain INSERT する。
 
         pk の一意性は呼出側 (= source を CAS claim する dispatcher) が保証する前提。
-        既存 pk と衝突した場合は黙ってスキップ (IGNORE) せず WARN ログに残し collided として
-        数える (= 取りこぼしを不可視にしない)。1 行の衝突で batch 全体を巻き戻さないよう
-        行単位で握る (duplicate-key は statement レベルエラーで txn は継続可能)。
+        真の重複 (1062) のみ collided として数え、deadlock (1213) / lock-wait (1205) は
+        rollback → backoff retry で吸収する (旧実装は 1213 を collided と誤カウントし、
+        巻き戻った成功 INSERT も inserted に嘘の数を積んでいた)。
+
+        実装:
+          ① まず 1 statement の multi-row INSERT で全件投入する。
+             - AUTO_INC / insert-intention lock の窓が最小化され deadlock 発生率が桁で下がる。
+             - all-in / all-out で inserted の数え上げが真になる。
+             - pk 昇順にソートして並行 enqueuer 間のロック順を揃える (循環待ち抑制)。
+          ② 全体が deadlock なら _retry_on_deadlock で再試行。
+          ③ 真の重複 (1062) が混じって全体 rollback したら 1 行ずつ retry-with-deadlock で
+             再投入し、collided を特定する。
         戻り値: {"inserted": n, "collided": m}。
         """
         _validate_queue_table(queue_table)
         if not items:
             return {"inserted": 0, "collided": 0}
+
+        # pk 昇順にすると並行 enqueuer が同じ順で unique index を触るので、
+        # gap の循環待ちが「片方が先に完了するまで待つだけ」に変わる。
+        batch = sorted(items, key=lambda x: str(x[0]))
+
+        # ① multi-row INSERT を一発。 deadlock は _retry_on_deadlock が握る。
+        def _bulk() -> int:
+            with self._get_db(queue_table).transaction() as conn:
+                placeholders = ", ".join(f"(:pk{i}, :extra{i})" for i in range(len(batch)))
+                params: dict[str, Any] = {}
+                for i, (pk, extra) in enumerate(batch):
+                    params[f"pk{i}"] = str(pk)
+                    params[f"extra{i}"] = json.dumps(extra or {})
+                conn.execute(
+                    f"INSERT INTO {queue_table} (pk, extra) VALUES {placeholders}",
+                    params,
+                )
+            return len(batch)
+
+        try:
+            inserted = self._retry_on_deadlock(
+                f"enqueue_many_strict({queue_table})", _bulk
+            )
+            return {"inserted": inserted, "collided": 0}
+        except Exception as e:
+            if not _is_duplicate_key(e):
+                raise
+            # ③ 真の重複が混ざっていた → どの pk かを 1 行ずつ判定する。
+            #    deadlock は行単位で retry する。
+
         inserted = 0
         collided = 0
-        with self._get_db(queue_table).transaction() as conn:
-            for pk, extra in items:
-                try:
-                    conn.execute(
-                        f"INSERT INTO {queue_table} (pk, extra) VALUES (:pk, :extra)",
-                        {"pk": str(pk), "extra": json.dumps(extra or {})},
-                    )
-                    inserted += 1
-                except Exception as e:
-                    collided += 1
-                    log.warning("strict enqueue collision %s pk=%s: %s", queue_table, pk, e)
+        for pk, extra in batch:
+            def _one(pk: str = pk, extra: dict[str, Any] | None = extra) -> bool:
+                with self._get_db(queue_table).transaction() as conn:
+                    try:
+                        conn.execute(
+                            f"INSERT INTO {queue_table} (pk, extra) VALUES (:pk, :extra)",
+                            {"pk": str(pk), "extra": json.dumps(extra or {})},
+                        )
+                    except Exception as e2:
+                        if _is_duplicate_key(e2):
+                            return False
+                        raise
+                return True
+
+            ok = self._retry_on_deadlock(f"enqueue_one_strict({queue_table})", _one)
+            if ok:
+                inserted += 1
+            else:
+                collided += 1
+                log.warning("strict enqueue collision %s pk=%s (duplicate)", queue_table, pk)
         return {"inserted": inserted, "collided": collided}
 
     def claim(
@@ -204,18 +284,38 @@ class QueueRepository:
             try:
                 with self._get_db(queue_table).transaction() as conn:
                     if secondary:
+                        # 2026-09-06: pending 枝と 期限切れclaimed 枝を分離。
+                        # 単一 SELECT の OR は _idx_claim_order を範囲スキャンできず
+                        # 全件 filesort に落ちて 380k 行を毎回並び替えていた
+                        # (Creating sort index が 40本 同時に数分張り付き)。
+                        # 圧倒的多数は pending なので、まず _idx_claim_order で
+                        # クリーンに拾い、足りないぶんだけ _idx_claim で
+                        # 期限切れclaimed を拾う 2 段構えにする。
+                        lim = int(limit)
                         sel = conn.execute(
                             f"""
                             SELECT pk FROM {queue_table}
                             WHERE state='pending'
-                               OR (state='claimed' AND claimed_at < :cutoff)
                             ORDER BY enqueued_at, pk
                             LIMIT :lim
                             FOR UPDATE SKIP LOCKED
                             """,
-                            {"cutoff": lease_cutoff, "lim": int(limit)},
+                            {"lim": lim},
                         )
                         pks = [r["pk"] for r in sel.fetchall()]
+                        if len(pks) < lim:
+                            remaining = lim - len(pks)
+                            sel2 = conn.execute(
+                                f"""
+                                SELECT pk FROM {queue_table}
+                                WHERE state='claimed' AND claimed_at < :cutoff
+                                ORDER BY claimed_at
+                                LIMIT :lim
+                                FOR UPDATE SKIP LOCKED
+                                """,
+                                {"cutoff": lease_cutoff, "lim": remaining},
+                            )
+                            pks += [r["pk"] for r in sel2.fetchall()]
                         if not pks:
                             return []
                         ph = ", ".join(f":p{i}" for i in range(len(pks)))

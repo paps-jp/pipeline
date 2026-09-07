@@ -105,3 +105,70 @@ def test_deadlock以外のエラーはretryせず即座に上げる(repo_and_tab
     with pytest.raises(ValueError):
         q.complete(table, "pk1")
     assert calls["n"] == 1, "deadlock でないのに retry している"
+
+
+def test_enqueue_many_strict_はdeadlockをretryして完了する(repo_and_table, monkeypatch):
+    q, table = repo_and_table
+    orig = q._get_db
+    wrapped, calls = _flaky(2, orig)
+    monkeypatch.setattr(q, "_get_db", wrapped)
+
+    r = q.enqueue_many_strict(table, [("a", {}), ("b", {}), ("c", {})])
+
+    assert calls["n"] == 3, f"retry していない (呼び出し {calls['n']} 回)"
+    assert r == {"inserted": 3, "collided": 0}
+    monkeypatch.undo()
+    # 巻き戻った試行の副作用が残っていないこと。
+    assert q.count_by_state(table).get("pending", 0) == 3
+
+
+def test_enqueue_many_strict_重複pkはcollidedに数える(repo_and_table):
+    q, table = repo_and_table
+    q.enqueue(table, "dup")
+
+    r = q.enqueue_many_strict(table, [("a", {}), ("dup", {}), ("c", {})])
+
+    # multi-row INSERT が dup で丸ごと巻き戻ってから 1 行ずつ再投入する。
+    # dup 以外は入る、dup は collided として数える。
+    assert r == {"inserted": 2, "collided": 1}
+    assert q.count_by_state(table).get("pending", 0) == 3  # "dup" + 新規 2 件
+
+
+def test_enqueue_many_strict_deadlockは1213として吸収し重複扱いにしない(
+    repo_and_table, monkeypatch
+):
+    """1213 を "collided" と誤カウントしていた旧実装の回帰防止。"""
+    q, table = repo_and_table
+    orig = q._get_db
+    wrapped, calls = _flaky(1, orig)
+    monkeypatch.setattr(q, "_get_db", wrapped)
+
+    r = q.enqueue_many_strict(table, [("x", {}), ("y", {})])
+
+    assert r == {"inserted": 2, "collided": 0}
+    assert calls["n"] == 2  # 1 回失敗 → 1 回成功。 collision path には落ちていない
+
+
+def test_enqueue_many_はdeadlockをretryして完了する(repo_and_table, monkeypatch):
+    q, table = repo_and_table
+    orig = q._get_db
+    wrapped, calls = _flaky(2, orig)
+    monkeypatch.setattr(q, "_get_db", wrapped)
+
+    n = q.enqueue_many(table, [("a", {}), ("b", {}), ("c", {})])
+
+    assert calls["n"] == 3, f"retry していない (呼び出し {calls['n']} 回)"
+    assert n == 3
+    monkeypatch.undo()
+    assert q.count_by_state(table).get("pending", 0) == 3
+
+
+def test_enqueue_many_重複pkは黙って落として実挿入だけを数える(repo_and_table):
+    q, table = repo_and_table
+    q.enqueue(table, "dup")
+
+    # dup は既存で INSERT IGNORE (= INSERT OR IGNORE) で落ちる。inserted=2 のみ。
+    n = q.enqueue_many(table, [("a", {}), ("dup", {}), ("c", {})])
+
+    assert n == 2
+    assert q.count_by_state(table).get("pending", 0) == 3
