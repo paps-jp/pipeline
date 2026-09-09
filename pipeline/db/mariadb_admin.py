@@ -43,8 +43,9 @@ class TableSpec:
     # 本当に DELETE FROM してよいテーブルだけ deletable=True にする。 crawl_config の
     # ように他テーブル (crawl_image/crawl_video 等) から site を参照されうる行は
     # 孤児データを残すので対象外。 その代わり soft_delete_* で「削除」を固定値の
-    # UPDATE に読み替える (crawl_config は enabled=99 が既存運用の恒久除外と同じ意味、
-    # 2026-08-25 実測で 23 件が既にこの値)。
+    # UPDATE に読み替える (crawl_config は enabled=-1 = 恒久除外/無効化。
+    # 2026-09-10 の priority スキーム移行で 99→-1 に統合した。 詳細は
+    # paprika_job_submit/submit_main.py の priority docstring を参照)。
     deletable: bool = False
     soft_delete_column: str | None = None
     soft_delete_value: Any = None
@@ -68,9 +69,13 @@ TABLE_REGISTRY: dict[str, TableSpec] = {
             ColumnSpec("url", editable=True, creatable=True),
             ColumnSpec("domain", creatable=True),
             ColumnSpec("type"),
-            # -1/0/1/50/99 が実在し、それぞれ別の意味を持つ (単純な bool ではない)。
-            # 2026-08-25 実測: -1=個別理由付きで無効化、0=無効(資産ホスト等)、
-            # 1=有効、50=優先度フラグ、99=恒久除外。
+            # 2026-09-10 priority スキーム: enabled は tri-state ではなく数値。
+            # < 1 (-1, 0) = 無効。 >= 1 = 有効で、 値が大きいほど優先。
+            #   -1 = 恒久除外/無効化 (以前の -1「個別理由」と 99「恒久除外」を統合)
+            #    0 = 無効 (資産ホスト等、 legacy)
+            #    1 = 通常
+            #   >1 = 優先 tier (submit filler が enabled DESC で先頭注入)
+            # 詳細は paprika_job_submit/submit_main.py の priority docstring。
             ColumnSpec("enabled", editable=True, creatable=True, kind="int"),
             ColumnSpec("next_no"),
             ColumnSpec("max_pages_per_run", editable=True, creatable=True, kind="int"),
@@ -88,10 +93,12 @@ TABLE_REGISTRY: dict[str, TableSpec] = {
         # の docstring 参照)。 admin から手動追加するときも同じ種まきをする。
         seed_table="crawl",
         seed_columns={"site": "site", "url": "url"},
-        # 「削除」= enabled=99 (恒久除外) への変更。 crawl_image 等が site を参照
-        # したままになりうるので本当の DELETE はしない。
+        # 「削除」= enabled=-1 (恒久除外) への変更。 crawl_image 等が site を参照
+        # したままになりうるので本当の DELETE はしない。 2026-09-10 の priority
+        # スキーム移行で、 高い値 (>=1) は「優先 tier」の意味を持つようになった
+        # ため、 除外は必ず負値側 (-1) を使う。 旧 99 は同 migration で -1 に統合。
         soft_delete_column="enabled",
-        soft_delete_value=99,
+        soft_delete_value=-1,
     ),
     "host_import_queue": TableSpec(
         name="host_import_queue", label="取り込み候補キュー", pk="id",

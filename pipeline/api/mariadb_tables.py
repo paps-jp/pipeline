@@ -169,7 +169,9 @@ def post_row(table: str, payload: dict[str, Any],
 def delete_row_endpoint(table: str, pk: int,
                         backend: _Backend = Depends(get_backend)) -> dict[str, Any]:
     """deletable なテーブルは本当に DELETE、 soft_delete_column 設定があるテーブルは
-    その列を固定値に書き換える (crawl_config は enabled=99 = 恒久除外)。
+    その列を固定値に書き換える (crawl_config は enabled=-1 = 恒久除外。 2026-09-10
+    の priority スキーム移行で 99→-1 に統合。 詳細は mariadb_admin.py の
+    ColumnSpec("enabled") コメント参照)。
     """
     try:
         spec = get_spec(table)
