@@ -16,6 +16,7 @@ import {
   IconDashboard,
   IconDatabase,
   IconLanguage,
+  IconLink,
   IconList,
   IconMoon,
   IconPuzzle,
@@ -45,6 +46,7 @@ import Throughput from "./pages/Throughput";
 import PluginPanel from "./pages/PluginPanel";
 import Settings from "./pages/Settings";
 import ServiceLog from "./pages/ServiceLog";
+import UrlManagement from "./pages/UrlManagement";
 import Workers from "./pages/Workers";
 import Workloads from "./pages/Workloads";
 
@@ -199,7 +201,7 @@ export default function App() {
         </Group>
       </AppShell.Header>
 
-      <AppShell.Navbar p="xs">
+      <AppShell.Navbar p="xs" style={{ overflowY: "auto" }}>
         <NavLink
           label={t("nav.dashboard")}
           leftSection={<IconDashboard size={18} />}
@@ -242,6 +244,12 @@ export default function App() {
           leftSection={<IconSettingsAutomation size={18} />}
           component={RouterNavLink}
           to="/supervisor"
+        />
+        <NavLink
+          label={t("nav.urlManagement", "URL管理")}
+          leftSection={<IconLink size={18} />}
+          component={RouterNavLink}
+          to="/url-management"
         />
         <NavLink
           label={t("nav.crawlTables", "クロール設定")}
@@ -300,6 +308,7 @@ export default function App() {
             <Route path="/workloads/:slug/runs" element={<Workloads />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/hosts" element={<Hosts />} />
+            <Route path="/url-management" element={<UrlManagement />} />
             <Route path="/crawl-tables" element={<MariadbTables />} />
             <Route path="/supervisor" element={<Supervisor />} />
             <Route path="/logs" element={<ServiceLog />} />

@@ -18,7 +18,7 @@ import {
 import { useDebouncedValue, useDisclosure } from "@mantine/hooks";
 import { modals } from "@mantine/modals";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconSearch, IconTrash } from "@tabler/icons-react";
+import { IconPlus, IconRefresh, IconSearch, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -176,6 +176,7 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
   const hasEnabledColumn = meta.columns.some((c) => c.name === "enabled");
   const isCreatable = meta.columns.some((c) => c.creatable);
   const isDeletable = meta.deletable || Boolean(meta.soft_delete_column);
+  const isReseedable = Boolean(meta.reseedable);
 
   const rowsQ = useQuery({
     queryKey: ["mariadb-rows", meta.name, debouncedQ, enabledFilter, page],
@@ -218,6 +219,56 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
       notifications.show({ color: "red", message: String(e) });
     },
   });
+
+  const reseedMutation = useMutation({
+    mutationFn: (pk: number) => mariadbTablesApi.reseedRow(meta.name, pk),
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ["mariadb-rows", meta.name] });
+      const n = (data.reset ?? 0) + (data.inserted ?? 0);
+      const detail = data.inserted
+        ? t("mariadbTables.reseeded_inserted", {
+            defaultValue: "種URL を撒き直しました ({{n}} 件、うち新規挿入 {{ins}})",
+            n, ins: data.inserted,
+          })
+        : t("mariadbTables.reseeded", {
+            defaultValue: "種URL を再投入対象に戻しました ({{n}} 件)",
+            n,
+          });
+      notifications.show({ color: "teal", message: detail });
+    },
+    onError: (e: unknown) => {
+      notifications.show({ color: "red", message: String(e) });
+    },
+  });
+
+  const askReseed = (pk: number, row: Record<string, unknown>) => {
+    const identifier = String(row.site ?? row.domain ?? row[meta.pk] ?? pk);
+    const url = String(row.url ?? "");
+    modals.openConfirmModal({
+      title: t("mariadbTables.reseed_title", "種URL を再投入しますか"),
+      children: (
+        <Text size="sm">
+          <Code>{identifier}</Code>{" "}
+          {t("mariadbTables.reseed_body",
+            "の種URL を「未投入」状態に戻します。数分以内に priority filler が拾い直して paprika に投入し、成功すれば links-pull が新規リンクを取り込みます。")}
+          {url && (
+            <>
+              <br />
+              <Text size="xs" c="dimmed" span>
+                {url}
+              </Text>
+            </>
+          )}
+        </Text>
+      ),
+      labels: {
+        confirm: t("mariadbTables.reseed_confirm", "再投入"),
+        cancel: t("mariadbTables.cancel", "キャンセル"),
+      },
+      confirmProps: { color: "blue" },
+      onConfirm: () => reseedMutation.mutate(pk),
+    });
+  };
 
   const askDelete = (pk: number, row: Record<string, unknown>) => {
     const identifier = String(row.site ?? row.domain ?? row[meta.pk] ?? pk);
@@ -320,7 +371,11 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
                   {meta.columns.map((c) => (
                     <Table.Th key={c.name}>{c.name}</Table.Th>
                   ))}
-                  {isDeletable && <Table.Th style={{ width: 60 }} />}
+                  {(isReseedable || isDeletable) && (
+                    <Table.Th
+                      style={{ width: (isReseedable ? 32 : 0) + (isDeletable ? 32 : 0) + 20 }}
+                    />
+                  )}
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -347,22 +402,41 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
                           )}
                         </Table.Td>
                       ))}
-                      {isDeletable && (
+                      {(isReseedable || isDeletable) && (
                         <Table.Td>
-                          <Tooltip
-                            label={meta.deletable
-                              ? t("mariadbTables.delete_confirm", "削除")
-                              : t("mariadbTables.disable_confirm", "無効化")}
-                          >
-                            <ActionIcon
-                              size="sm"
-                              color="red"
-                              variant="subtle"
-                              onClick={() => askDelete(pk, row)}
-                            >
-                              <IconTrash size={14} />
-                            </ActionIcon>
-                          </Tooltip>
+                          <Group gap={4} wrap="nowrap">
+                            {isReseedable && (
+                              <Tooltip
+                                label={t("mariadbTables.reseed_tooltip", "種URL を再投入")}
+                              >
+                                <ActionIcon
+                                  size="sm"
+                                  color="blue"
+                                  variant="subtle"
+                                  loading={reseedMutation.isPending && reseedMutation.variables === pk}
+                                  onClick={() => askReseed(pk, row)}
+                                >
+                                  <IconRefresh size={14} />
+                                </ActionIcon>
+                              </Tooltip>
+                            )}
+                            {isDeletable && (
+                              <Tooltip
+                                label={meta.deletable
+                                  ? t("mariadbTables.delete_confirm", "削除")
+                                  : t("mariadbTables.disable_confirm", "無効化")}
+                              >
+                                <ActionIcon
+                                  size="sm"
+                                  color="red"
+                                  variant="subtle"
+                                  onClick={() => askDelete(pk, row)}
+                                >
+                                  <IconTrash size={14} />
+                                </ActionIcon>
+                              </Tooltip>
+                            )}
+                          </Group>
                         </Table.Td>
                       )}
                     </Table.Tr>

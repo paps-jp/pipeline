@@ -709,6 +709,20 @@ export interface MariadbTableMeta {
   deletable: boolean;
   soft_delete_column: string | null;
   soft_delete_value: unknown;
+  /** true = 「種URL 再投入」ボタンを出す (crawl_config だけ)。 詳細は
+   *  pipeline/db/mariadb_admin.py の reseed_row docstring 参照。 */
+  reseedable: boolean;
+}
+
+export interface MariadbReseedResponse {
+  /** downloaded_at/submitted_at を NULL に戻した seed_table 行の数 */
+  reset: number;
+  /** 種行が無かった場合に INSERT した seed_table 行の数 (通常 0) */
+  inserted: number;
+  /** 対象 seed の site 名 (crawl_config → crawl の対応列) */
+  site?: string;
+  /** 対象 seed の URL */
+  url?: string;
 }
 
 export interface MariadbRowsResponse {
@@ -747,6 +761,70 @@ export const mariadbTablesApi = {
       `/api/v1/mariadb-tables/tables/${encodeURIComponent(table)}/rows/${pk}`,
       { method: "DELETE" },
     ),
+  reseedRow: (table: string, pk: number) =>
+    request<MariadbReseedResponse>(
+      `/api/v1/mariadb-tables/tables/${encodeURIComponent(table)}/rows/${pk}/reseed`,
+      { method: "POST" },
+    ),
+};
+
+// ============================================================
+// url-management (URL 1 本での新規登録 + サイト状況一覧)
+// ============================================================
+
+export interface UrlRegisterRequest {
+  url: string;
+  /** 省略時は 50 (priority tier)。 通常投入なら 1、 更に高優先度なら 90 等 */
+  enabled?: number;
+  memo?: string;
+}
+
+export interface UrlRegisterResponse {
+  id: number;
+  site: string;
+  url: string;
+  domain: string;
+  enabled: number;
+}
+
+export interface UrlSiteRow {
+  id: number;
+  site: string;
+  url: string;
+  domain: string | null;
+  enabled: number;
+  memo: string | null;
+  created_at: string | null;
+  /** paprika_job_q に載っている本数 (未 claim + claim 済み合計) */
+  queued: number;
+  /** うち未 claim (= まだ POST されていない) */
+  queued_unclaimed: number;
+  /** enabled > 1 なら priority tier */
+  is_priority: boolean;
+  /** queued > 0 なら現在クロール中扱い */
+  is_currently_crawling: boolean;
+}
+
+export interface UrlSitesResponse {
+  sites: UrlSiteRow[];
+  total: number;
+  priority_count: number;
+  crawling_count: number;
+}
+
+export const urlManagementApi = {
+  register: (body: UrlRegisterRequest) =>
+    request<UrlRegisterResponse>("/api/v1/url-management/register", {
+      method: "POST",
+      json: body,
+    }),
+  listSites: (params: { q?: string; only_active?: boolean } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.q) qs.set("q", params.q);
+    if (params.only_active) qs.set("only_active", "true");
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return request<UrlSitesResponse>(`/api/v1/url-management/sites${suffix}`);
+  },
 };
 
 export interface DeployPath {

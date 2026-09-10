@@ -49,6 +49,16 @@ class TableSpec:
     deletable: bool = False
     soft_delete_column: str | None = None
     soft_delete_value: Any = None
+    # ---- 種URL 再投入 (reseed) ----
+    # `crawl` 表内の「この crawl_config 行に紐づく種URL」の downloaded_at /
+    # submitted_at を NULL に戻す UI アクションを許可する。 使い所は:
+    #   - 種ジョブが完了マークだけ付いてリンクが取り込めていないサイト
+    #     (links-pull の site_cache 未更新など [[new-sites-dilute-rotation-and-lose-links]])
+    #   - priority tier に居るのに crawl 在庫ゼロで自動除外されているサイト
+    # 対応する crawl 行が無ければ 1 行 INSERT IGNORE で種を撒き直す
+    # (create_row の seed_table 経路と同じ形)。 副作用が「1 サイト分の再投入」で
+    # 収まるよう、 リセット対象は必ず `crawl.url = <cc.url>` の 1 URL に限定する。
+    reseedable: bool = False
 
     def column(self, name: str) -> ColumnSpec | None:
         return next((c for c in self.columns if c.name == name), None)
@@ -99,6 +109,8 @@ TABLE_REGISTRY: dict[str, TableSpec] = {
         # ため、 除外は必ず負値側 (-1) を使う。 旧 99 は同 migration で -1 に統合。
         soft_delete_column="enabled",
         soft_delete_value=-1,
+        # 種URL 再投入ボタンを有効化 (詳細は reseedable フィールドのコメント)。
+        reseedable=True,
     ),
     "host_import_queue": TableSpec(
         name="host_import_queue", label="取り込み候補キュー", pk="id",
@@ -142,6 +154,10 @@ class DuplicateRowError(ValueError):
 
 
 class RowDeletionNotSupportedError(ValueError):
+    pass
+
+
+class RowReseedNotSupportedError(ValueError):
     pass
 
 
@@ -318,3 +334,93 @@ def delete_row(db: Any, lock: threading.Lock, spec: TableSpec,
     if not rowcount:
         raise KeyError(f"{spec.name}.{spec.pk}={pk_value} が見つかりません")
     return None
+
+
+def reseed_row(db: Any, lock: threading.Lock, spec: TableSpec,
+                pk_value: Any) -> dict[str, Any]:
+    """種URL を「未投入」状態に戻して priority filler に拾い直させる。
+
+    2026-09-11 追加。 crawl_config 行 1 件に対して:
+      1. seed_table (通常 ``crawl``) の対応行 (site + url 一致) の
+         ``downloaded_at`` / ``submitted_at`` を NULL に戻す
+      2. 該当 seed 行が存在しなければ INSERT IGNORE で 1 行撒く
+         (create_row の seed_table 経路と同じ形)
+
+    使い所は TableSpec.reseedable のコメント参照。
+
+    戻り値: ``{"reset": N, "inserted": M, "site": ..., "url": ...}``。
+    UI が「N 件を再投入対象に戻しました」と表示するために使う。 通常は
+    N=1 (種URL 1本), M=0 だが、 URL が edit されて crawl 側に無ければ
+    N=0, M=1 になる (新規種撒き)。
+    """
+    if not spec.reseedable:
+        raise RowReseedNotSupportedError(
+            f"{spec.name} は種URL 再投入に対応していません")
+    if not (spec.seed_table and spec.seed_columns):
+        # reseedable なのに seed_table 未設定 = spec バグ。 明示的に落とす
+        # (silent no-op にすると UI の成功メッセージだけ返って実際は何も
+        # 起きない、 という debug 困難な状態になる)。
+        raise RowReseedNotSupportedError(
+            f"{spec.name}: reseedable=True だが seed_table/seed_columns 未設定")
+
+    # 現行の crawl_config 行を読んで site/url を確定させる。 UI 側で持って
+    # いる値を信じずに DB を権威にするのは、 タイムラグ (list → click) の
+    # 間に他 operator が編集した場合の食い違いを避けるため。
+    all_col_names = [c.name for c in spec.columns]
+    with lock:
+        db.ping()
+        cur = db.execute(
+            f"SELECT {', '.join(all_col_names)} FROM {spec.name} "
+            f"WHERE {spec.pk} = %s",
+            (pk_value,),
+        )
+        try:
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        if row is None:
+            raise KeyError(f"{spec.name}.{spec.pk}={pk_value} が見つかりません")
+        row_dict = dict(zip(all_col_names, row))
+
+        # seed_columns は ``{self_col: seed_col}``。 crawl_config → crawl は
+        # ``{"site": "site", "url": "url"}``。 ここでは「seed_table 側の
+        # site/url 両方が一致する行」を対象にする。
+        seed_where_cols = list(spec.seed_columns.values())     # seed_table 側の列名
+        self_source_cols = list(spec.seed_columns.keys())     # 自分側の列名
+        seed_where_vals = tuple(row_dict.get(c) for c in self_source_cols)
+        if any(v in (None, "") for v in seed_where_vals):
+            raise ValueError(
+                f"種URL 再投入に必要な列が空です: "
+                f"{dict(zip(self_source_cols, seed_where_vals))}")
+
+        seed_where_sql = " AND ".join(f"{c} = %s" for c in seed_where_cols)
+        # crawl 表の全 URL を戻したいわけではなく「seed URL 1 本」を再投入対象に
+        # したいだけ。 links-pull で拾ってきた 2 本目以降を巻き込まないよう
+        # 種の url まで含めた完全一致で絞る。
+        upd_cur = db.execute(
+            f"UPDATE {spec.seed_table} "
+            f"SET downloaded_at = NULL, submitted_at = NULL "
+            f"WHERE {seed_where_sql}",
+            seed_where_vals,
+        )
+        reset = int(upd_cur.rowcount or 0)
+        upd_cur.close()
+
+        inserted = 0
+        if reset == 0:
+            # 種 URL が seed_table にまだ無い (URL が edit された等)。
+            # create_row と同じ形で撒き直す。
+            ins_cur = db.execute(
+                f"INSERT IGNORE INTO {spec.seed_table} "
+                f"({', '.join(seed_where_cols)}) "
+                f"VALUES ({', '.join(['%s'] * len(seed_where_cols))})",
+                seed_where_vals,
+            )
+            inserted = int(ins_cur.rowcount or 0)
+            ins_cur.close()
+
+    return {
+        "reset": reset,
+        "inserted": inserted,
+        **dict(zip(seed_where_cols, seed_where_vals)),
+    }

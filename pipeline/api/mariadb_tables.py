@@ -26,11 +26,13 @@ from pipeline.db.mariadb_admin import (
     MissingRequiredFieldError,
     RowCreationNotSupportedError,
     RowDeletionNotSupportedError,
+    RowReseedNotSupportedError,
     TableNotFoundError,
     create_row,
     delete_row,
     get_spec,
     list_rows,
+    reseed_row,
     update_row,
 )
 
@@ -85,6 +87,7 @@ class TableMeta(BaseModel):
     deletable: bool
     soft_delete_column: str | None
     soft_delete_value: Any = None
+    reseedable: bool = False
 
 
 class TableListResponse(BaseModel):
@@ -107,6 +110,7 @@ def _table_meta(name: str) -> TableMeta:
         deletable=spec.deletable,
         soft_delete_column=spec.soft_delete_column,
         soft_delete_value=spec.soft_delete_value,
+        reseedable=spec.reseedable,
     )
 
 
@@ -186,3 +190,25 @@ def delete_row_endpoint(table: str, pk: int,
     if row is not None:
         return row
     return {"deleted": True, "id": pk}
+
+
+@router.post("/tables/{table}/rows/{pk}/reseed")
+def reseed_row_endpoint(table: str, pk: int,
+                         backend: _Backend = Depends(get_backend)) -> dict[str, Any]:
+    """種URL を「未投入」状態に戻して priority filler に拾い直させる。
+
+    reseedable=True の TableSpec のみ許可 (現状 crawl_config のみ)。
+    詳細は pipeline/db/mariadb_admin.py の reseed_row docstring 参照。
+    """
+    try:
+        spec = get_spec(table)
+    except TableNotFoundError:
+        raise HTTPException(status_code=404, detail=f"未登録のテーブル: {table}") from None
+    try:
+        return reseed_row(backend.db, backend.lock, spec, pk)
+    except RowReseedNotSupportedError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
