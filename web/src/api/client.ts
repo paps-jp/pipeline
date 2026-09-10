@@ -812,6 +812,23 @@ export interface UrlSitesResponse {
   crawling_count: number;
 }
 
+export interface UrlQueueRow {
+  id: number;
+  url: string;
+  attempts: number;
+  enqueued_at: string | null;
+  /** null = 未 POST、値ありは POST 中 or stale claim */
+  claimed_at: string | null;
+}
+
+export interface UrlSiteQueueResponse {
+  site: string;
+  total: number;
+  unclaimed: number;
+  claimed: number;
+  rows: UrlQueueRow[];
+}
+
 export const urlManagementApi = {
   register: (body: UrlRegisterRequest) =>
     request<UrlRegisterResponse>("/api/v1/url-management/register", {
@@ -824,6 +841,10 @@ export const urlManagementApi = {
     if (params.only_active) qs.set("only_active", "true");
     const suffix = qs.toString() ? `?${qs.toString()}` : "";
     return request<UrlSitesResponse>(`/api/v1/url-management/sites${suffix}`);
+  },
+  siteQueue: (site: string, limit: number = 200) => {
+    const qs = new URLSearchParams({ site, limit: String(limit) });
+    return request<UrlSiteQueueResponse>(`/api/v1/url-management/queue?${qs.toString()}`);
   },
 };
 

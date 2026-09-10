@@ -82,6 +82,22 @@ class SitesResponse(BaseModel):
     crawling_count: int
 
 
+class QueueRow(BaseModel):
+    id: int
+    url: str
+    attempts: int
+    enqueued_at: str | None
+    claimed_at: str | None    # None なら未 POST、 値ありなら今 POST 中 (or stale)
+
+
+class SiteQueueResponse(BaseModel):
+    site: str
+    total: int
+    unclaimed: int
+    claimed: int
+    rows: list[QueueRow]
+
+
 # ---------------- URL → host 正規化 ----------------
 
 def _host_of(url: str) -> str:
@@ -255,4 +271,64 @@ def list_sites(q: str | None = None,
         total=len(cc_rows),
         priority_count=priority_count,
         crawling_count=crawling_count,
+    )
+
+
+# ---------------- endpoint: 1 サイトの現在キュー ----------------
+
+@router.get("/queue", response_model=SiteQueueResponse)
+def get_site_queue(site: str, limit: int = 200,
+                    backend: _Backend = Depends(get_backend)) -> SiteQueueResponse:
+    """指定サイトの paprika_job_q に載っている URL を返す (現在キュー中身の可視化)。
+
+    site 名には ``https://www.jukujo-cafe.net/`` のように URL そのものが入る
+    ことがあるので、 path param ではなく query string で受ける (path encoding
+    の煩雑さと URL 中の ``/`` の扱いを避ける)。
+
+    - unclaimed (claimed_at IS NULL) を先頭に、次に claimed 済み (= POST 中 or
+      stale claim) を並べる。 デバッグ観点で「まだ POST されていない」が先の方が
+      使いやすい。 attempts>0 の再試行行も混ざる。
+    - デフォルト 200 件で切る (キューはドメイン分散のため 1 サイトあたり
+      通常数十件だが、 大量投入直後は数百に膨らむ)。
+    """
+    limit = max(1, min(int(limit), 1000))
+    with backend.lock:
+        backend.db.ping()
+        cur = backend.db.execute(
+            "SELECT id, url, attempts, enqueued_at, claimed_at "
+            "FROM paprika_job_q WHERE site = %s "
+            "ORDER BY (claimed_at IS NOT NULL) ASC, id ASC LIMIT %s",
+            (site, limit),
+        )
+        try:
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+        # total (limit 前の件数) を別途取る。 小テーブルなので追加 COUNT でも安い。
+        ccur = backend.db.execute(
+            "SELECT COUNT(*), SUM(claimed_at IS NULL) FROM paprika_job_q WHERE site = %s",
+            (site,),
+        )
+        try:
+            total, unclaimed = ccur.fetchone()
+            total = int(total or 0)
+            unclaimed = int(unclaimed or 0)
+        finally:
+            ccur.close()
+
+    return SiteQueueResponse(
+        site=site,
+        total=total,
+        unclaimed=unclaimed,
+        claimed=total - unclaimed,
+        rows=[
+            QueueRow(
+                id=int(r[0]),
+                url=str(r[1] or ""),
+                attempts=int(r[2] or 0),
+                enqueued_at=str(r[3]) if r[3] is not None else None,
+                claimed_at=str(r[4]) if r[4] is not None else None,
+            )
+            for r in rows
+        ],
     )

@@ -1,11 +1,15 @@
 import {
   ActionIcon,
+  Anchor,
   Badge,
   Button,
+  Code,
   Group,
   Loader,
+  Modal,
   NumberInput,
   Paper,
+  ScrollArea,
   Stack,
   Switch,
   Table,
@@ -13,7 +17,7 @@ import {
   TextInput,
   Tooltip,
 } from "@mantine/core";
-import { useDebouncedValue } from "@mantine/hooks";
+import { useDebouncedValue, useDisclosure } from "@mantine/hooks";
 import { modals } from "@mantine/modals";
 import { notifications } from "@mantine/notifications";
 import { IconPlus, IconRefresh, IconSearch, IconTrash } from "@tabler/icons-react";
@@ -102,9 +106,123 @@ function AddUrlForm({ onAdded }: { onAdded: () => void }) {
   );
 }
 
+function QueueModal({
+  site, opened, onClose,
+}: { site: string | null; opened: boolean; onClose: () => void }) {
+  const { t } = useTranslation();
+  const queueQ = useQuery({
+    queryKey: ["url-mgmt-queue", site],
+    queryFn: () => urlManagementApi.siteQueue(site!, 200),
+    enabled: opened && !!site,
+    refetchInterval: opened ? 10_000 : false,
+  });
+  const rows = queueQ.data?.rows ?? [];
+  const total = queueQ.data?.total ?? 0;
+  const unclaimed = queueQ.data?.unclaimed ?? 0;
+  const claimed = queueQ.data?.claimed ?? 0;
+
+  return (
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title={
+        <Group gap="xs">
+          <Text fw={600}>{t("urlManagement.queue_title", "現在のキュー")}</Text>
+          {site && <Code>{site}</Code>}
+        </Group>
+      }
+      size="xl"
+    >
+      <Stack gap="sm">
+        <Group gap="md">
+          <Text size="sm">
+            {t("urlManagement.queue_summary", {
+              defaultValue: "合計 {{n}} / 未POST {{u}} / POST中 {{c}}",
+              n: total, u: unclaimed, c: claimed,
+            })}
+          </Text>
+          {queueQ.isFetching && <Loader size="xs" />}
+          <Text size="xs" c="dimmed">
+            {t("urlManagement.queue_refresh_hint", "10 秒ごとに再取得")}
+          </Text>
+        </Group>
+
+        {queueQ.error && <ErrorState error={queueQ.error} onRetry={() => queueQ.refetch()} />}
+
+        {!queueQ.error && rows.length === 0 && !queueQ.isLoading && (
+          <EmptyState
+            title={t("urlManagement.queue_empty_title", "キューは空です")}
+            description={t("urlManagement.queue_empty_hint",
+              "このサイトの URL は現在キューに載っていません。 crawl 表に在庫がある場合は次の filler tick で載ります。")}
+          />
+        )}
+
+        {rows.length > 0 && (
+          <ScrollArea.Autosize mah={"60vh"} type="auto">
+            <Table striped withTableBorder stickyHeader>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th style={{ width: 50 }}>#</Table.Th>
+                  <Table.Th>URL</Table.Th>
+                  <Table.Th style={{ width: 90 }}>{t("urlManagement.queue_col_status", "状態")}</Table.Th>
+                  <Table.Th style={{ width: 80 }}>{t("urlManagement.queue_col_attempts", "再試行")}</Table.Th>
+                  <Table.Th style={{ width: 170 }}>{t("urlManagement.queue_col_enqueued", "投入時刻")}</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {rows.map((r) => (
+                  <Table.Tr key={r.id}>
+                    <Table.Td>
+                      <Text size="xs" c="dimmed">{r.id}</Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Anchor href={r.url} target="_blank" rel="noreferrer noopener"
+                              size="xs" style={{ wordBreak: "break-all" }}>
+                        {r.url}
+                      </Anchor>
+                    </Table.Td>
+                    <Table.Td>
+                      {r.claimed_at ? (
+                        <Badge color="orange" variant="light" size="xs">
+                          {t("urlManagement.queue_status_claimed", "POST中")}
+                        </Badge>
+                      ) : (
+                        <Badge color="gray" variant="light" size="xs">
+                          {t("urlManagement.queue_status_pending", "待機")}
+                        </Badge>
+                      )}
+                    </Table.Td>
+                    <Table.Td>
+                      {r.attempts > 0
+                        ? <Badge color="red" variant="light" size="xs">{r.attempts}</Badge>
+                        : <Text size="xs" c="dimmed">0</Text>}
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="xs" c="dimmed" style={{ fontFamily: "ui-monospace, monospace" }}>
+                        {r.enqueued_at ?? "—"}
+                      </Text>
+                    </Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          </ScrollArea.Autosize>
+        )}
+      </Stack>
+    </Modal>
+  );
+}
+
 function SitesTable({ sites }: { sites: UrlSiteRow[] }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
+  const [queueSite, setQueueSite] = useState<string | null>(null);
+  const [queueOpened, { open: openQueue, close: closeQueue }] = useDisclosure(false);
+
+  const showQueue = (site: string) => {
+    setQueueSite(site);
+    openQueue();
+  };
 
   const reseedMutation = useMutation({
     mutationFn: (pk: number) => mariadbTablesApi.reseedRow("crawl_config", pk),
@@ -172,6 +290,8 @@ function SitesTable({ sites }: { sites: UrlSiteRow[] }) {
   };
 
   return (
+    <>
+      <QueueModal site={queueSite} opened={queueOpened} onClose={closeQueue} />
     <Paper withBorder style={{ overflowX: "auto" }}>
       <Table striped highlightOnHover withTableBorder stickyHeader>
         <Table.Thead>
@@ -199,7 +319,10 @@ function SitesTable({ sites }: { sites: UrlSiteRow[] }) {
                 )}
               </Table.Td>
               <Table.Td>
-                <Text size="sm" fw={500}>{s.site}</Text>
+                <Anchor component="button" type="button" onClick={() => showQueue(s.site)}
+                        fw={500} size="sm" style={{ textAlign: "left" }}>
+                  {s.site}
+                </Anchor>
                 {s.memo && <Text size="xs" c="dimmed">{s.memo}</Text>}
               </Table.Td>
               <Table.Td>
@@ -250,6 +373,7 @@ function SitesTable({ sites }: { sites: UrlSiteRow[] }) {
         </Table.Tbody>
       </Table>
     </Paper>
+    </>
   );
 }
 
