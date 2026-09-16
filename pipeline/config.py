@@ -23,6 +23,9 @@ class Settings:
     admin_password: str | None = None  # 初回起動時のみ env で指定
     secret_key: str | None = None  # session HMAC 用
     plugin_dirs: tuple[Path, ...] = field(default_factory=tuple)
+    # ブラウザ拡張など外部オリジンからの /api/v1/create 直叩きを許すオリジン。
+    # 資格情報 (cookie) は載せない前提なので admin セッションは奪われない。
+    cors_origins: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
     def from_env(cls, **overrides) -> Settings:
@@ -41,6 +44,9 @@ class Settings:
             secret_key=env("SECRET_KEY"),
             plugin_dirs=tuple(
                 Path(p) for p in env("PLUGIN_DIRS", "").split(os.pathsep) if p
+            ),
+            cors_origins=tuple(
+                o.strip() for o in env("CORS_ORIGINS", "").split(",") if o.strip()
             ),
         )
         defaults.update(overrides)
