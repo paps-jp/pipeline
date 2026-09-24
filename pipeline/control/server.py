@@ -385,19 +385,10 @@ def create_app(settings: Settings) -> FastAPI:
             allow_methods=["*"],
             allow_headers=["*"],
         )
-    elif settings.cors_origins:
-        # 外部オリジン (ブラウザ拡張の content script 等) から /api/v1/create を
-        # 直接叩かせるための CORS。**allow_credentials は必ず False**:
-        # True にすると許可オリジン上のスクリプトが admin セッション cookie 付きで
-        # 管理 API を叩けてしまう。 create API の認証は Bearer ヘッダなので不要。
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=list(settings.cors_origins),
-            allow_credentials=False,
-            allow_methods=["GET", "POST", "OPTIONS"],
-            allow_headers=["authorization", "content-type"],
-            max_age=86400,
-        )
+    # 外部オリジン (ブラウザ拡張の content script 等) から /api/v1/create を直接叩かせる
+    # CORS。 オリジン無制限・create API のパス限定 (理由は pipeline.api_public.cors)。
+    from pipeline.api_public.cors import CreateApiCors
+    app.add_middleware(CreateApiCors)
 
     # routers
     app.include_router(system.router)

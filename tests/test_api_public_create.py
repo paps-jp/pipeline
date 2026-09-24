@@ -359,3 +359,44 @@ def test_limits_reports_site_and_quota(client: TestClient) -> None:
         assert body["site"] == "create-beta"
         assert body["max_image_bytes"] > 0
 
+
+# ---------------- CORS (create API のパスだけ、 オリジン無制限) ----------------
+
+
+@pytest.fixture
+def control_client() -> TestClient:
+    # lifespan を走らせない (with を使わない) ので control の常駐ループは起動しない。
+    app = create_app(Settings(db_url="sqlite:///:memory:", mode="control"))
+    app.state.create_backend = FakeBackend()
+    return TestClient(app)
+
+
+_PREFLIGHT = {"Access-Control-Request-Method": "POST",
+              "Access-Control-Request-Headers": "authorization,content-type"}
+
+
+@pytest.mark.parametrize("origin", ["https://x.com", "https://www.instagram.com"])
+def test_create_preflight_allows_any_origin(control_client: TestClient, origin: str) -> None:
+    r = control_client.options("/api/v1/create/videos",
+                               headers={"Origin": origin, **_PREFLIGHT})
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == "*"
+    assert "POST" in r.headers["access-control-allow-methods"]
+    assert "authorization" in r.headers["access-control-allow-headers"].lower()
+    assert r.headers["access-control-max-age"] == "86400"
+    assert "access-control-allow-credentials" not in r.headers
+
+
+def test_create_error_response_carries_cors(control_client: TestClient) -> None:
+    # 401 でも ACAO が無いと、 拡張には「CORS エラー」しか見えず原因が分からない。
+    r = control_client.post("/api/v1/create/videos", headers={"Origin": "https://x.com"},
+                            files={"file": ("v.mp4", io.BytesIO(MP4), "video/mp4")})
+    assert r.status_code == 401
+    assert r.headers["access-control-allow-origin"] == "*"
+
+
+def test_admin_api_gets_no_cors(control_client: TestClient) -> None:
+    # 認証なしの管理 API (api-keys 発行等) を任意サイトの JS から読ませない。
+    r = control_client.options("/api/v1/api-keys",
+                               headers={"Origin": "https://evil.example", **_PREFLIGHT})
+    assert "access-control-allow-origin" not in r.headers
