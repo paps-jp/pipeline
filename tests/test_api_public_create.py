@@ -12,7 +12,7 @@ import io
 import pytest
 from fastapi.testclient import TestClient
 
-from pipeline.api_public.backend import CreateError, CreateResult
+from pipeline.api_public.backend import CreateBackend, CreateError, CreateResult
 from pipeline.config import Settings
 from pipeline.control.server import create_app
 
@@ -22,11 +22,17 @@ MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64
 
 
 class FakeBackend:
-    def __init__(self) -> None:
+    # spool は本物を使う (spool_dir / spool_min_free_bytes しか見ない)。
+    spool = CreateBackend.spool
+
+    def __init__(self, spool_dir=None) -> None:
         self.images: list[dict] = []
         self.videos: list[dict] = []
         self.fail_with: CreateError | None = None
+        self.video_dedup_id: int | None = None
         self._next = 1000
+        self.spool_dir = spool_dir
+        self.spool_min_free_bytes = 0
 
     def create_image(self, *, data, url, site, ext, page_url=None):
         if self.fail_with:
@@ -44,6 +50,17 @@ class FakeBackend:
         self._next += 1
         return CreateResult(self._next, "video", dedup=False, state="queued")
 
+    def create_video_spooled(self, sp, *, url, site, ext, mime=None, page_url=None):
+        sp.discard()                    # 本物同様に所有権を引き取る
+        if self.fail_with:
+            raise self.fail_with
+        if self.video_dedup_id is not None:
+            return CreateResult(self.video_dedup_id, "video", dedup=True, state="existing")
+        self.videos.append({"bytes": sp.size, "url": url, "site": site, "ext": ext,
+                            "mime": mime, "page_url": page_url})
+        self._next += 1
+        return CreateResult(self._next, "video", dedup=False, state="uploading")
+
     def image_status(self, image_id):
         if image_id != 1001:
             return None
@@ -55,10 +72,10 @@ class FakeBackend:
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client(tmp_path) -> TestClient:
     settings = Settings(db_url="sqlite:///:memory:", mode="dev")
     app = create_app(settings)
-    app.state.create_backend = FakeBackend()
+    app.state.create_backend = FakeBackend(spool_dir=tmp_path / "spool")
     return TestClient(app)
 
 
@@ -195,9 +212,49 @@ def test_video_upload_uses_video_sniffer(client: TestClient) -> None:
         key = _issue_key(client)
         r = client.post("/api/v1/create/videos", headers=_auth(key),
                         files={"file": ("v.mp4", io.BytesIO(MP4), "video/mp4")})
+        assert r.status_code == 202, r.text          # 受理のみ、 put は裏
+        item = r.json()["items"][0]
+        assert item["ok"] is True and item["state"] == "uploading"
+        v = client.app.state.create_backend.videos[0]
+        assert (v["ext"], v["bytes"], v["mime"]) == ("mp4", len(MP4), "video/mp4")
+
+
+def _spool_files(client: TestClient) -> list:
+    d = client.app.state.create_backend.spool_dir
+    return list(d.iterdir()) if d.exists() else []
+
+
+def test_video_dedup_is_201_and_leaves_no_spool(client: TestClient) -> None:
+    with client:
+        key = _issue_key(client)
+        client.app.state.create_backend.video_dedup_id = 42
+        r = client.post("/api/v1/create/videos", headers=_auth(key),
+                        files={"file": ("v.mp4", io.BytesIO(MP4), "video/mp4")})
         assert r.status_code == 201, r.text
-        assert r.json()["items"][0]["ok"] is True
-        assert client.app.state.create_backend.videos[0]["ext"] == "mp4"
+        assert r.json()["dedup"] == 1 and r.json()["items"][0]["id"] == 42
+        assert _spool_files(client) == []
+
+
+def test_video_too_large_is_rejected_without_keeping_spool(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pipeline.api_public.create as create_mod
+    monkeypatch.setattr(create_mod, "MAX_VIDEO_BYTES", 16)
+    with client:
+        key = _issue_key(client)
+        r = client.post("/api/v1/create/videos", headers=_auth(key),
+                        files={"file": ("v.mp4", io.BytesIO(MP4), "video/mp4")})
+        assert r.json()["items"][0]["error"] == "too_large"
+        assert client.app.state.create_backend.videos == []
+        assert _spool_files(client) == []
+
+
+def test_video_spool_full_is_an_item_error(client: TestClient) -> None:
+    with client:
+        key = _issue_key(client)
+        client.app.state.create_backend.spool_min_free_bytes = 1 << 62
+        r = client.post("/api/v1/create/videos", headers=_auth(key),
+                        files={"file": ("v.mp4", io.BytesIO(MP4), "video/mp4")})
+        assert r.json()["items"][0]["error"] == "spool_full"
 
 
 def test_jpeg_posted_to_videos_is_rejected(client: TestClient) -> None:
@@ -206,6 +263,7 @@ def test_jpeg_posted_to_videos_is_rejected(client: TestClient) -> None:
         r = client.post("/api/v1/create/videos", headers=_auth(key),
                         files={"file": ("v.mp4", io.BytesIO(JPEG), "video/mp4")})
         assert r.json()["items"][0]["error"] == "unsupported_format"
+        assert _spool_files(client) == []
 
 
 def test_storage_failure_surfaces_as_item_error(client: TestClient) -> None:
@@ -300,3 +358,4 @@ def test_limits_reports_site_and_quota(client: TestClient) -> None:
         body = r.json()
         assert body["site"] == "create-beta"
         assert body["max_image_bytes"] > 0
+

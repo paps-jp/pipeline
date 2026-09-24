@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Annotated, Any, Literal
 
 from fastapi import (
@@ -21,6 +22,7 @@ from fastapi import (
     Form,
     HTTPException,
     Request,
+    Response,
     UploadFile,
     status,
 )
@@ -39,6 +41,7 @@ MAX_VIDEO_BYTES = int(os.environ.get("PIPELINE_CREATE_MAX_VIDEO_BYTES", str(2 * 
 MAX_URLS_PER_REQUEST = int(os.environ.get("PIPELINE_CREATE_MAX_URLS", "100"))
 
 _ENV_FILE = os.environ.get("PIPELINE_ENV_FILE", "/etc/pipeline/.env")
+_BACKEND_INIT_LOCK = threading.Lock()
 
 
 # ---------------- backend の解決 (lazy + テスト差し替え可) ----------------
@@ -54,16 +57,32 @@ def get_backend(request: Request) -> CreateBackend:
     be = getattr(request.app.state, "create_backend", None)
     if be is not None:
         return be
-    try:
-        be = CreateBackend.from_env_file(_ENV_FILE)
-    except Exception as e:  # noqa: BLE001
-        log.warning("create backend の初期化に失敗: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"create backend 未設定 ({type(e).__name__})",
-        ) from e
-    request.app.state.create_backend = be
+    # 1 プロセス 1 個に固定する: 裏 put のワーカーと recover_uploads を二重に持たないため。
+    with _BACKEND_INIT_LOCK:
+        be = getattr(request.app.state, "create_backend", None)
+        if be is not None:
+            return be
+        try:
+            be = CreateBackend.from_env_file(_ENV_FILE)
+        except Exception as e:  # noqa: BLE001
+            log.warning("create backend の初期化に失敗: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"create backend 未設定 ({type(e).__name__})",
+            ) from e
+        request.app.state.create_backend = be
+    # 前のプロセスが put し終える前に落ちた 'uploading' 行を拾い直す。 起動直後ではなく
+    # 最初の create リクエストで走るが、 拡張の投入は頻繁なので実用上の遅れは小さい。
+    threading.Thread(target=_recover, args=(be,), daemon=True,
+                     name="create-recover").start()
     return be
+
+
+def _recover(be: CreateBackend) -> None:
+    try:
+        be.recover_uploads()
+    except Exception:  # noqa: BLE001
+        log.exception("create: recover_uploads 失敗")
 
 
 # ---------------- スキーマ ----------------
@@ -134,6 +153,44 @@ def _one(be: CreateBackend, *, kind: str, data: bytes, url: str | None,
         return CreatedItem(ok=False, kind=kind, source=url, error="internal",
                             detail=f"{type(e).__name__}: {e}"[:300])
     return CreatedItem(ok=True, kind=kind, id=r.id, state=r.state, dedup=r.dedup, source=url)
+
+
+def _one_video_file(be: CreateBackend, src: Any, *, url: str | None, site: str,
+                    mime: str | None, page_url: str | None) -> CreatedItem:
+    """multipart の動画 1 本を spool 経由で受理する (`_one` の非同期版)。
+
+    検査項目と item error は `_one` と揃える。 違いは「bytes をメモリに載せない」ことと
+    「受理した時点で返す (state='uploading')」こと。
+    """
+    try:
+        sp = be.spool(src, max_bytes=MAX_VIDEO_BYTES)
+    except CreateError as e:
+        return CreatedItem(ok=False, kind="video", source=url, error=e.reason, detail=e.detail)
+    if sp.size == 0 and not sp.truncated:
+        sp.discard()
+        return CreatedItem(ok=False, kind="video", source=url, error="empty",
+                            detail="0 バイト")
+    if sp.truncated:
+        sp.discard()
+        return CreatedItem(ok=False, kind="video", source=url, error="too_large",
+                            detail=f"> {MAX_VIDEO_BYTES}")
+    sniffed = _fetch.sniff_ext(sp.head, kind="video")
+    if sniffed is None:
+        sp.discard()
+        return CreatedItem(ok=False, kind="video", source=url, error="unsupported_format",
+                            detail="video として判別できない先頭バイト")
+    try:
+        # ここから sp の後始末は backend 側の責任 (所有権を渡す)。
+        r = be.create_video_spooled(sp, url=url, site=site, ext=sniffed,
+                                    mime=mime, page_url=page_url)
+    except CreateError as e:
+        return CreatedItem(ok=False, kind="video", source=url, error=e.reason, detail=e.detail)
+    except Exception as e:  # noqa: BLE001
+        log.exception("create 失敗 kind=video url=%s", url)
+        return CreatedItem(ok=False, kind="video", source=url, error="internal",
+                            detail=f"{type(e).__name__}: {e}"[:300])
+    return CreatedItem(ok=True, kind="video", id=r.id, state=r.state, dedup=r.dedup,
+                       source=url)
 
 
 def _summarize(items: list[CreatedItem]) -> CreateResponse:
@@ -217,6 +274,7 @@ def get_image_status(
              status_code=status.HTTP_201_CREATED)
 def create_video_file(
     request: Request,
+    response: Response,
     principal: Annotated[dict, Depends(require_api_key)],
     file: Annotated[UploadFile, File(description="動画ファイル")],
     url: Annotated[str | None, Form(description="出所 URL (任意・dedup に使われる)")] = None,
@@ -224,15 +282,18 @@ def create_video_file(
 ) -> CreateResponse:
     """multipart で動画ファイルを 1 本投入する。
 
-    大きい動画をここに流すと control plane のプロセスがバッファを持つので、 数百 MB を
-    超えるものは URL 投入 (または将来の presigned PUT) を使うこと。
+    受信が終わった時点で **202 Accepted** (`state="uploading"`) を返し、 paprika MinIO への
+    保存は裏で行う。 進捗は `GET /videos/{video_id}` の `state` で見る
+    (`uploading` → `processing` → `done`、 保存に失敗したら `failed`)。
+    dedup (既存) と item error は従来どおり 201 で返す。
     """
     be = get_backend(request)
     consume_quota(principal["id"])
     site = site_for(principal["user_slug"])
-    data = file.file.read(MAX_VIDEO_BYTES + 1)
-    item = _one(be, kind="video", data=data, url=url, site=site, ext=None,
-                mime=file.content_type, page_url=page_url)
+    item = _one_video_file(be, file.file, url=url, site=site, mime=file.content_type,
+                           page_url=page_url)
+    if item.ok and item.state == "uploading":
+        response.status_code = status.HTTP_202_ACCEPTED
     return _summarize([item])
 
 

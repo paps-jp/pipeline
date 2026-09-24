@@ -10,6 +10,9 @@ MariaDB / MinIO は fake。 検証したいのは **SQL の中身と手順の順
 from __future__ import annotations
 
 import hashlib
+import io
+import os
+import time
 from typing import Any
 
 import pytest
@@ -71,6 +74,9 @@ class FakeDb:
         self.deleted_images = 0
         self.connected = False                  # 実 Db と同じ「触ると張る / close で捨てる」
         self.closes = 0
+        self.uploading_rows: list = []          # recover_uploads が見る 'uploading' 行
+        self.video_status_updates: list[tuple] = []   # (id, status, error)
+        self.update_video_errors = 0            # 先頭 N 回の UPDATE crawl_video を失敗させる
 
     def ping(self) -> None:
         self.pinged += 1
@@ -103,6 +109,15 @@ class FakeDb:
             return FakeCursor([], 1, 0)
         if sql.startswith("DELETE FROM crawl_image"):
             self.deleted_images += 1
+            return FakeCursor([], 1, 0)
+        if "SELECT id, storage_url, mime FROM crawl_video" in sql:
+            return FakeCursor(list(self.uploading_rows), 1, 0)
+        if sql.startswith("UPDATE crawl_video"):
+            if self.update_video_errors > 0:
+                self.update_video_errors -= 1
+                raise GoneAway()
+            status, error, vid, _ = params
+            self.video_status_updates.append((vid, status, error))
             return FakeCursor([], 1, 0)
         if "FROM crawl_video" in sql:
             return FakeCursor([(self.existing_video,)] if self.existing_video else [], 1, 0)
@@ -140,6 +155,7 @@ class FakeStore:
         self.fail = fail
         self.calls: list[str] = []
         self.observe = observe      # put の最中の状態を覗くフック (接続保持の検査用)
+        self.present: set[str] = set()   # exists() が True を返すキー
 
     def put_bytes(self, key: str, data: bytes, content_type: str = "") -> None:
         self.calls.append(f"put:{key}")
@@ -148,6 +164,18 @@ class FakeStore:
         if self.fail:
             raise RuntimeError("MinIO down")
         self.puts.append((key, len(data), content_type))
+
+    def put_file(self, key: str, path: str, content_type: str = "") -> None:
+        self.calls.append(f"put_file:{key}")
+        if self.observe is not None:
+            self.observe()
+        if self.fail:
+            raise RuntimeError("MinIO down")
+        with open(path, "rb") as f:
+            self.puts.append((key, len(f.read()), content_type))
+
+    def exists(self, key: str) -> bool:
+        return key in self.present
 
     def remove(self, key: str) -> None:
         self.removed.append(key)
@@ -428,3 +456,196 @@ def test_video_insert_failure_reclaims_the_object_and_raises(be: CreateBackend) 
 
     assert be.paprika.puts != []
     assert be.paprika.removed == [be.paprika.puts[0][0]]
+
+
+# ---------------- 動画 (非同期: spool → 'uploading' → 裏で put → 'pending') ----------------
+#
+# 2026-09-24: 1.2〜2GB の動画で 504 が 1 日 8 件。 .8 の MinIO へ同期 put すると 20 分を
+# 超え、 前段 nginx の proxy_read_timeout (600s) を越えていた。 行は後から入るので拡張には
+# 「失敗したのに登録済み」に見え、 再送で 2GB を二重に送っていた。
+
+
+def _abe(tmp_path, **kw) -> CreateBackend:
+    kw.setdefault("paprika", FakeStore())
+    return CreateBackend(db=kw.pop("db", FakeDb()), raw=FakeStore(),
+                         spool_dir=tmp_path / "spool", spool_min_free_bytes=0, **kw)
+
+
+def _spool(b: CreateBackend, data: bytes = MP4):
+    return b.spool(io.BytesIO(data), max_bytes=1 << 30)
+
+
+def _drain(b: CreateBackend) -> None:
+    b._uploads.join()
+
+
+def _age(path, seconds: float) -> None:
+    t = time.time() - seconds
+    os.utime(path, (t, t))
+
+
+def test_spool_hashes_and_keeps_head(tmp_path) -> None:
+    b = _abe(tmp_path)
+    sp = _spool(b)
+    assert sp.size == len(MP4) and not sp.truncated
+    assert sp.sha256 == hashlib.sha256(MP4).digest()
+    assert sp.head == MP4[:64]
+    assert sp.path.read_bytes() == MP4
+
+
+def test_spool_stops_at_max_bytes(tmp_path) -> None:
+    b = _abe(tmp_path)
+    sp = b.spool(io.BytesIO(MP4), max_bytes=4)
+    assert sp.truncated
+
+
+def test_spool_refuses_when_disk_is_low(tmp_path) -> None:
+    b = _abe(tmp_path)
+    b.spool_min_free_bytes = 1 << 62
+    with pytest.raises(CreateError) as ei:
+        _spool(b)
+    assert ei.value.reason == "spool_full"
+
+
+def test_spooled_video_is_registered_as_uploading_then_put_then_pending(tmp_path) -> None:
+    b = _abe(tmp_path)
+    sp = _spool(b)
+    r = b.create_video_spooled(sp, url=None, site="create-acme", ext="mp4",
+                               mime="video/mp4", page_url="https://example.com/p")
+    assert (r.id, r.dedup, r.state) == (7001, False, "uploading")
+
+    _, params = b.db.find("INSERT INTO crawl_video")
+    assert params[-1] == "uploading"           # 後段 (dispatcher / vfe) が拾わない値
+    key = params[2]
+    assert key == f"create/{sp.token}.mp4"     # spool 名と uuid を揃える (再起動後の突合)
+
+    _drain(b)
+    assert b.paprika.puts == [(key, len(MP4), "video/mp4")]
+    assert b.db.video_status_updates == [(7001, "pending", None)]
+    assert not sp.path.exists()                # put し終えた spool は消す
+    assert b._inflight == {}
+
+
+def test_spooled_video_does_not_hold_the_db_connection_during_put(tmp_path) -> None:
+    db = FakeDb()
+    held: list[bool] = []
+    b = _abe(tmp_path, db=db, paprika=FakeStore(observe=lambda: held.append(db.connected)))
+    b.create_video_spooled(_spool(b), url=None, site="s", ext="mp4")
+    _drain(b)
+    assert held == [False]
+
+
+def test_spooled_video_put_failure_marks_failed_and_cleans_up(tmp_path) -> None:
+    b = _abe(tmp_path, paprika=FakeStore(fail=True))
+    sp = _spool(b)
+    b.create_video_spooled(sp, url=None, site="s", ext="mp4")
+    _drain(b)
+    (vid, status, error), = b.db.video_status_updates
+    assert (vid, status) == (7001, "failed") and "MinIO down" in error
+    assert b.paprika.removed == [f"create/{sp.token}.mp4"]
+    assert not sp.path.exists()
+
+
+def test_spool_is_kept_when_pending_update_keeps_failing(tmp_path, monkeypatch) -> None:
+    """put 済みでも 'pending' に倒せなければ spool は残す (次回起動の recover が拾う)。"""
+    monkeypatch.setattr("pipeline.api_public.backend.time.sleep", lambda _s: None)
+    b = _abe(tmp_path)
+    b.db.update_video_errors = 99
+    sp = _spool(b)
+    b.create_video_spooled(sp, url=None, site="s", ext="mp4")
+    _drain(b)
+    assert b.paprika.puts != []
+    assert sp.path.exists()
+
+
+def test_spooled_video_dedup_skips_insert_and_discards_spool(tmp_path) -> None:
+    b = _abe(tmp_path)
+    b.db.existing_video = 5
+    sp = _spool(b)
+    r = b.create_video_spooled(sp, url="https://example.com/v.mp4", site="s", ext="mp4")
+    assert (r.id, r.dedup, r.state) == (5, True, "existing")
+    assert not any("INSERT INTO crawl_video" in q for q in b.db.sqls())
+    assert not sp.path.exists()
+    assert b._upload_threads == []             # 裏に何も回していない
+
+
+def test_spooled_video_insert_race_is_dedup(tmp_path) -> None:
+    b = _abe(tmp_path)
+    b.db.insert_video_dup = True
+    original = b.db.execute
+    seen = {"n": 0}
+
+    def execute(sql: str, params: tuple = ()) -> FakeCursor:
+        if "FROM crawl_video" in sql:
+            seen["n"] += 1
+            if seen["n"] >= 2:
+                b.db.existing_video = 88
+        return original(sql, params)
+
+    b.db.execute = execute  # type: ignore[method-assign]
+    sp = _spool(b)
+    r = b.create_video_spooled(sp, url=None, site="s", ext="mp4")
+    assert (r.id, r.dedup) == (88, True)
+    assert not sp.path.exists()
+
+
+def test_spooled_video_insert_failure_discards_spool_and_raises(tmp_path) -> None:
+    b = _abe(tmp_path)
+    b.db.insert_video_error = GoneAway()
+    sp = _spool(b)
+    with pytest.raises(GoneAway):
+        b.create_video_spooled(sp, url=None, site="s", ext="mp4")
+    assert not sp.path.exists()
+    assert b._inflight == {}
+
+
+def test_spooled_video_without_paprika_is_unavailable(tmp_path) -> None:
+    b = _abe(tmp_path, paprika=None)
+    sp = _spool(b)
+    with pytest.raises(CreateError) as ei:
+        b.create_video_spooled(sp, url=None, site="s", ext="mp4")
+    assert ei.value.reason == "video_unavailable"
+    assert not sp.path.exists()
+
+
+def test_recover_uploads_resumes_promotes_or_fails(tmp_path) -> None:
+    b = _abe(tmp_path)
+    b.spool_dir.mkdir(parents=True)
+    (b.spool_dir / "aaa.part").write_bytes(MP4)          # spool が残っている → put し直す
+    b.paprika.present = {"create/bbb.mp4"}               # 実体だけある → put は済んでいた
+    b.db.uploading_rows = [
+        (1, "create/aaa.mp4", "video/mp4"),
+        (2, "create/bbb.mp4", None),
+        (3, "create/ccc.mp4", None),                     # どちらも無い → 取り戻せない
+    ]
+    old = b.spool_dir / "zzz.part"                       # どの行にも無い古い spool
+    old.write_bytes(b"x")
+    _age(old, 2 * 86400)
+    fresh = b.spool_dir / "yyy.part"                     # どの行にも無いが新しい → 残す
+    fresh.write_bytes(b"x")
+
+    out = b.recover_uploads()
+    _drain(b)
+
+    assert out == {"resumed": 1, "pending": 1, "failed": 1, "orphan_spool": 1}
+    assert b.paprika.puts == [("create/aaa.mp4", len(MP4), "video/mp4")]
+    assert sorted((v, s) for v, s, _ in b.db.video_status_updates) == [
+        (1, "pending"), (2, "pending"), (3, "failed")]
+    assert not old.exists() and fresh.exists()
+    assert b._inflight == {}
+
+
+def test_recover_uploads_skips_rows_this_process_is_uploading(tmp_path) -> None:
+    b = _abe(tmp_path)
+    b._inflight[9] = "live.part"
+    b.spool_dir.mkdir(parents=True)
+    live = b.spool_dir / "live.part"
+    live.write_bytes(MP4)
+    _age(live, 2 * 86400)                               # 古くても処理中なら孤児扱いしない
+    b.db.uploading_rows = [(9, "create/live.mp4", None)]
+
+    out = b.recover_uploads()
+
+    assert out["resumed"] == 0 and out["orphan_spool"] == 0
+    assert live.exists()
+    assert b.paprika.puts == []
