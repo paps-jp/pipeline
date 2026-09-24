@@ -42,6 +42,8 @@ import logging
 import os
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -103,8 +105,16 @@ class CreateBackend:
     """MariaDB (.20) + raw MinIO (.17) + paprika MinIO への薄いアダプタ。
 
     `pipeline.storage.Db` は単一コネクションでスレッド安全でない。 control plane の sync
-    エンドポイントは threadpool で並列に走るので、 DB 操作は全て `_lock` 下で直列化する。
-    MinIO put は数百 ms かかりうるので **lock の外**で行う (= DB を待たせない)。
+    エンドポイントは threadpool で並列に走るので、 DB 操作は全て `_db()` 区間 (= `_lock`)
+    の下で直列化する。 MinIO put は数分かかりうるので **区間の外**で行う。
+
+    **接続を MinIO put をまたいで持ち越さない** のがこのクラスの不変条件。 1 リクエストは
+    「DB → put → DB」の形をしていて、 put の間 DB 接続は完全にアイドルになる。 MariaDB の
+    `wait_timeout` (実測 600s) を超えると向こうから切られるので、 持ち越した接続で 2 回目の
+    DB を叩くと `2006 MySQL server has gone away` になる。 API 的には item error
+    `internal` になり、 置いた実体だけが MinIO に残る。 2026-09-16 に 1.5GiB の投入で再現
+    (put に 1382s = 2.24MB/s しか出ない .8 の MinIO なら 660MB 程度から射程に入る)。
+    `_db()` は区間を出るたびに接続を捨てるので、 次の区間は必ず張り直した接続で始まる。
     """
 
     def __init__(self, *, db: Any, raw: Any, paprika: Any = None,
@@ -125,7 +135,21 @@ class CreateBackend:
             log.warning("create: paprika MinIO 未設定 — 動画投入は 503 になります")
         return cls(db=reg.db(), raw=reg.minio("raw"), paprika=paprika)
 
-    # ---------------- DB 小道具 (全て _lock 下で呼ぶ) ----------------
+    # ---------------- DB 小道具 (全て _db() 区間の中で呼ぶ) ----------------
+
+    @contextmanager
+    def _db(self) -> Iterator[None]:
+        """DB を触る区間。 lock を取り、 区間を出るときに接続を捨てる。
+
+        捨てるのは「長い MinIO put をまたいで接続を持ち越さない」ため (クラス docstring)。
+        張り直しは実測 13ms で、 この API の流量 (1 リクエスト数件) なら無視できる。
+        区間の中で例外が出ても閉じるので、 壊れた接続が次のリクエストに漏れない。
+        """
+        with self._lock:
+            try:
+                yield
+            finally:
+                self.db.close()
 
     def _q(self, sql: str, params: tuple = ()) -> list:
         cur = self.db.execute(sql, params)
@@ -141,15 +165,6 @@ class CreateBackend:
             return cur.rowcount, cur.lastrowid
         finally:
             cur.close()
-
-    def _alive(self) -> None:
-        """各リクエストの先頭で接続を確かめる (要 _lock)。
-
-        `Db` は long-lived な単一コネクションなので、 MariaDB 側の wait_timeout で切られると
-        以降のリクエストが全部落ち続ける (`Db.ping()` が失敗時に `_conn` を None に戻すので、
-        ここを通せば次アクセスで再接続される)。 プラグインの `_ensure_db_alive` と同方針。
-        """
-        self.db.ping()
 
     # ---------------- crawl_config / file_no ----------------
 
@@ -227,8 +242,7 @@ class CreateBackend:
         store_url = url or f"create://{site}/{sha.hex()}"
 
         image_id: int | None = None
-        with self._lock:
-            self._alive()
+        with self._db():
             existing = self._find_image(store_url, sha)
             if existing is not None:
                 return CreateResult(existing, "image", dedup=True, state="existing")
@@ -259,7 +273,7 @@ class CreateBackend:
             # downloaded_at が NULL のまま = orphan_reconcile の条件に一度も合致しておらず、
             # hash キューに入っていない → crawl_face も参照も無い。 採番済 file_no を
             # 1 つ捨てるだけで済む。
-            with self._lock:
+            with self._db():
                 try:
                     self._x("DELETE FROM crawl_image WHERE id=%s "
                             "AND download_status='processing' AND downloaded_at IS NULL",
@@ -275,15 +289,14 @@ class CreateBackend:
                         log.exception("create: 失敗マークにも失敗 image_id=%s", image_id)
             raise CreateError("storage_failed", f"raw MinIO put 失敗: {e}"[:300]) from e
 
-        with self._lock:
+        with self._db():
             self._x("UPDATE crawl_image SET download_status=NULL, downloaded_at=NOW() "
                     "WHERE id=%s", (image_id,))
         log.info("create: image_id=%s site=%s key=%s bytes=%d", image_id, site, key, len(data))
         return CreateResult(image_id, "image", dedup=False, state="queued")
 
     def image_status(self, image_id: int) -> dict[str, Any] | None:
-        with self._lock:
-            self._alive()
+        with self._db():
             rows = self._q(
                 "SELECT id, site, url, hash_id, download_status, downloaded_at, ignore_reason, "
                 "       page_url "
@@ -347,8 +360,7 @@ class CreateBackend:
         source_url = url or f"create://{site}/{sha.hex()}"
         ext = (ext or "mp4")[:8]
 
-        with self._lock:
-            self._alive()
+        with self._db():
             existing = self._find_video(source_url)
             if existing is not None:
                 return CreateResult(existing, "video", dedup=True, state="existing")
@@ -360,7 +372,9 @@ class CreateBackend:
         except Exception as e:
             raise CreateError("storage_failed", f"paprika MinIO put 失敗: {e}"[:300]) from e
 
-        with self._lock:
+        video_id: int | None = None
+        insert_error: Exception | None = None
+        with self._db():
             try:
                 _, last = self._x(
                     "INSERT INTO crawl_video "
@@ -373,15 +387,21 @@ class CreateBackend:
                 video_id = int(last)
             except Exception as e:
                 if _errno(e) != ER_DUP_ENTRY:
-                    raise
-                video_id = None  # type: ignore[assignment]
-                existing = self._find_video(source_url)
+                    # 重複以外の失敗 (接続断 / ENOSPC など)。 ここで送出を遅らせるのは、
+                    # **どの理由で入らなかった場合も置いた実体を回収する**ため。 行が無い
+                    # オブジェクトは誰からも参照されず、 GC も持っていかない
+                    # (2026-09-15 までに 17 個 29GB が滞留していた)。
+                    insert_error = e
+                else:
+                    existing = self._find_video(source_url)
         if video_id is None:
-            # 並列投入に負けた → 置いた実体は誰も参照しないので回収する。
+            # 行が作れなかった → 置いた実体は誰も参照しないので回収する。
             try:
                 self.paprika.remove(storage_key)
             except Exception:  # noqa: BLE001
                 log.warning("create: 孤児 video オブジェクト削除失敗 key=%s", storage_key)
+            if insert_error is not None:
+                raise insert_error
             if existing is None:
                 raise CreateError("insert_conflict", "crawl_video INSERT が衝突")
             return CreateResult(existing, "video", dedup=True, state="existing")
@@ -391,8 +411,7 @@ class CreateBackend:
         return CreateResult(video_id, "video", dedup=False, state="queued")
 
     def video_status(self, video_id: int) -> dict[str, Any] | None:
-        with self._lock:
-            self._alive()
+        with self._db():
             rows = self._q(
                 "SELECT id, site, source_url, download_status, face_count, "
                 "       representative_image_ids, processed_at, error_message "

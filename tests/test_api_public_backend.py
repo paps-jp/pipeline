@@ -10,6 +10,7 @@ MariaDB / MinIO は fake。 検証したいのは **SQL の中身と手順の順
 from __future__ import annotations
 
 import hashlib
+from typing import Any
 
 import pytest
 
@@ -30,6 +31,14 @@ class DupEntry(Exception):
     def __init__(self) -> None:
         super().__init__("Duplicate entry")
         self.errno = 1062
+
+
+class GoneAway(Exception):
+    """wait_timeout で切られた接続を使ったときの 2006 相当。"""
+
+    def __init__(self) -> None:
+        super().__init__("MySQL server has gone away")
+        self.errno = 2006
 
 
 class FakeCursor:
@@ -57,13 +66,21 @@ class FakeDb:
         self.existing_video: int | None = None
         self.insert_image_errors = 0            # 先頭 N 回の crawl_image INSERT を 1062 に
         self.insert_video_dup = False
+        self.insert_video_error: Exception | None = None   # 重複以外の INSERT 失敗を注入
         self.pinged = 0
         self.deleted_images = 0
+        self.connected = False                  # 実 Db と同じ「触ると張る / close で捨てる」
+        self.closes = 0
 
     def ping(self) -> None:
         self.pinged += 1
 
+    def close(self) -> None:
+        self.connected = False
+        self.closes += 1
+
     def execute(self, sql: str, params: tuple = ()) -> FakeCursor:
+        self.connected = True
         self.log.append((" ".join(sql.split()), params))
         if "FROM crawl_config" in sql:
             return FakeCursor([(self.next_no,)] if "next_no" in sql else self.config_rows, 1, 0)
@@ -92,6 +109,8 @@ class FakeDb:
         if sql.startswith("INSERT INTO crawl_video"):
             if self.insert_video_dup:
                 raise DupEntry()
+            if self.insert_video_error is not None:
+                raise self.insert_video_error
             return FakeCursor([], 1, 7001)
         if "FROM crawl_face" in sql:
             return FakeCursor([], 1, 0)
@@ -115,14 +134,17 @@ class FakeDb:
 
 
 class FakeStore:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, observe: Any = None) -> None:
         self.puts: list[tuple[str, int, str]] = []
         self.removed: list[str] = []
         self.fail = fail
         self.calls: list[str] = []
+        self.observe = observe      # put の最中の状態を覗くフック (接続保持の検査用)
 
     def put_bytes(self, key: str, data: bytes, content_type: str = "") -> None:
         self.calls.append(f"put:{key}")
+        if self.observe is not None:
+            self.observe()
         if self.fail:
             raise RuntimeError("MinIO down")
         self.puts.append((key, len(data), content_type))
@@ -363,3 +385,46 @@ def test_video_without_paprika_store_is_unavailable() -> None:
     with pytest.raises(CreateError) as ei:
         b.create_video(data=MP4, url=None, site="s", ext="mp4")
     assert ei.value.reason == "video_unavailable"
+
+
+# ---------------- 接続を put をまたいで持ち越さない ----------------
+#
+# 2026-09-16: 1.5GiB の動画投入が item error `internal` で落ちた。 実体は
+# `2006 MySQL server has gone away` で、 原因は「dedup SELECT → 1382 秒かかる MinIO put
+# → INSERT」の間、 単一コネクションを握ったままにしていたこと。 MariaDB の wait_timeout
+# (600s) を超えたので向こうから切られていた。 MinIO は無関係で、 600 秒以上かかる処理なら
+# 何を挟んでも同じ。 put の最中に接続を持っていないことを不変条件として固定する。
+
+
+def test_video_does_not_hold_the_db_connection_across_the_upload() -> None:
+    db = FakeDb()
+    held: list[bool] = []
+    paprika = FakeStore(observe=lambda: held.append(db.connected))
+    be = CreateBackend(db=db, raw=FakeStore(), paprika=paprika)
+
+    be.create_video(data=MP4, url=None, site="create-acme", ext="mp4")
+
+    assert held == [False]          # put の最中は接続を持っていない
+    assert db.closes >= 2           # dedup 区間と INSERT 区間でそれぞれ閉じている
+
+
+def test_image_does_not_hold_the_db_connection_across_the_upload() -> None:
+    db = FakeDb()
+    held: list[bool] = []
+    raw = FakeStore(observe=lambda: held.append(db.connected))
+    be = CreateBackend(db=db, raw=raw, paprika=FakeStore())
+
+    be.create_image(data=JPEG, url=None, site="create-acme", ext="jpg")
+
+    assert held == [False]
+
+
+def test_video_insert_failure_reclaims_the_object_and_raises(be: CreateBackend) -> None:
+    """重複以外の INSERT 失敗でも実体を回収する (回収漏れが 17 個 29GB 滞留していた)。"""
+    be.db.insert_video_error = GoneAway()
+
+    with pytest.raises(GoneAway):
+        be.create_video(data=MP4, url=None, site="s", ext="mp4")
+
+    assert be.paprika.puts != []
+    assert be.paprika.removed == [be.paprika.puts[0][0]]

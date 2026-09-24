@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -176,6 +177,21 @@ class Db:
                 self.conn.ping()                 # mariadb (引数なし)
         except Exception:
             self._conn = None  # 次アクセスで再接続
+
+    def close(self) -> None:
+        """接続を閉じて捨てる (次アクセスで張り直す)。
+
+        「長い外部 I/O をまたいで接続を持ち越したくない」呼び出し側のためのもの。
+        MariaDB は `wait_timeout` を超えたアイドル接続を自分から切るので、 数分かかる
+        MinIO put などを挟む経路では、 持ち越すより使う直前に張る方が安全に倒せる
+        (`ping` は「持ち越した上で生存確認する」側の道具で、 用途が違う)。
+        """
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
+        # 既に切れている接続を捨てるだけなので、 close 自体の失敗は無視してよい。
+        with contextlib.suppress(Exception):
+            conn.close()
 
     def execute(self, sql: str, params: tuple | None = None) -> Any:
         cur = self.conn.cursor()
