@@ -30,8 +30,9 @@ detect → `crawl_face` → `image-embed` → `embed-write` → `face-person-lin
 動画 (multipart, `create_video_spooled`): 順序が逆で、 put を裏に回す
   1. 受信した body を spool へ書き出す (sha256 も同時に取る)
   2. `INSERT crawl_video (..., download_status='uploading')` → video_id を 202 で返す
-  3. 裏スレッドが paprika MinIO へ put → `UPDATE download_status='pending'`
-     (失敗なら 'failed')。 'uploading' は後段の誰も拾わない値なので 2〜3 の間は不可視。
+  3. 裏スレッドが .48 (RAM) へ put → `UPDATE download_status='pending'` → .8 (HDD) へ
+     バックアップ put。 .48 が満杯 / 不調なら .8 へ直接 put → 'pending'。 どちらも
+     失敗なら 'failed'。 'uploading' は後段の誰も拾わない値なので 2〜3 の間は不可視。
 
 ## 一意制約 (実 DDL から確認済)
 
@@ -82,6 +83,15 @@ SPOOL_MIN_FREE_BYTES = int(os.environ.get("PIPELINE_CREATE_SPOOL_MIN_FREE_BYTES"
 _SPOOL_CHUNK = 8 * 1024 * 1024
 # 孤児 spool (行を作る前に落ちた等) を掃除する経過時間。
 _SPOOL_ORPHAN_AGE_S = 24 * 3600
+# 動画の一次置き場は .48 (RAM ディスク)、 .8 (HDD) はバックアップ。 .48 に置けば put は
+# 数秒で終わり、 vfe も .48 を先に読むので処理開始までが短い。
+# ここはその .48 に置いてよい上限: put 後の使用率 (= 今の使用量 + この動画) が超えるなら
+# .48 を諦めて .8 に置く。 flow の赤ボックス (warn 80 / crit 90) と揃える。 tmpfs が
+# 満杯になると CT の cgroup 上限に当たって OOM ループから戻れないので、 ENOSPC を
+# 待たずに手前で避ける。 Paprika が .48 で消すのは `jobs/<id>/` 配下だけなので
+# `create/` はここで置いた後、 vfe が処理して消すまで残る (2026-09-24 に Paprika の
+# objstore / video-gc を確認済)。
+VIDEO_RAM_MAX_PCT = float(os.environ.get("PIPELINE_CREATE_VIDEO_RAM_MAX_PCT", "80"))
 
 # 裏 put 中の crawl_video.download_status。 video-dispatcher / vfe は 'pending' / 'queued'
 # しか拾わず、 video-asset-gc / video-health もこの値には触らないので、 put が終わるまで
@@ -153,6 +163,30 @@ def site_for(user_slug: str) -> str:
     return f"create-{safe}"[:64]
 
 
+def _minio_capacity(endpoint: str, timeout: float = 4.0) -> tuple[float, float]:
+    """MinIO の (usable total, usable free) バイト。 `total - free` が df 相当。
+
+    `minio_cluster_usage_total_bytes` は定期集計で数分〜数十分遅れるので使わない
+    (pipeline.api.flow の RAM ディスク赤ボックスと同じ理由)。
+    """
+    import urllib.request
+
+    url = f"http://{endpoint}/minio/v2/metrics/cluster"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", "replace")
+    vals: dict[str, float] = {}
+    for ln in raw.splitlines():
+        for name in ("minio_cluster_capacity_usable_total_bytes",
+                     "minio_cluster_capacity_usable_free_bytes"):
+            if ln.startswith(name):
+                vals[name] = float(ln.rsplit(" ", 1)[1])
+    total = vals.get("minio_cluster_capacity_usable_total_bytes", 0.0)
+    free = vals.get("minio_cluster_capacity_usable_free_bytes")
+    if total <= 0 or free is None:
+        raise RuntimeError(f"capacity metrics を読めない ({url})")
+    return total, free
+
+
 class CreateBackend:
     """MariaDB (.20) + raw MinIO (.17) + paprika MinIO への薄いアダプタ。
 
@@ -172,10 +206,17 @@ class CreateBackend:
     def __init__(self, *, db: Any, raw: Any, paprika: Any = None,
                  dir_base: int = DIR_BASE, spool_dir: str | Path = SPOOL_DIR,
                  upload_workers: int = UPLOAD_WORKERS,
-                 spool_min_free_bytes: int = SPOOL_MIN_FREE_BYTES) -> None:
+                 spool_min_free_bytes: int = SPOOL_MIN_FREE_BYTES,
+                 paprika_video: Any = None,
+                 video_ram_max_pct: float | None = None,
+                 backup_settle_s: float = 30.0) -> None:
         self.db = db
         self.raw = raw
-        self.paprika = paprika
+        self.paprika = paprika                # .8 (HDD): バックアップ / .48 に置けない時の置き場
+        self.paprika_video = paprika_video    # .48 (RAM): 一次置き場。 None なら .8 のみ
+        self.video_ram_max_pct = (VIDEO_RAM_MAX_PCT if video_ram_max_pct is None
+                                  else video_ram_max_pct)
+        self.backup_settle_s = backup_settle_s
         self.dir_base = dir_base
         self._lock = threading.Lock()
         self.spool_dir = Path(spool_dir)
@@ -196,7 +237,13 @@ class CreateBackend:
         except RuntimeError:
             paprika = None      # PAPRIKA_MINIO_* 未設定 = 動画投入だけ無効
             log.warning("create: paprika MinIO 未設定 — 動画投入は 503 になります")
-        return cls(db=reg.db(), raw=reg.minio("raw"), paprika=paprika)
+        try:
+            paprika_video = reg.minio("paprika_video")
+        except RuntimeError:
+            paprika_video = None    # .48 未設定 = 従来どおり .8 のみ
+            log.warning("create: PAPRIKA_MINIO_VIDEO_ENDPOINT 未設定 — 動画は .8 に直接置きます")
+        return cls(db=reg.db(), raw=reg.minio("raw"), paprika=paprika,
+                   paprika_video=paprika_video)
 
     # ---------------- DB 小道具 (全て _db() 区間の中で呼ぶ) ----------------
 
@@ -595,27 +642,106 @@ class CreateBackend:
                 self._uploads.task_done()
 
     def _upload_one(self, video_id: int, key: str, path: Path, content_type: str) -> None:
+        """1 本分の裏 put。 .48 (RAM) が一次、 .8 (HDD) がバックアップ。
+
+          1. .48 に空きがあれば .48 へ put → 'pending' (vfe は .48 を先に読むので即処理可)
+             → .8 へバックアップ put (.48 が CT 再起動で飛んでも .8 から読める)
+          2. .48 が無い / 満杯 / put 失敗 → .8 へ put → 'pending' (従来の経路)
+          3. どちらも失敗 → 'failed'
+        """
         t0 = time.monotonic()
         try:
-            try:
-                self.paprika.put_file(key, str(path), content_type)
-            except Exception as e:  # noqa: BLE001
-                log.warning("create: 裏 put 失敗 video_id=%s key=%s: %s", video_id, key, e)
-                with contextlib.suppress(Exception):
-                    self.paprika.remove(key)       # 途中まで書かれた実体があれば回収
-                self._set_video_status(
-                    video_id, "failed", f"create: paprika MinIO put 失敗: {e}"[:1000])
-                path.unlink(missing_ok=True)
-                return
+            primary = None
+            size = path.stat().st_size
+            if self.paprika_video is not None and self._video_ram_has_room(size):
+                try:
+                    self.paprika_video.put_file(key, str(path), content_type)
+                    primary = ".48"
+                except Exception as e:  # noqa: BLE001
+                    log.warning("create: .48 put 失敗 → .8 に置く video_id=%s: %s", video_id, e)
+                    with contextlib.suppress(Exception):
+                        self.paprika_video.remove(key)
+            if primary is None:
+                try:
+                    self.paprika.put_file(key, str(path), content_type)
+                    primary = ".8"
+                except Exception as e:  # noqa: BLE001
+                    log.warning("create: 裏 put 失敗 video_id=%s key=%s: %s", video_id, key, e)
+                    with contextlib.suppress(Exception):
+                        self.paprika.remove(key)   # 途中まで書かれた実体があれば回収
+                    self._set_video_status(
+                        video_id, "failed", f"create: paprika MinIO put 失敗: {e}"[:1000])
+                    path.unlink(missing_ok=True)
+                    return
             # 'pending' へ倒せなかった (DB 断など) ときは spool を残す: 行は 'uploading'
             # のままなので、 次回起動の recover_uploads が実体の存在を見て pending にする。
-            if self._set_video_status(video_id, "pending", None):
-                path.unlink(missing_ok=True)
-            log.info("create: 裏 put 完了 video_id=%s key=%s %.0fs",
-                     video_id, key, time.monotonic() - t0)
+            if not self._set_video_status(video_id, "pending", None):
+                return
+            log.info("create: 裏 put 完了 video_id=%s key=%s on %s %.0fs",
+                     video_id, key, primary, time.monotonic() - t0)
+            if primary == ".48":
+                self._backup_to_hdd(video_id, key, path, content_type)
+            path.unlink(missing_ok=True)
         finally:
             with self._lock:
                 self._inflight.pop(video_id, None)
+
+    def _backup_to_hdd(self, video_id: int, key: str, path: Path, content_type: str) -> None:
+        """.48 に置いた動画のバックアップを .8 に取る ('pending' にした後で行う)。
+
+        vfe は処理後に .48 と .8 の両方から実体を消す。 バックアップの put が vfe の
+        処理より後に終わると、 .8 に**誰も消さない実体**が残る (video-asset-gc は
+        completed 行の実体を回収しない)。 そこで put 後に .48 の実体を確かめ、 消えて
+        いたら少し待って行を読み、 vfe が処理済みなら .8 のバックアップも消す。
+        .48 が消えていても行が未処理のままなら、 それは .48 側の事故 (CT 再起動等) で、
+        まさにバックアップが要る場面なので残す。
+        """
+        t0 = time.monotonic()
+        try:
+            self.paprika.put_file(key, str(path), content_type)
+        except Exception as e:  # noqa: BLE001 (一次は .48 にあるので致命ではない)
+            log.warning("create: .8 バックアップ失敗 video_id=%s: %s", video_id, e)
+            with contextlib.suppress(Exception):
+                self.paprika.remove(key)
+            return
+        try:
+            on_ram = self.paprika_video.exists(key)
+        except Exception:  # noqa: BLE001 (判定不能 → 残す。 実体が残るだけで壊れはしない)
+            return
+        if on_ram:
+            log.info("create: .8 バックアップ完了 video_id=%s %.0fs", video_id,
+                     time.monotonic() - t0)
+            return
+        # vfe の _delete_minio_source と status 更新の間には僅かな隙間がある。
+        time.sleep(self.backup_settle_s)
+        status = self._video_download_status(video_id)
+        if status is None or status in ("completed", "failed", "skipped_small"):
+            with contextlib.suppress(Exception):
+                self.paprika.remove(key)
+            log.info("create: .8 バックアップは処理済みのため回収 video_id=%s (%s)",
+                     video_id, status)
+        else:
+            log.warning("create: .48 の実体が未処理のまま消えた video_id=%s status=%s "
+                        "— .8 のバックアップを残す", video_id, status)
+
+    def _video_download_status(self, video_id: int) -> str | None:
+        with self._db():
+            rows = self._q("SELECT download_status FROM crawl_video WHERE id=%s", (video_id,))
+        return str(rows[0][0]) if rows else None
+
+    def _video_ram_has_room(self, size: int) -> bool:
+        """.48 の tmpfs に size を足しても上限 % を超えないか。 読めなければ置かない。"""
+        try:
+            total, free = _minio_capacity(self.paprika_video.endpoint)
+        except Exception as e:  # noqa: BLE001
+            log.warning("create: .48 の容量を読めない → .8 に置く: %s", e)
+            return False
+        pct = ((total - free) + size) / total * 100.0
+        if pct > self.video_ram_max_pct:
+            log.warning("create: .48 に置くと %.1f%% > %.0f%% → .8 に置く",
+                        pct, self.video_ram_max_pct)
+            return False
+        return True
 
     def _set_video_status(self, video_id: int, status: str, error: str | None,
                           *, attempts: int = 3) -> bool:
@@ -660,7 +786,8 @@ class CreateBackend:
                 out["resumed"] += 1
                 continue
             try:
-                present = bool(key) and self.paprika.exists(key)
+                present = bool(key) and any(
+                    st.exists(key) for st in (self.paprika_video, self.paprika) if st is not None)
             except Exception as e:  # noqa: BLE001 (判定不能 → 触らない。 次回起動で再判定)
                 log.warning("create: recover 判定不能 video_id=%s: %s", vid, e)
                 present = None

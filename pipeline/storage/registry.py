@@ -8,6 +8,7 @@ lazy 生成・cache する。プラグインは **名前で参照するだけ**�
   minio:raw   → MINIO_RAW_ENDPOINT / MINIO_RAW_BUCKET(既定 raw) / MINIO_ACCESS_KEY / MINIO_SECRET_KEY   (.17 PANTRY)
   minio:crawl → MINIO_ENDPOINT / MINIO_BUCKET(既定 crawl) / MINIO_ACCESS_KEY / MINIO_SECRET_KEY / MINIO_VERIFY_TLS  (.16 ATTIC)
   minio:paprika → PAPRIKA_MINIO_ENDPOINT / PAPRIKA_MINIO_BUCKET(既定 paprika) / PAPRIKA_MINIO_ACCESS_KEY / PAPRIKA_MINIO_SECRET_KEY
+  minio:paprika_video → PAPRIKA_MINIO_VIDEO_ENDPOINT (.48 RAM)。 資格情報・バケットは paprika と共通
   db:main     → DB_HOST / DB_PORT(既定 3306) / DB_USER / DB_PASS / DB_NAME
 """
 
@@ -73,8 +74,21 @@ class StorageRegistry:
                 bucket=self._e("PAPRIKA_MINIO_BUCKET", default="paprika"),
                 secure=False,
             )
+        elif name == "paprika_video":
+            # .48 video-ram (RAM ディスク)。 paprika と同じ資格情報・同じバケット。
+            # 動画の一次置き場で、 paprika (.8, HDD) はバックアップ扱い。 vfe は
+            # こちらを先に読み、 無ければ .8 を読む。
+            store = MinioStore(
+                "minio:paprika_video",
+                endpoint=self._e("PAPRIKA_MINIO_VIDEO_ENDPOINT"),
+                access_key=self._e("PAPRIKA_MINIO_ACCESS_KEY"),
+                secret_key=self._e("PAPRIKA_MINIO_SECRET_KEY"),
+                bucket=self._e("PAPRIKA_MINIO_BUCKET", default="paprika"),
+                secure=False,
+            )
         else:
-            raise KeyError(f"unknown minio connection: {name!r} (known: raw, crawl, paprika)")
+            raise KeyError(f"unknown minio connection: {name!r} "
+                           "(known: raw, crawl, paprika, paprika_video)")
         if not store.endpoint:
             raise RuntimeError(f"storage: minio:{name} endpoint 未設定 (env 不足)")
         self._cache[("minio", name)] = store

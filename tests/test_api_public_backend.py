@@ -77,6 +77,7 @@ class FakeDb:
         self.uploading_rows: list = []          # recover_uploads が見る 'uploading' 行
         self.video_status_updates: list[tuple] = []   # (id, status, error)
         self.update_video_errors = 0            # 先頭 N 回の UPDATE crawl_video を失敗させる
+        self.video_download_status: str | None = "pending"   # バックアップ後の再確認で読む値
 
     def ping(self) -> None:
         self.pinged += 1
@@ -110,6 +111,9 @@ class FakeDb:
         if sql.startswith("DELETE FROM crawl_image"):
             self.deleted_images += 1
             return FakeCursor([], 1, 0)
+        if "SELECT download_status FROM crawl_video" in sql:
+            st = self.video_download_status
+            return FakeCursor([(st,)] if st is not None else [], 1, 0)
         if "SELECT id, storage_url, mime FROM crawl_video" in sql:
             return FakeCursor(list(self.uploading_rows), 1, 0)
         if sql.startswith("UPDATE crawl_video"):
@@ -156,6 +160,7 @@ class FakeStore:
         self.calls: list[str] = []
         self.observe = observe      # put の最中の状態を覗くフック (接続保持の検査用)
         self.present: set[str] = set()   # exists() が True を返すキー
+        self.endpoint = "fake:9000"
 
     def put_bytes(self, key: str, data: bytes, content_type: str = "") -> None:
         self.calls.append(f"put:{key}")
@@ -173,12 +178,14 @@ class FakeStore:
             raise RuntimeError("MinIO down")
         with open(path, "rb") as f:
             self.puts.append((key, len(f.read()), content_type))
+        self.present.add(key)
 
     def exists(self, key: str) -> bool:
         return key in self.present
 
     def remove(self, key: str) -> None:
         self.removed.append(key)
+        self.present.discard(key)
 
 
 @pytest.fixture
@@ -649,3 +656,129 @@ def test_recover_uploads_skips_rows_this_process_is_uploading(tmp_path) -> None:
     assert out["resumed"] == 0 and out["orphan_spool"] == 0
     assert live.exists()
     assert b.paprika.puts == []
+
+
+# ---------------- 動画の置き場: .48 (RAM) が一次、 .8 (HDD) がバックアップ ----------------
+
+
+G = 1024 ** 3
+
+
+@pytest.fixture
+def ram(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """.48 の容量 (total, free) を差し替える。 None にすると metrics 読み失敗。"""
+    cap: dict = {"v": (100 * G, 90 * G)}
+
+    def fake_capacity(endpoint: str, timeout: float = 4.0):
+        if cap["v"] is None:
+            raise RuntimeError("metrics down")
+        return cap["v"]
+
+    monkeypatch.setattr("pipeline.api_public.backend._minio_capacity", fake_capacity)
+    return cap
+
+
+def _be48(tmp_path, **kw) -> CreateBackend:
+    kw.setdefault("paprika_video", FakeStore())
+    return _abe(tmp_path, backup_settle_s=0, **kw)
+
+
+def _key(b: CreateBackend) -> str:
+    return b.db.find("INSERT INTO crawl_video")[1][2]
+
+
+def test_video_goes_to_ram_first_then_pending_then_hdd_backup(tmp_path, ram) -> None:
+    b = _be48(tmp_path)
+    order: list[str] = []
+    b.paprika_video.observe = lambda: order.append(".48 put")
+    b.paprika.observe = lambda: order.append(f".8 put (status={b.db.video_status_updates})")
+    sp = _spool(b)
+    b.create_video_spooled(sp, url=None, site="s", ext="mp4", mime="video/mp4")
+    _drain(b)
+
+    key = _key(b)
+    assert b.paprika_video.puts == [(key, len(MP4), "video/mp4")]
+    assert b.paprika.puts == [(key, len(MP4), "video/mp4")]
+    # .48 に置いた直後に pending (= vfe が拾える)。 .8 のバックアップはその後。
+    assert order == [".48 put", ".8 put (status=[(7001, 'pending', None)])"]
+    assert b.paprika.removed == []             # .48 に実体がある = 未処理 → バックアップは残す
+    assert not sp.path.exists()
+
+
+def test_ram_nearly_full_goes_straight_to_hdd(tmp_path, ram) -> None:
+    ram["v"] = (100 * G, 21 * G)               # 使用 79% + 動画 → 上限 79% を超える
+    b = _be48(tmp_path, video_ram_max_pct=79.0)
+    b.create_video_spooled(_spool(b), url=None, site="s", ext="mp4")
+    _drain(b)
+    assert b.paprika_video.puts == []
+    assert [k for k, *_ in b.paprika.puts] == [_key(b)]
+    assert b.db.video_status_updates == [(7001, "pending", None)]
+
+
+def test_ram_capacity_unreadable_goes_to_hdd(tmp_path, ram) -> None:
+    ram["v"] = None
+    b = _be48(tmp_path)
+    b.create_video_spooled(_spool(b), url=None, site="s", ext="mp4")
+    _drain(b)
+    assert b.paprika_video.puts == []
+    assert len(b.paprika.puts) == 1
+
+
+def test_ram_put_failure_falls_back_to_hdd(tmp_path, ram) -> None:
+    b = _be48(tmp_path, paprika_video=FakeStore(fail=True))
+    b.create_video_spooled(_spool(b), url=None, site="s", ext="mp4")
+    _drain(b)
+    assert b.paprika_video.removed == [_key(b)]    # 途中の残骸を回収
+    assert len(b.paprika.puts) == 1
+    assert b.db.video_status_updates == [(7001, "pending", None)]
+
+
+def test_both_stores_failing_marks_failed(tmp_path, ram) -> None:
+    b = _be48(tmp_path, paprika=FakeStore(fail=True), paprika_video=FakeStore(fail=True))
+    b.create_video_spooled(_spool(b), url=None, site="s", ext="mp4")
+    _drain(b)
+    assert [(v, s) for v, s, _ in b.db.video_status_updates] == [(7001, "failed")]
+
+
+def test_hdd_backup_failure_is_not_fatal(tmp_path, ram) -> None:
+    b = _be48(tmp_path, paprika=FakeStore(fail=True))
+    sp = _spool(b)
+    b.create_video_spooled(sp, url=None, site="s", ext="mp4")
+    _drain(b)
+    assert b.db.video_status_updates == [(7001, "pending", None)]
+    assert not sp.path.exists()
+
+
+def test_backup_finished_after_vfe_processed_is_reclaimed(tmp_path, ram) -> None:
+    """vfe が先に処理して両方から消した後にバックアップが書かれた → 誰も消さないので自分で消す。"""
+    b = _be48(tmp_path)
+
+    def vfe_processes_during_backup() -> None:
+        b.paprika_video.present.clear()        # vfe の _delete_minio_source
+        b.db.video_download_status = "completed"
+
+    b.paprika.observe = vfe_processes_during_backup
+    b.create_video_spooled(_spool(b), url=None, site="s", ext="mp4")
+    _drain(b)
+    assert b.paprika.removed == [_key(b)]
+    assert b.paprika.present == set()
+
+
+def test_backup_is_kept_when_ram_copy_vanished_unprocessed(tmp_path, ram) -> None:
+    """.48 が CT 再起動等で飛んだ (行は未処理) → バックアップが要る場面なので残す。"""
+    b = _be48(tmp_path)
+    b.paprika.observe = lambda: b.paprika_video.present.clear()
+    b.db.video_download_status = "pending"
+    b.create_video_spooled(_spool(b), url=None, site="s", ext="mp4")
+    _drain(b)
+    assert b.paprika.removed == []
+    assert b.paprika.present == {_key(b)}
+
+
+def test_recover_promotes_rows_whose_object_is_only_on_ram(tmp_path, ram) -> None:
+    b = _be48(tmp_path)
+    b.paprika_video.present = {"create/ram.mp4"}
+    b.db.uploading_rows = [(4, "create/ram.mp4", None)]
+    out = b.recover_uploads()
+    assert out["pending"] == 1
+    assert b.db.video_status_updates == [(4, "pending", None)]
