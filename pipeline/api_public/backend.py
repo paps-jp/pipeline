@@ -85,8 +85,9 @@ BACKUP_WORKERS = int(os.environ.get("PIPELINE_CREATE_BACKUP_WORKERS", "2"))
 SPOOL_MIN_FREE_BYTES = int(os.environ.get("PIPELINE_CREATE_SPOOL_MIN_FREE_BYTES",
                                           str(20 * 1024 ** 3)))
 _SPOOL_CHUNK = 8 * 1024 * 1024
-# 孤児 spool (行を作る前に落ちた等) を掃除する経過時間。
-_SPOOL_ORPHAN_AGE_S = 24 * 3600
+# どの行にも結び付かない spool (行を作る前に落ちた等) を消すまでの経過時間。
+# 受信中 (spool 済・INSERT 前) のファイルを巻き込まない程度に空ける。
+_SPOOL_ORPHAN_AGE_S = 3600
 # 動画の一次置き場は .48 (RAM ディスク)、 .8 (HDD) はバックアップ。 .48 に置けば put は
 # 数秒で終わり、 vfe も .48 を先に読むので処理開始までが短い。
 # ここはその .48 に置いてよい上限: put 後の使用率 (= 今の使用量 + この動画) が超えるなら
@@ -747,22 +748,25 @@ class CreateBackend:
     def _processed_by_vfe(self, video_id: int, key: str) -> bool:
         """vfe が処理を終えた (= .48 から実体が消え、 行が終端状態) なら True。
 
-        .48 に実体があれば未処理。 消えていたら、 vfe の _delete_minio_source と
-        status 更新の間の僅かな隙間を待ってから行を読む。 消えているのに行が未処理なら
-        .48 側の事故 (CT 再起動等) = まさにバックアップが要る場面なので False。
+        .48 に実体があれば未処理。 消えていて行が終端なら処理済み。 消えているのに行が
+        未処理に見えるときだけ、 vfe の _delete_minio_source と status 更新の間の僅かな
+        隙間を待って読み直す (待つのをこの場合だけにするのは、 毎回待つと 2 本の
+        ワーカーが 1 分 4 件しか捌けず、 処理済みの spool が溜まるため)。 それでも
+        未処理なら .48 側の事故 (CT 再起動等) = まさにバックアップが要る場面なので False。
         判定できないときも False (実体が .8 に残るだけで壊れはしない側に倒す)。
         """
+        terminal = ("completed", "failed", "skipped_small")
         try:
             if self.paprika_video.exists(key):
                 return False
-        except Exception:  # noqa: BLE001
-            return False
-        time.sleep(self.backup_settle_s)
-        try:
+            status = self._video_download_status(video_id)
+            if status is None or status in terminal:
+                return True
+            time.sleep(self.backup_settle_s)
             status = self._video_download_status(video_id)
         except Exception:  # noqa: BLE001
             return False
-        if status is None or status in ("completed", "failed", "skipped_small"):
+        if status is None or status in terminal:
             return True
         log.warning("create: .48 の実体が未処理のまま消えた video_id=%s status=%s "
                     "— .8 にバックアップを置く", video_id, status)
@@ -810,9 +814,14 @@ class CreateBackend:
         - spool は無いが実体が MinIO にある → put は完了していた (S3 の put は完了時に
           初めて見える) → 'pending' へ
         - どちらも無い → 取り戻せない → 'failed'
-        あわせて、 どの行からも参照されない古い spool (行を作る前に落ちた等) を消す。
+        あわせて spool を片付ける:
+        - 行が 'uploading' より先へ進んでいる spool (= バックアップ待ちのまま再起動で
+          キューから落ちたもの) → バックアップのキューへ戻す。 vfe が処理済みなら
+          _backup_one が .8 に書かずに捨てる
+        - どの行にも結び付かない古い spool (行を作る前に落ちた等) → 消す
         """
-        out = {"resumed": 0, "pending": 0, "failed": 0, "orphan_spool": 0}
+        out = {"resumed": 0, "pending": 0, "failed": 0, "backup_resumed": 0,
+               "orphan_spool": 0}
         if self.paprika is None:
             return out
         with self._db():
@@ -845,6 +854,24 @@ class CreateBackend:
             with self._lock:
                 self._inflight.pop(vid, None)
         if self.spool_dir.is_dir():
+            with self._lock:
+                referenced |= set(self._inflight.values()) | self._backup_spools
+            loose = {p.name for p in self.spool_dir.glob("*.part")} - referenced
+            if loose and self.paprika_video is not None:
+                # storage_url に index は無いので、 site (ix_site_status) と期間で絞って
+                # Python 側で spool 名と突き合わせる。
+                with self._db():
+                    recent = self._q(
+                        "SELECT id, storage_url, mime, download_status FROM crawl_video "
+                        "WHERE site LIKE %s AND created_at > NOW() - INTERVAL 7 DAY",
+                        ("create-%",))
+                for vid, key, mime, status in recent:
+                    name = f"{Path(str(key or '')).stem}.part"
+                    if name in loose and status != VIDEO_UPLOADING:
+                        self._enqueue_backup(int(vid), key, self.spool_dir / name,
+                                             mime or "video/mp4")
+                        referenced.add(name)
+                        out["backup_resumed"] += 1
             now = time.time()
             for p in self.spool_dir.glob("*.part"):
                 if p.name in referenced:

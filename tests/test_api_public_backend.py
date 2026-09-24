@@ -75,6 +75,7 @@ class FakeDb:
         self.connected = False                  # 実 Db と同じ「触ると張る / close で捨てる」
         self.closes = 0
         self.uploading_rows: list = []          # recover_uploads が見る 'uploading' 行
+        self.recent_create_rows: list = []      # recover_uploads の spool 突合用 (id, key, mime, status)
         self.video_status_updates: list[tuple] = []   # (id, status, error)
         self.update_video_errors = 0            # 先頭 N 回の UPDATE crawl_video を失敗させる
         self.video_download_status: str | None = "pending"   # バックアップ後の再確認で読む値
@@ -114,6 +115,8 @@ class FakeDb:
         if "SELECT download_status FROM crawl_video" in sql:
             st = self.video_download_status
             return FakeCursor([(st,)] if st is not None else [], 1, 0)
+        if "SELECT id, storage_url, mime, download_status FROM crawl_video" in sql:
+            return FakeCursor(list(self.recent_create_rows), 1, 0)
         if "SELECT id, storage_url, mime FROM crawl_video" in sql:
             return FakeCursor(list(self.uploading_rows), 1, 0)
         if sql.startswith("UPDATE crawl_video"):
@@ -635,7 +638,8 @@ def test_recover_uploads_resumes_promotes_or_fails(tmp_path) -> None:
     out = b.recover_uploads()
     _drain(b)
 
-    assert out == {"resumed": 1, "pending": 1, "failed": 1, "orphan_spool": 1}
+    assert out == {"resumed": 1, "pending": 1, "failed": 1, "backup_resumed": 0,
+                   "orphan_spool": 1}
     assert b.paprika.puts == [("create/aaa.mp4", len(MP4), "video/mp4")]
     assert sorted((v, s) for v, s, _ in b.db.video_status_updates) == [
         (1, "pending"), (2, "pending"), (3, "failed")]
@@ -809,3 +813,24 @@ def test_ram_put_does_not_wait_for_hdd_backup(tmp_path, ram) -> None:
     assert len(b.paprika_video.puts) == 2           # 2 本とも .48 に置けている
     release.set()
     _drain(b)
+
+
+def test_recover_requeues_spools_left_waiting_for_backup(tmp_path, ram) -> None:
+    """バックアップ待ちのまま再起動した spool はバックアップのキューへ戻す。"""
+    b = _be48(tmp_path)
+    b.spool_dir.mkdir(parents=True)
+    (b.spool_dir / "wait.part").write_bytes(MP4)        # 行は pending、 .48 に実体あり
+    (b.spool_dir / "done.part").write_bytes(MP4)        # 行は completed (vfe 処理済み)
+    b.paprika_video.present = {"create/wait.mp4"}
+    b.db.recent_create_rows = [
+        (11, "create/wait.mp4", "video/mp4", "pending"),
+        (12, "create/done.mp4", None, "completed"),
+    ]
+    b.db.video_download_status = "completed"            # done の再確認で読まれる値
+
+    out = b.recover_uploads()
+    _drain(b)
+
+    assert out["backup_resumed"] == 2
+    assert [k for k, *_ in b.paprika.puts] == ["create/wait.mp4"]   # done は .8 に書かない
+    assert list(b.spool_dir.iterdir()) == []
