@@ -484,6 +484,7 @@ def _spool(b: CreateBackend, data: bytes = MP4):
 
 def _drain(b: CreateBackend) -> None:
     b._uploads.join()
+    b._backups.join()
 
 
 def _age(path, seconds: float) -> None:
@@ -782,3 +783,29 @@ def test_recover_promotes_rows_whose_object_is_only_on_ram(tmp_path, ram) -> Non
     out = b.recover_uploads()
     assert out["pending"] == 1
     assert b.db.video_status_updates == [(4, "pending", None)]
+
+
+def test_backup_is_skipped_when_vfe_already_processed(tmp_path, ram) -> None:
+    """バックアップ待ちの間に vfe が処理を終えていたら .8 には書かない。"""
+    b = _be48(tmp_path)
+    sp = _spool(b)
+    b.db.video_download_status = "completed"       # .48 には実体が無い (vfe が消した)
+    b._backup_one(7001, "create/x.mp4", sp.path, "video/mp4")
+    assert b.paprika.puts == []
+    assert not sp.path.exists()
+
+
+def test_ram_put_does_not_wait_for_hdd_backup(tmp_path, ram) -> None:
+    """.48 に置けた次の動画は、 前の動画の .8 バックアップを待たずに put される。"""
+    import threading as _th
+
+    release = _th.Event()
+    b = _be48(tmp_path, upload_workers=1)
+    b.paprika.observe = lambda: release.wait(5)    # .8 バックアップを塞いでおく
+    b.create_video_spooled(_spool(b, MP4 + b"1"), url=None, site="s", ext="mp4")
+    b.db.existing_video = None
+    b.create_video_spooled(_spool(b, MP4 + b"2"), url=None, site="s", ext="mp4")
+    b._uploads.join()                              # 一次側だけ待つ
+    assert len(b.paprika_video.puts) == 2           # 2 本とも .48 に置けている
+    release.set()
+    _drain(b)

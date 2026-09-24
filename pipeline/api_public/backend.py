@@ -77,6 +77,10 @@ log = logging.getLogger("pipeline.api_public.backend")
 # /tmp に置くと再起動で消え、 その行は failed に落ちる。
 SPOOL_DIR = os.environ.get("PIPELINE_CREATE_SPOOL_DIR", "/var/tmp/pipeline-create-spool")
 UPLOAD_WORKERS = int(os.environ.get("PIPELINE_CREATE_UPLOAD_WORKERS", "2"))
+# .8 へのバックアップ put 用。 一次 (.48) の put とはキューを分ける: 同じワーカーで
+# 続けて回すと、 .48 の put は 0 秒なのに次の動画が .8 (1〜2MB/s) の 20 秒を待たされ、
+# 滞留の解消が結局 HDD 律速になる (2026-09-24 のデプロイ直後に実測)。
+BACKUP_WORKERS = int(os.environ.get("PIPELINE_CREATE_BACKUP_WORKERS", "2"))
 # spool 先の空きがこれを割ったら受け付けない (拡張の連投で nas の / を埋めないため)。
 SPOOL_MIN_FREE_BYTES = int(os.environ.get("PIPELINE_CREATE_SPOOL_MIN_FREE_BYTES",
                                           str(20 * 1024 ** 3)))
@@ -224,6 +228,12 @@ class CreateBackend:
         self._upload_workers = max(1, upload_workers)
         self._uploads: queue.Queue[tuple[int, str, Path, str]] = queue.Queue()
         self._upload_threads: list[threading.Thread] = []
+        self._backup_workers = max(1, BACKUP_WORKERS)
+        self._backups: queue.Queue[tuple[int, str, Path, str]] = queue.Queue()
+        self._backup_threads: list[threading.Thread] = []
+        # バックアップ待ちの spool ファイル名 (行は既に 'pending' なので _inflight には無い)。
+        # recover_uploads の孤児掃除から守るため。
+        self._backup_spools: set[str] = set()
         # 裏 put を持っている video_id → spool ファイル名。 recover_uploads が同じ行を
         # 二重に拾わない / 処理待ちの spool を孤児と誤認して消さないため。
         # 追加は INSERT と同じ _db() 区間 (= 同じ lock) で行う。
@@ -616,36 +626,46 @@ class CreateBackend:
                 sp.discard()
 
     def _enqueue_upload(self, video_id: int, key: str, path: Path, content_type: str) -> None:
-        self._ensure_upload_workers()
+        self._ensure_workers("_upload_threads", self._upload_workers, self._uploads,
+                             self._upload_one, "create-upload")
         self._uploads.put((video_id, key, path, content_type))
 
-    def _ensure_upload_workers(self) -> None:
+    def _enqueue_backup(self, video_id: int, key: str, path: Path, content_type: str) -> None:
+        with self._lock:
+            self._backup_spools.add(path.name)
+        self._ensure_workers("_backup_threads", self._backup_workers, self._backups,
+                             self._backup_one, "create-backup")
+        self._backups.put((video_id, key, path, content_type))
+
+    def _ensure_workers(self, attr: str, n: int, q: queue.Queue, fn: Any, name: str) -> None:
         # daemon にするのは、 ThreadPoolExecutor だと終了時に put の完了 (数十分) を
         # 待って systemd の stop timeout で SIGKILL されるため。 途中で死んだ put は
         # 次回起動の recover_uploads が spool から拾い直す。
         with self._lock:
-            self._upload_threads = [t for t in self._upload_threads if t.is_alive()]
-            while len(self._upload_threads) < self._upload_workers:
-                t = threading.Thread(target=self._upload_loop, daemon=True,
-                                     name=f"create-upload-{len(self._upload_threads)}")
+            threads = [t for t in getattr(self, attr) if t.is_alive()]
+            while len(threads) < n:
+                t = threading.Thread(target=self._worker_loop, args=(q, fn), daemon=True,
+                                     name=f"{name}-{len(threads)}")
                 t.start()
-                self._upload_threads.append(t)
+                threads.append(t)
+            setattr(self, attr, threads)
 
-    def _upload_loop(self) -> None:
+    @staticmethod
+    def _worker_loop(q: queue.Queue, fn: Any) -> None:
         while True:
-            job = self._uploads.get()
+            job = q.get()
             try:
-                self._upload_one(*job)
+                fn(*job)
             except Exception:  # noqa: BLE001 (ワーカーを殺さない)
-                log.exception("create: 裏 put の後処理で例外 video_id=%s", job[0])
+                log.exception("create: 裏処理で例外 video_id=%s", job[0])
             finally:
-                self._uploads.task_done()
+                q.task_done()
 
     def _upload_one(self, video_id: int, key: str, path: Path, content_type: str) -> None:
         """1 本分の裏 put。 .48 (RAM) が一次、 .8 (HDD) がバックアップ。
 
           1. .48 に空きがあれば .48 へ put → 'pending' (vfe は .48 を先に読むので即処理可)
-             → .8 へバックアップ put (.48 が CT 再起動で飛んでも .8 から読める)
+             → .8 へのバックアップは別キューへ (.48 が CT 再起動で飛んでも .8 から読める)
           2. .48 が無い / 満杯 / put 失敗 → .8 へ put → 'pending' (従来の経路)
           3. どちらも失敗 → 'failed'
         """
@@ -680,22 +700,34 @@ class CreateBackend:
             log.info("create: 裏 put 完了 video_id=%s key=%s on %s %.0fs",
                      video_id, key, primary, time.monotonic() - t0)
             if primary == ".48":
-                self._backup_to_hdd(video_id, key, path, content_type)
-            path.unlink(missing_ok=True)
+                self._enqueue_backup(video_id, key, path, content_type)  # spool はあちらで消す
+            else:
+                path.unlink(missing_ok=True)
         finally:
             with self._lock:
                 self._inflight.pop(video_id, None)
 
+    def _backup_one(self, video_id: int, key: str, path: Path, content_type: str) -> None:
+        try:
+            self._backup_to_hdd(video_id, key, path, content_type)
+        finally:
+            path.unlink(missing_ok=True)
+            with self._lock:
+                self._backup_spools.discard(path.name)
+
     def _backup_to_hdd(self, video_id: int, key: str, path: Path, content_type: str) -> None:
         """.48 に置いた動画のバックアップを .8 に取る ('pending' にした後で行う)。
 
-        vfe は処理後に .48 と .8 の両方から実体を消す。 バックアップの put が vfe の
-        処理より後に終わると、 .8 に**誰も消さない実体**が残る (video-asset-gc は
-        completed 行の実体を回収しない)。 そこで put 後に .48 の実体を確かめ、 消えて
-        いたら少し待って行を読み、 vfe が処理済みなら .8 のバックアップも消す。
-        .48 が消えていても行が未処理のままなら、 それは .48 側の事故 (CT 再起動等) で、
-        まさにバックアップが要る場面なので残す。
+        vfe は .48 を先に読んで大抵すぐ処理するので、 **始める前に**処理済みかを見て、
+        済んでいれば HDD に書かない (バックアップが要るのは処理前に .48 が飛んだ時だけ)。
+
+        書いた後にも同じ確認をする。 vfe は処理後に .48 と .8 の両方から実体を消すが、
+        バックアップの put がそれより後に終わると .8 に**誰も消さない実体**が残る
+        (video-asset-gc は completed 行の実体を回収しない) ため。
         """
+        if self._processed_by_vfe(video_id, key):
+            log.info("create: .8 バックアップ不要 (処理済み) video_id=%s", video_id)
+            return
         t0 = time.monotonic()
         try:
             self.paprika.put_file(key, str(path), content_type)
@@ -704,25 +736,37 @@ class CreateBackend:
             with contextlib.suppress(Exception):
                 self.paprika.remove(key)
             return
-        try:
-            on_ram = self.paprika_video.exists(key)
-        except Exception:  # noqa: BLE001 (判定不能 → 残す。 実体が残るだけで壊れはしない)
-            return
-        if on_ram:
-            log.info("create: .8 バックアップ完了 video_id=%s %.0fs", video_id,
-                     time.monotonic() - t0)
-            return
-        # vfe の _delete_minio_source と status 更新の間には僅かな隙間がある。
-        time.sleep(self.backup_settle_s)
-        status = self._video_download_status(video_id)
-        if status is None or status in ("completed", "failed", "skipped_small"):
+        if self._processed_by_vfe(video_id, key):
             with contextlib.suppress(Exception):
                 self.paprika.remove(key)
-            log.info("create: .8 バックアップは処理済みのため回収 video_id=%s (%s)",
-                     video_id, status)
+            log.info("create: .8 バックアップは処理済みのため回収 video_id=%s", video_id)
         else:
-            log.warning("create: .48 の実体が未処理のまま消えた video_id=%s status=%s "
-                        "— .8 のバックアップを残す", video_id, status)
+            log.info("create: .8 バックアップ完了 video_id=%s %.0fs", video_id,
+                     time.monotonic() - t0)
+
+    def _processed_by_vfe(self, video_id: int, key: str) -> bool:
+        """vfe が処理を終えた (= .48 から実体が消え、 行が終端状態) なら True。
+
+        .48 に実体があれば未処理。 消えていたら、 vfe の _delete_minio_source と
+        status 更新の間の僅かな隙間を待ってから行を読む。 消えているのに行が未処理なら
+        .48 側の事故 (CT 再起動等) = まさにバックアップが要る場面なので False。
+        判定できないときも False (実体が .8 に残るだけで壊れはしない側に倒す)。
+        """
+        try:
+            if self.paprika_video.exists(key):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        time.sleep(self.backup_settle_s)
+        try:
+            status = self._video_download_status(video_id)
+        except Exception:  # noqa: BLE001
+            return False
+        if status is None or status in ("completed", "failed", "skipped_small"):
+            return True
+        log.warning("create: .48 の実体が未処理のまま消えた video_id=%s status=%s "
+                    "— .8 にバックアップを置く", video_id, status)
+        return False
 
     def _video_download_status(self, video_id: int) -> str | None:
         with self._db():
@@ -777,7 +821,7 @@ class CreateBackend:
             rows = [r for r in rows if int(r[0]) not in self._inflight]
             for vid, key, _ in rows:
                 self._inflight[int(vid)] = f"{Path(str(key or '')).stem}.part"
-            referenced = set(self._inflight.values())
+            referenced = set(self._inflight.values()) | self._backup_spools
         for vid, key, mime in rows:
             vid = int(vid)
             path = self.spool_dir / f"{Path(str(key or '')).stem}.part"
