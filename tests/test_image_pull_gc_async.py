@@ -227,3 +227,41 @@ def test_worker_survives_a_failing_batch(im, monkeypatch):
     _drain(im, st)
     assert st["gc_thread"].is_alive()
     assert boom["n"] == 2, "2 回目が実行されていない = スレッドが死んだ"
+
+
+# ------------------------------------------------ 動画 job は purge しない --
+# hub purge は動画 tier (.48) も消すので、 動画を持つ job は .47 の prefix 削除だけに
+# 回す (2026-10-13: purge 導入後、 動画処理が download failed 99.9% になっていた)。
+
+@pytest.mark.parametrize("gc_async", [False, True])
+def test_video_jobs_bypass_hub_purge(im, calls, gc_async):
+    st = _state(im, gc_async=gc_async)
+    im._gc_submit(st, {}, ["img", "vid"], [], ["vid"])
+    _drain(im, st)
+    assert calls["purge"] == [["img"]]
+    assert calls["prefix"] == [["vid"]]
+
+
+def test_only_video_jobs_makes_no_purge_request(im, calls):
+    st = _state(im)
+    im._gc_submit(st, {}, ["vid"], [], ["vid"])
+    assert calls["purge"] == []
+    assert calls["prefix"] == [["vid"]]
+
+
+def test_video_jobs_omitted_keeps_old_behaviour(im, calls):
+    st = _state(im)
+    im._gc_submit(st, {}, ["a", "b"], [])
+    assert calls["purge"] == [["a", "b"]]
+    assert calls["prefix"] == []
+
+
+@pytest.mark.parametrize("asset,expected", [
+    ({"mime": "video/mp4", "name": "x"}, True),
+    ({"mime": "", "name": "HLSPlaylist [HLSPlaylist].MP4"}, True),
+    ({"mime": "", "name": "clip.webm"}, True),
+    ({"mime": "image/jpeg", "name": "a.jpg"}, False),
+    ({"mime": None, "name": None}, False),
+])
+def test_is_video_asset(im, asset, expected):
+    assert im._is_video_asset(asset) is expected
