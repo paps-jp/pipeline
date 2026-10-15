@@ -71,7 +71,8 @@ def _hosts_in(metrics: dict) -> tuple[str, ...]:
 
 
 def _wire(sup, monkeypatch, metrics: dict, *, policies: dict[str, dict] | None = None,
-          gpu_hosts=None, agent_hosts=None, agent_age_s: float = 5.0):
+          gpu_hosts=None, agent_hosts=None, agent_age_s: float = 5.0,
+          vram_null_hosts=()):
     """_http_get_json を URL で振り分け、 requests.put を記録する。
 
     gpu_hosts / agent_hosts を省略すると metrics に居る host だけが母集合になる。
@@ -92,13 +93,15 @@ def _wire(sup, monkeypatch, metrics: dict, *, policies: dict[str, dict] | None =
             return metrics
         if "/api/v1/agents" in url:
             return {"agents": [{"host": h,
-                                "last_vram_total_mb": 16311 if h in gpu_hosts else 0,
+                                "last_vram_total_mb": (None if h in vram_null_hosts
+                                                       else 16311 if h in gpu_hosts else 0),
                                 "last_seen_at": agent_seen_at,
                                 "desired": {"workloads": dict(EFFECTIVE)}}
                                for h in agent_hosts]}
         if "/host-policy" in url:
             return {"hosts": [{"host": h,
-                               "vram_effective_mb": 16311 if h in gpu_hosts else None,
+                               "vram_effective_mb": (16311 if h in gpu_hosts
+                                                     and h not in vram_null_hosts else None),
                                **(policies.get(h) or {})}
                               for h in sorted(set(gpu_hosts) | set(policies))]}
         raise AssertionError(f"unexpected GET {url}")
@@ -257,8 +260,11 @@ def test_dry_mode_detects_but_never_writes(sup, monkeypatch):
 
 def test_gpu_host_with_no_metrics_at_all_is_drained(sup, monkeypatch):
     """nvidia-smi ごと落ちると _nvidia_smi_gpus() が [] を返して行が入らない。
-    temp_ok==0 の条件だけだと n==0 で素通りするので、 別枝で拾う。"""
-    puts = _wire(sup, monkeypatch, _metrics({"ai-gpu1": (60, True)}), gpu_hosts=GPU_HOSTS)
+    temp_ok==0 の条件だけだと n==0 で素通りするので、 別枝で拾う。
+    GPU worker は生きている (gpu_children_alive>0) のに行が来ない = Xid 154 型。"""
+    alive = {h: {"gpu_children_alive": 3} for h in GPU_HOSTS}
+    puts = _wire(sup, monkeypatch, _metrics({"ai-gpu1": (60, True)}),
+                 gpu_hosts=GPU_HOSTS, policies=alive)
     out = _run(sup, _state(), n=2)
 
     assert out["verdicts"]["ai-gpu8"]["state"] == "metrics_absent"
@@ -360,3 +366,36 @@ def test_disabled_by_config_is_a_noop(sup, monkeypatch):
 
     monkeypatch.setattr(sup, "_http_get_json", boom)
     assert sup._gpu_health_watchdog(_state(enabled=False))["skipped"]
+
+
+def test_idle_healthy_gpu_host_is_not_flagged(sup, monkeypatch):
+    """GPU worker が 0 台の健全な host もメトリクスは 0 件になる。 故障扱いすると
+    「遊休 → drain → 配分されない → 遊休」 の自己ロックになるので報告しない。"""
+    puts = _wire(sup, monkeypatch, _metrics({"ai-gpu1": (60, True)}),
+                 gpu_hosts=("ai-gpu1", "ai-gpu8"))
+    out = _run(sup, _state(), n=3)
+
+    assert out["verdicts"]["ai-gpu8"]["state"] == "unknown"
+    assert out["unhealthy"] == {}
+    assert puts == []
+
+
+def test_driver_mismatch_host_is_caught_via_expected_hosts(sup, monkeypatch):
+    """2026-10-10〜14 の実障害: driver/library 版ずれで agent の nvidia-smi が
+    exit 18 → vram=null。 vram 由来の母集合から外れて 4 日間無音だった。
+    expected_hosts で宣言しておけば、 vram=null 自体を故障の証拠として拾う。"""
+    _wire(sup, monkeypatch, _metrics({"ai-gpu1": (60, True)}),
+          gpu_hosts=("ai-gpu1", "ai-gpu8"), vram_null_hosts=("ai-gpu8",))
+    out = _run(sup, _state(expected_hosts=["ai-gpu1", "ai-gpu8"]), n=2)
+
+    assert out["verdicts"]["ai-gpu8"]["state"] == "metrics_absent"
+    assert "ai-gpu8" in out["unhealthy"]
+
+
+def test_driver_mismatch_host_is_invisible_without_expected_hosts(sup, monkeypatch):
+    """宣言が無ければ従来どおり母集合に入らない (= expected_hosts が要る理由)。"""
+    _wire(sup, monkeypatch, _metrics({"ai-gpu1": (60, True)}),
+          gpu_hosts=("ai-gpu1", "ai-gpu8"), vram_null_hosts=("ai-gpu8",))
+    out = _run(sup, _state(), n=2)
+
+    assert "ai-gpu8" not in out["verdicts"]

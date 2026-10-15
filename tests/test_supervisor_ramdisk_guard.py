@@ -185,6 +185,29 @@ def test_clamp_warn_freezes_growth_but_allows_shrink(sup, monkeypatch):
     assert plan["video-face-extract"] == 12          # 縮小は素通し
 
 
+def test_clamp_warn_does_not_ratchet_below_min_workers(sup, monkeypatch):
+    """warn の「増加凍結」が active に追従して min_workers 未満へ落ちてはいけない。
+
+    2026-10-14 実障害: .48 WARN 82.5% のまま active が 6→0 に減り、
+    min(before, active)=0 に固着。 vfe は .48 の消費者なので .48 は 11 時間
+    1MB も減らず、 submit-gate も解除されずに全停止した。
+    """
+    state = _state(sup, used=int(0.825 * _TOTAL), live=8 * _GB, monkeypatch=monkeypatch)
+    plan = {"video-face-extract": 16}
+    sup._ramdisk_clamp(state, plan, {"video-face-extract": 0},
+                       {"video-face-extract": _wl(min_workers=15)})
+    assert plan["video-face-extract"] == 15
+
+
+def test_clamp_budget_does_not_ratchet_below_min_workers(sup, monkeypatch):
+    """通常域でも headroom が 0 なら active + 0 になるが、 min_workers は割らない。"""
+    state = _state(sup, used=int(0.899 * _TOTAL), live=8 * _GB, monkeypatch=monkeypatch)
+    plan = {"video-face-extract": 16}
+    sup._ramdisk_clamp(state, plan, {"video-face-extract": 0},
+                       {"video-face-extract": _wl(min_workers=15)})
+    assert plan["video-face-extract"] == 15
+
+
 def test_clamp_crit_falls_back_to_min_workers_not_zero(sup, monkeypatch):
     """crit では min_workers まで。 0 にはしない (片道切符 / floor guard 衝突の回避)。"""
     state = _state(sup, used=int(0.92 * _TOTAL), live=20 * _GB, monkeypatch=monkeypatch)
@@ -251,7 +274,7 @@ def test_clamp_uses_declared_claim_mb_over_default(sup, monkeypatch):
     state = _state(sup, used=60 * _GB, live=8 * _GB, crit=85.0, monkeypatch=monkeypatch)
     plan = {"video-face-extract": 32}
     sup._ramdisk_clamp(state, plan, {"video-face-extract": 2},
-                       {"video-face-extract": _wl(claim_mb=4224)})
+                       {"video-face-extract": _wl(min_workers=0, claim_mb=4224)})
     assert plan["video-face-extract"] == 6           # active 2 + 4
 
 

@@ -110,6 +110,8 @@ def patches(sup, monkeypatch):
         return {"ok": True, "updates": updates}
 
     monkeypatch.setattr(sup, "_patch_init_kwargs", _fake)
+    # 初見 target の停止状態は workload の init_kwargs から拾う。 既定は「停止していない」。
+    monkeypatch.setattr(sup, "_slugs_submit_paused", lambda url, slugs: False)
     return calls
 
 
@@ -290,3 +292,48 @@ def test_targets_json_string_is_parsed(sup):
                                 '"slugs":["s"],"crit_pct":50,"resume_pct":10}]'})
     assert targets[0]["name"] == "x"
     assert targets[0]["slugs"] == ["s"]
+
+
+def test_restart_while_paused_still_resumes(sup, monkeypatch, patches):
+    """2026-10-14 実障害: 停止中に supervisor の setup() が再実行され (init_kwargs
+    の PUT でホットリロード)、 メモリ上の state が「停止していない」に戻った。
+    workload 側の submit_paused=1 は残ったので、 .48 が 2% まで下がっても
+    RESUMED 分岐に入らず投入停止のままだった。
+
+    初見の target は workload の実際の submit_paused から状態を拾うこと。
+    """
+    monkeypatch.setattr(sup, "_slugs_submit_paused", lambda url, slugs: True)
+    st = _state(sup)                     # submit_gate_state = {} = 再起動直後
+    _set_pct(sup, monkeypatch, 2.0)
+    out = sup._submit_gate_run(st)
+
+    assert patches == [("paprika-job-submit", {"submit_paused": 0})]
+    assert out["actions"][0]["to"] == "running"
+    assert st["submit_gate_state"]["image-ram-47"]["paused"] is False
+
+
+def test_restart_while_paused_above_resume_keeps_paused(sup, monkeypatch, patches):
+    """拾った停止状態でもヒステリシスは効く (resume 超なら停止維持、 書き込みなし)。"""
+    monkeypatch.setattr(sup, "_slugs_submit_paused", lambda url, slugs: True)
+    st = _state(sup)
+    _set_pct(sup, monkeypatch, 70.0)
+    out = sup._submit_gate_run(st)
+
+    assert patches == []
+    assert st["submit_gate_state"]["image-ram-47"]["paused"] is True
+    assert any(a["kind"] == "ramdisk_submit_paused" for a in out["alerts"])
+
+
+def test_seed_reads_init_kwargs_from_workload(sup, monkeypatch):
+    """_slugs_submit_paused は GET した workload の init_kwargs.submit_paused を見る。"""
+    resp = {"paprika-job-submit": {"executor_config": {"init_kwargs": {"submit_paused": 1}}},
+            "other": {"executor_config": {"init_kwargs": {}}}}
+    monkeypatch.setattr(sup, "_http_get_json",
+                        lambda url, timeout=5: resp[url.rsplit("/", 1)[-1]])
+    assert sup._slugs_submit_paused("http://c", ["other", "paprika-job-submit"]) is True
+    assert sup._slugs_submit_paused("http://c", ["other"]) is False
+
+    def _boom(url, timeout=5):
+        raise OSError("down")
+    monkeypatch.setattr(sup, "_http_get_json", _boom)
+    assert sup._slugs_submit_paused("http://c", ["paprika-job-submit"]) is False
