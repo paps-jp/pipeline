@@ -172,3 +172,26 @@ def test_enqueue_many_重複pkは黙って落として実挿入だけを数え�
 
     assert n == 2
     assert q.count_by_state(table).get("pending", 0) == 3
+
+
+class _StatementTimeout(Exception):
+    def __init__(self) -> None:
+        super().__init__(1969, "Query execution was interrupted (max_statement_time exceeded)")
+
+
+def test_claim_はstatement_timeoutを0件として返しretryしない(repo_and_table, monkeypatch):
+    """index 欠落で claim SELECT が数分かかると worker は timeout で諦め、 サーバ側だけ
+    完走して幽霊 claim が積もる (2026-10-23 face_person_link_queue)。 上限超過は即 0 件。"""
+    q, table = repo_and_table
+    q.enqueue(table, "pk1")
+    calls = {"n": 0}
+
+    def _slow(*a, **k):
+        calls["n"] += 1
+        raise _StatementTimeout()
+
+    monkeypatch.setattr(q, "_get_db", _slow)
+    assert q.claim(table, "w1", 1, lease_secs=60) == []
+    assert calls["n"] == 1, "statement timeout を retry している"
+    monkeypatch.undo()
+    assert q.count_by_state(table).get("pending", 0) == 1, "行が pending のまま残っていない"

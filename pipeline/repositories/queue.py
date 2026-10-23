@@ -45,6 +45,23 @@ def _is_deadlock(exc: BaseException) -> bool:
     return "deadlock" in msg or "try restarting transaction" in msg or "lock wait timeout" in msg
 
 
+# claim の SELECT ... FOR UPDATE SKIP LOCKED に掛ける実行時間上限 (秒)。
+# worker の HTTP timeout (30s) より十分短くする。 index が欠けた queue 表で filesort に
+# 落ちると 1 本数分かかり、 その間に worker は timeout で諦めるがサーバ側は完走して
+# 行を claimed にする (= 誰も受け取らない幽霊 claim)。 リース切れで再 claim → また幽霊、
+# の無限ループになり、 しかも全 AnyIO スレッドを占有して他 workload の claim/heartbeat
+# まで止める (2026-10-23 face_person_link_queue, 30万行全部 claimed で全段停止)。
+_CLAIM_SELECT_MAX_S = 5.0
+
+
+def _is_statement_timeout(exc: BaseException) -> bool:
+    """MariaDB の max_statement_time 超過 (ER_STATEMENT_TIMEOUT=1969) を判定。"""
+    args = getattr(exc, "args", None)
+    if args and args[0] == 1969:
+        return True
+    return "max_statement_time exceeded" in str(exc).lower()
+
+
 def _is_duplicate_key(exc: BaseException) -> bool:
     """PK/UNIQUE 制約違反 (MariaDB 1062 / SQLite UNIQUE constraint failed) を判定。
 
@@ -292,8 +309,10 @@ class QueueRepository:
                         # クリーンに拾い、足りないぶんだけ _idx_claim で
                         # 期限切れclaimed を拾う 2 段構えにする。
                         lim = int(limit)
+                        guard = f"SET STATEMENT max_statement_time={_CLAIM_SELECT_MAX_S} FOR"
                         sel = conn.execute(
                             f"""
+                            {guard}
                             SELECT pk FROM {queue_table}
                             WHERE state='pending'
                             ORDER BY enqueued_at, pk
@@ -307,6 +326,7 @@ class QueueRepository:
                             remaining = lim - len(pks)
                             sel2 = conn.execute(
                                 f"""
+                                {guard}
                                 SELECT pk FROM {queue_table}
                                 WHERE state='claimed' AND claimed_at < :cutoff
                                 ORDER BY claimed_at
@@ -378,6 +398,14 @@ class QueueRepository:
                     now_iso = _utcnow_iso()
                     log.debug("claim deadlock on %s (attempt %d) — retrying", queue_table, attempt + 1)
                     continue
+                if _is_statement_timeout(e):
+                    # 遅い claim は 0 件として返す。 retry はしない (同じ plan で同じだけ遅い)。
+                    # 典型は claim 用 index (_idx_claim / _idx_claim_order) の欠落。
+                    log.warning(
+                        "claim on %s exceeded %.0fs and was aborted — check claim indexes",
+                        queue_table, _CLAIM_SELECT_MAX_S,
+                    )
+                    return []
                 raise
 
         return [
