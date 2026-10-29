@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from pipeline import __version__
-from pipeline.api import admin_cmds, admin_deploy, agents as agents_api, dashboard, fleet, flow, host_policy as host_policy_api, mariadb_tables, plugin_runtime, plugins_local, service_logs, settings as settings_api, system, url_management, workers, workloads
+from pipeline.api import admin_cmds, admin_deploy, agents as agents_api, dashboard, fleet, flow, host_policy as host_policy_api, mariadb_tables, plugin_runtime, plugins_local, service_logs, settings as settings_api, site_yield, system, url_management, workers, workloads
 from pipeline.config import Settings
 from pipeline.db import get_db
 from pipeline.worker.drain import Worker
@@ -408,6 +408,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(host_policy_api.router)
     app.include_router(mariadb_tables.router)
     app.include_router(url_management.router)
+    app.include_router(site_yield.router)
     app.include_router(fleet.router)
     # MinIO プロキシ (= プラグイン UI が顔サムネ等を <img> で見るため)
     from pipeline.api import minio_proxy as _mp

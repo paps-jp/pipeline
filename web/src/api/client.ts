@@ -853,6 +853,126 @@ export const urlManagementApi = {
   },
 };
 
+// ============================================================
+// site-yield (サイト収率 = Thompson Sampling の事後分布と lane 別 harvest)
+// ============================================================
+
+export interface SiteYieldRow {
+  id: number;
+  site: string;
+  enabled: number;
+  memo: string | null;
+  /** 割引後の成功 / 失敗カウント */
+  s: number;
+  f: number;
+  s_raw: number;
+  f_raw: number;
+  /** s + f = 有効観測数 */
+  n: number;
+  /** 事後平均 (s+prior)/(s+f+2prior) */
+  mean: number;
+  /** 近似 80% 区間 */
+  lo: number;
+  hi: number;
+  jobs: number;
+  new_images: number;
+  age_s: number | null;
+  updated_at: string | null;
+  /** good / ok / poor / unknown (n<3 は unknown) */
+  grade: string;
+}
+
+export interface SiteYieldSummary {
+  total: number;
+  observed: number;
+  dead: number;
+  low: number;
+  unknown: number;
+  jobs: number;
+  new_images: number;
+  buckets: { lo: number; hi: number; count: number }[];
+  grades: Record<string, number>;
+}
+
+export interface SiteYieldSitesResponse {
+  available: boolean;
+  error: string | null;
+  sites: SiteYieldRow[];
+  total: number;
+  half_life_h: number;
+  prior: number;
+  summary: SiteYieldSummary;
+}
+
+export interface YieldStatRow {
+  ts: string;
+  lane: string;
+  jobs: number;
+  productive: number;
+  new_images: number;
+  dup_images: number;
+  no_image_jobs: number;
+}
+
+export interface YieldStatsResponse {
+  available: boolean;
+  error: string | null;
+  rows: YieldStatRow[];
+  hours: number;
+  bucket_min: number;
+  lanes: string[];
+  /** lane -> 最初に観測が入った分 (全期間、 DB ローカル時刻) */
+  first_seen: Record<string, string>;
+}
+
+/** paprika-job-submit が plugin state `yield_picks` に流す「直近の TS 選択」 */
+export interface YieldPick {
+  t: string;
+  site: string;
+  theta: number;
+  mean: number;
+  s: number;
+  f: number;
+  jobs: number;
+  new_images: number;
+  n_ts: number;
+  filled_ts: number;
+}
+
+export const siteYieldApi = {
+  sites: (params: {
+    half_life_h?: number;
+    prior?: number;
+    q?: string;
+    order?: string;
+    limit?: number;
+  } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.half_life_h) qs.set("half_life_h", String(params.half_life_h));
+    if (params.prior) qs.set("prior", String(params.prior));
+    if (params.q) qs.set("q", params.q);
+    if (params.order) qs.set("order", params.order);
+    if (params.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return request<SiteYieldSitesResponse>(`/api/v1/site-yield/sites${suffix}`);
+  },
+  stats: (params: { hours?: number; bucket_min?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.hours) qs.set("hours", String(params.hours));
+    if (params.bucket_min) qs.set("bucket_min", String(params.bucket_min));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return request<YieldStatsResponse>(`/api/v1/site-yield/stats${suffix}`);
+  },
+};
+
+/** plugin が PUT した任意 JSON state を読む (plugin_runtime の GET /state/{key}) */
+export const pluginStateApi = {
+  get: <T,>(slug: string, key: string) =>
+    request<{ value: T; updated_at: string }>(
+      `/api/v1/plugins/${encodeURIComponent(slug)}/state/${encodeURIComponent(key)}`,
+    ),
+};
+
 export interface DeployPath {
   id: number;
   label: string;

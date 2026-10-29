@@ -11,6 +11,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
+  IconChartBar,
   IconChartLine,
   IconBook2,
   IconDashboard,
@@ -46,6 +47,7 @@ import Throughput from "./pages/Throughput";
 import PluginPanel from "./pages/PluginPanel";
 import Settings from "./pages/Settings";
 import ServiceLog from "./pages/ServiceLog";
+import SiteYield from "./pages/SiteYield";
 import UrlManagement from "./pages/UrlManagement";
 import Workers from "./pages/Workers";
 import Workloads from "./pages/Workloads";
@@ -252,6 +254,12 @@ export default function App() {
           to="/url-management"
         />
         <NavLink
+          label={t("nav.siteYield", "サイト収率")}
+          leftSection={<IconChartBar size={18} />}
+          component={RouterNavLink}
+          to="/site-yield"
+        />
+        <NavLink
           label={t("nav.crawlTables", "クロール設定")}
           leftSection={<IconDatabase size={18} />}
           component={RouterNavLink}
@@ -309,6 +317,7 @@ export default function App() {
             <Route path="/workers" element={<Workers />} />
             <Route path="/hosts" element={<Hosts />} />
             <Route path="/url-management" element={<UrlManagement />} />
+            <Route path="/site-yield" element={<SiteYield />} />
             <Route path="/crawl-tables" element={<MariadbTables />} />
             <Route path="/supervisor" element={<Supervisor />} />
             <Route path="/logs" element={<ServiceLog />} />
