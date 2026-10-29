@@ -99,7 +99,7 @@ export default function TaskEnqueueModal({ opened, onClose, workload }: Props) {
           <TextInput
             label={t("workloads.enqueue.pk")}
             description={t("workloads.enqueue.pk_help")}
-            placeholder="任意の文字列 (例: 1, abc, http://...)"
+            placeholder={t("workloads.enqueue.pk_placeholder", "任意の文字列 (例: 1, abc, http://...)")}
             required
             {...form.getInputProps("pk")}
           />

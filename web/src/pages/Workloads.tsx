@@ -15,7 +15,7 @@ import { notifications } from "@mantine/notifications";
 import { IconHistory, IconPencil, IconPlus, IconSend, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 
 import { api, Workload } from "@/api/client";
@@ -122,10 +122,15 @@ export default function Workloads() {
       title: t("workloads.delete_confirm_title", "ワークロードを削除"),
       children: (
         <Text size="sm">
-          <Code>{w.slug}</Code> を削除します。この操作は元に戻せません。
+          <Trans
+            i18nKey="workloads.delete_confirm_body"
+            defaults="<0>{{slug}}</0> を削除します。この操作は元に戻せません。"
+            values={{ slug: w.slug }}
+            components={[<Code key="0" />]}
+          />
         </Text>
       ),
-      labels: { confirm: "削除", cancel: "キャンセル" },
+      labels: { confirm: t("common.delete", "削除"), cancel: t("common.cancel", "キャンセル") },
       confirmProps: { color: "red" },
       onConfirm: () => deleteMut.mutate(w.slug),
     });
@@ -160,7 +165,7 @@ export default function Workloads() {
       {data && data.workloads.length === 0 && (
         <EmptyState
           title={t("workloads.empty")}
-          description="「新規作成」 ボタンから ワークロードを追加してください。"
+          description={t("workloads.empty_desc", "「新規作成」 ボタンから ワークロードを追加してください。")}
           action={{ label: t("workloads.new"), onClick: openCreate }}
         />
       )}
@@ -172,7 +177,7 @@ export default function Workloads() {
               <Table.Th>{t("workloads.slug")}</Table.Th>
               <Table.Th>{t("workloads.name")}</Table.Th>
               <Table.Th>{t("workloads.executor")}</Table.Th>
-              <Table.Th>直近 20</Table.Th>
+              <Table.Th>{t("workloads.last_20", "直近 20")}</Table.Th>
               <Table.Th>{t("workloads.enabled")}</Table.Th>
               <Table.Th>{t("workloads.priority")}</Table.Th>
               <Table.Th>{t("workloads.weight")}</Table.Th>

@@ -2,6 +2,7 @@ import { Button, Center, Stack, Text, Title } from "@mantine/core";
 import { Component, type ErrorInfo, type ReactNode } from "react";
 
 import { ErrorState } from "@/components/states";
+import i18n from "@/i18n";
 
 /**
  * トップレベルの安全網。 このバウンダリが無いと未捕捉例外で React ツリーが
@@ -29,13 +30,15 @@ export class ErrorBoundary extends Component<
       return (
         <Center mih="100vh" p="xl">
           <Stack gap="md" maw={640}>
-            <Title order={3}>画面の描画中にエラーが発生しました</Title>
+            <Title order={3}>{i18n.t("errors.boundary_title", "画面の描画中にエラーが発生しました")}</Title>
             <Text size="sm" c="dimmed">
-              直前の操作 (フォーム入力・貼り付け等) が原因の可能性があります。
-              下のエラー内容を控えたうえで再読み込みしてください。
+              {i18n.t(
+                "errors.boundary_desc",
+                "直前の操作 (フォーム入力・貼り付け等) が原因の可能性があります。 下のエラー内容を控えたうえで再読み込みしてください。",
+              )}
             </Text>
             <ErrorState error={this.state.error} />
-            <Button onClick={() => window.location.reload()}>再読み込み</Button>
+            <Button onClick={() => window.location.reload()}>{i18n.t("errors.reload", "再読み込み")}</Button>
           </Stack>
         </Center>
       );

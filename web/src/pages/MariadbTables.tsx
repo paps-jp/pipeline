@@ -21,7 +21,7 @@ import { notifications } from "@mantine/notifications";
 import { IconPlus, IconRefresh, IconSearch, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 
 import { MariadbTableMeta, mariadbTablesApi } from "@/api/client";
 import { PageHeader } from "@/components/PageHeader";
@@ -248,9 +248,12 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
       title: t("mariadbTables.reseed_title", "種URL を再投入しますか"),
       children: (
         <Text size="sm">
-          <Code>{identifier}</Code>{" "}
-          {t("mariadbTables.reseed_body",
-            "の種URL を「未投入」状態に戻します。数分以内に priority filler が拾い直して paprika に投入し、成功すれば links-pull が新規リンクを取り込みます。")}
+          <Trans
+            i18nKey="mariadbTables.reseed_body_full"
+            defaults="<0>{{id}}</0> の種URL を「未投入」状態に戻します。数分以内に priority filler が拾い直して paprika に投入し、成功すれば links-pull が新規リンクを取り込みます。"
+            values={{ id: identifier }}
+            components={[<Code key="0" />]}
+          />
           {url && (
             <>
               <br />
@@ -279,17 +282,23 @@ function TableView({ meta }: { meta: MariadbTableMeta }) {
       children: (
         <Text size="sm">
           {meta.deletable ? (
-            <>
-              <Code>{identifier}</Code>{" "}
-              {t("mariadbTables.delete_body", "を完全に削除します。この操作は元に戻せません。")}
-            </>
+            <Trans
+              i18nKey="mariadbTables.delete_body_full"
+              defaults="<0>{{id}}</0> を完全に削除します。この操作は元に戻せません。"
+              values={{ id: identifier }}
+              components={[<Code key="0" />]}
+            />
           ) : (
-            <>
-              <Code>{identifier}</Code> の <Code>{meta.soft_delete_column}</Code> を{" "}
-              <Code>{String(meta.soft_delete_value)}</Code>{" "}
-              {t("mariadbTables.disable_body",
-                "に変更します(行自体は残り、後から編集で元に戻せます)。")}
-            </>
+            <Trans
+              i18nKey="mariadbTables.disable_body_full"
+              defaults="<0>{{id}}</0> の <1>{{col}}</1> を <2>{{val}}</2> に変更します(行自体は残り、後から編集で元に戻せます)。"
+              values={{
+                id: identifier,
+                col: meta.soft_delete_column,
+                val: String(meta.soft_delete_value),
+              }}
+              components={[<Code key="0" />, <Code key="1" />, <Code key="2" />]}
+            />
           )}
         </Text>
       ),

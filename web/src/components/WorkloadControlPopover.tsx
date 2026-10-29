@@ -31,6 +31,8 @@ import {
   IconUsers,
 } from "@tabler/icons-react";
 
+import { useTranslation } from "react-i18next";
+
 import { api, type WorkerInfo, type Workload } from "@/api/client";
 
 function parseHostFromWid(wid: string): string {
@@ -54,6 +56,7 @@ function buildPut(w: Workload, patch: Partial<Workload>): Record<string, unknown
 }
 
 export default function WorkloadControlPopover({ slug }: { slug: string }) {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const wlQ = useQuery({
     queryKey: ["wl", slug],
@@ -168,7 +171,7 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
           await api.setWorkerFilter(cand.id, next, "ui:flow-popover");
           return;
         }
-        throw new Error("追加対象なし: 全 worker が既に担当 or filter=null");
+        throw new Error(t("wlctl.err_no_add_target", "追加対象なし: 全 worker が既に担当 or filter=null"));
       } else {
         const hosts = Array.from(byHost.keys()).sort(
           (a, b) => countPerHost.get(b)! - countPerHost.get(a)!,
@@ -183,7 +186,7 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
           await api.setWorkerFilter(cand.id, next.length === 0 ? null : next, "ui:flow-popover");
           return;
         }
-        throw new Error("削減対象なし");
+        throw new Error(t("wlctl.err_no_remove_target", "削減対象なし"));
       }
     },
     onSuccess: () => {
@@ -196,7 +199,7 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
     return (
       <Stack align="center" p="md">
         <Loader size="sm" />
-        <Text size="xs" c="dimmed">読み込み中…</Text>
+        <Text size="xs" c="dimmed">{t("common.loading", "読み込み中…")}</Text>
       </Stack>
     );
   }
@@ -215,10 +218,10 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
         <Alert
           color="yellow"
           icon={<IconRobot size={16} />}
-          title="supervisor が自動制御中"
+          title={t("wlctl.supervisor_auto_title", "supervisor が自動制御中")}
           variant="light"
         >
-          ルール条件が成立すれば再上書きされます。
+          {t("wlctl.supervisor_auto_body", "ルール条件が成立すれば再上書きされます。")}
         </Alert>
       )}
 
@@ -230,12 +233,12 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
               : <IconRobot size={18} color="var(--mantine-color-green-6)" />}
             <Box style={{ minWidth: 0 }}>
               <Text size="sm" fw={600}>
-                supervisor 自動制御
+                {t("wlctl.supervisor_toggle", "supervisor 自動制御")}
               </Text>
               <Text size="xs" c="dimmed">
                 {supervisorOptedOut
-                  ? "OFF: 手動操作だけが効きます"
-                  : "ON: ルール条件成立で priority / filter が上書きされます"}
+                  ? t("wlctl.supervisor_off", "OFF: 手動操作だけが効きます")
+                  : t("wlctl.supervisor_on", "ON: ルール条件成立で priority / filter が上書きされます")}
               </Text>
             </Box>
           </Group>
@@ -251,7 +254,7 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
 
       <Box>
         <Group justify="space-between" mb={4}>
-          <Text size="xs" c="dimmed">流量</Text>
+          <Text size="xs" c="dimmed">{t("wlctl.flow", "流量")}</Text>
           <Text size="sm" fw={600}>
             {(metrics?.throughput_min ?? 0).toFixed(1)} /min
           </Text>
@@ -275,7 +278,7 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
           onClick={() => patchMut.mutate({ priority: Math.max(0, w.priority - 10) })}
           disabled={pending || w.priority <= 0}
         >
-          弱
+          {t("wlctl.weaker", "弱")}
         </Button>
         <Button
           variant="light"
@@ -284,79 +287,79 @@ export default function WorkloadControlPopover({ slug }: { slug: string }) {
           onClick={() => patchMut.mutate({ priority: Math.min(200, w.priority + 10) })}
           disabled={pending || w.priority >= 200}
         >
-          強
+          {t("wlctl.stronger", "強")}
         </Button>
       </Group>
 
       <Stack gap="sm">
         <Knob
           icon={<IconUsers size={14} />}
-          label="担当 worker 数"
+          label={t("wlctl.knob_workers", "担当 worker 数")}
           value={String(metrics?.active_workers ?? "—")}
-          hint="+/- で host 別に worker filter を増減します"
+          hint={t("wlctl.knob_workers_hint", "+/- で host 別に worker filter を増減します")}
           onDown={() => filterMut.mutate(-1)}
           onUp={() => filterMut.mutate(1)}
           disabled={pending}
         />
         <Knob
           icon={<IconStack2 size={14} />}
-          label="並列バッチ規模 (batch_size)"
+          label={t("wlctl.knob_batch", "並列バッチ規模 (batch_size)")}
           value={String(w.batch_size)}
-          hint="1 claim で何件まとめて処理するか。 多いほど GPU batch 推論等が速くなる"
+          hint={t("wlctl.knob_batch_hint", "1 claim で何件まとめて処理するか。 多いほど GPU batch 推論等が速くなる")}
           onDown={() => patchMut.mutate({ batch_size: Math.max(1, w.batch_size - 1) })}
           onUp={() => patchMut.mutate({ batch_size: Math.min(1024, w.batch_size + 1) })}
           disabled={pending}
         />
         <Knob
           icon={<IconBolt size={14} />}
-          label="優先度 (priority)"
+          label={t("wlctl.knob_priority", "優先度 (priority)")}
           value={String(w.priority)}
-          hint="高いほど他より先に claim される。 0-200"
+          hint={t("wlctl.knob_priority_hint", "高いほど他より先に claim される。 0-200")}
           onDown={() => patchMut.mutate({ priority: Math.max(0, w.priority - 10) })}
           onUp={() => patchMut.mutate({ priority: Math.min(200, w.priority + 10) })}
           disabled={pending}
         />
         <Knob
           icon={<IconAdjustments size={14} />}
-          label="lease 周期 (秒)"
+          label={t("wlctl.knob_lease", "lease 周期 (秒)")}
           value={String(w.lease_secs)}
-          hint="claim の有効期限。 短いほど取りこぼし回復が早く、 長いほど overhead 低い"
+          hint={t("wlctl.knob_lease_hint", "claim の有効期限。 短いほど取りこぼし回復が早く、 長いほど overhead 低い")}
           onDown={() => patchMut.mutate({ lease_secs: Math.max(15, w.lease_secs - 30) })}
           onUp={() => patchMut.mutate({ lease_secs: Math.min(86400, w.lease_secs + 30) })}
           disabled={pending}
         />
         <Knob
           icon={<IconUsers size={14} />}
-          label="最低台数 (min_workers)"
+          label={t("wlctl.knob_min_workers", "最低台数 (min_workers)")}
           value={String(w.min_workers ?? 0)}
-          hint="この workload に常に確保する worker 数の下限。 max_workers と対。 backlog>0 なら supervisor がここまでは必ず戻す"
+          hint={t("wlctl.knob_min_workers_hint", "この workload に常に確保する worker 数の下限。 max_workers と対。 backlog>0 なら supervisor がここまでは必ず戻す")}
           onDown={() => patchMut.mutate({ min_workers: Math.max(0, (w.min_workers ?? 0) - 1) })}
           onUp={() => patchMut.mutate({ min_workers: Math.min(100, (w.min_workers ?? 0) + 1) })}
           disabled={pending}
         />
         <Knob
           icon={<IconStack2 size={14} />}
-          label="host毎 同時実行 (max_concurrent_per_host)"
-          value={w.max_concurrent_per_host == null ? "既定" : String(w.max_concurrent_per_host)}
-          hint="1 host で同時に claim できる上限。 GPU workload の VRAM 過密/OOM を防ぐ主レバー"
+          label={t("wlctl.knob_per_host", "host毎 同時実行 (max_concurrent_per_host)")}
+          value={w.max_concurrent_per_host == null ? t("common.default", "既定") : String(w.max_concurrent_per_host)}
+          hint={t("wlctl.knob_per_host_hint", "1 host で同時に claim できる上限。 GPU workload の VRAM 過密/OOM を防ぐ主レバー")}
           onDown={() => patchMut.mutate({ max_concurrent_per_host: w.max_concurrent_per_host == null ? null : (w.max_concurrent_per_host <= 1 ? null : w.max_concurrent_per_host - 1) })}
           onUp={() => patchMut.mutate({ max_concurrent_per_host: (w.max_concurrent_per_host ?? 0) + 1 })}
           disabled={pending}
         />
         <Knob
           icon={<IconUsers size={14} />}
-          label="最大 worker (max_workers)"
+          label={t("wlctl.knob_max_workers", "最大 worker (max_workers)")}
           value={w.max_workers == null ? "∞" : String(w.max_workers)}
-          hint="elastic が spawn できる worker 数の上限。 ∞=無制限"
+          hint={t("wlctl.knob_max_workers_hint", "elastic が spawn できる worker 数の上限。 ∞=無制限")}
           onDown={() => patchMut.mutate({ max_workers: w.max_workers == null ? null : (w.max_workers <= 1 ? null : w.max_workers - 1) })}
           onUp={() => patchMut.mutate({ max_workers: (w.max_workers ?? 0) + 1 })}
           disabled={pending}
         />
         <Knob
           icon={<IconBolt size={14} />}
-          label="全体 同時実行 (max_concurrent_total)"
+          label={t("wlctl.knob_total", "全体 同時実行 (max_concurrent_total)")}
           value={w.max_concurrent_total == null ? "∞" : String(w.max_concurrent_total)}
-          hint="fleet 全体で同時に claim できる上限。 単一 writer 保証等に使う。 ∞=無制限"
+          hint={t("wlctl.knob_total_hint", "fleet 全体で同時に claim できる上限。 単一 writer 保証等に使う。 ∞=無制限")}
           onDown={() => patchMut.mutate({ max_concurrent_total: w.max_concurrent_total == null ? null : (w.max_concurrent_total <= 1 ? null : w.max_concurrent_total - 1) })}
           onUp={() => patchMut.mutate({ max_concurrent_total: (w.max_concurrent_total ?? 0) + 1 })}
           disabled={pending}

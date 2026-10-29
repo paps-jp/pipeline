@@ -120,6 +120,7 @@ async function execShell(targetHost: string, script: string) {
 }
 
 function AddWorkerButtons({ hostWorkers, physHost }: { hostWorkers: WorkerInfo[]; physHost: string }) {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const [cpuStatus, setCpuStatus] = useState<"idle" | "sent" | "error">("idle");
   const [gpuStatus, setGpuStatus] = useState<"idle" | "sent" | "error">("idle");
@@ -178,10 +179,16 @@ function AddWorkerButtons({ hostWorkers, physHost }: { hostWorkers: WorkerInfo[]
       <Tooltip
         label={
           cpuStatus === "sent"
-            ? `コマンド送信済み — pipeline-worker-cpu@${nextCpuSlot} の起動を待っています`
+            ? t("workers.add_sent", {
+                defaultValue: "コマンド送信済み — {{unit}} の起動を待っています",
+                unit: `pipeline-worker-cpu@${nextCpuSlot}`,
+              })
             : cpuStatus === "error"
-            ? "コマンド送信に失敗しました"
-            : `pipeline-worker-cpu@${nextCpuSlot}.service を新規起動してワーカーを追加`
+            ? t("workers.add_send_failed", "コマンド送信に失敗しました")
+            : t("workers.add_tip", {
+                defaultValue: "{{unit}}.service を新規起動してワーカーを追加",
+                unit: `pipeline-worker-cpu@${nextCpuSlot}`,
+              })
         }
         withArrow
       >
@@ -193,17 +200,25 @@ function AddWorkerButtons({ hostWorkers, physHost }: { hostWorkers: WorkerInfo[]
           loading={addCpu.isPending}
           onClick={() => { setCpuStatus("idle"); addCpu.mutate(); }}
         >
-          {cpuStatus === "sent" ? `CPU ${nextCpuSlot} 待機中…` : `+ CPU ${nextCpuSlot}`}
+          {cpuStatus === "sent"
+            ? t("workers.add_waiting", { defaultValue: "CPU {{n}} 待機中…", n: nextCpuSlot })
+            : `+ CPU ${nextCpuSlot}`}
         </Button>
       </Tooltip>
       {hasGpu && (
         <Tooltip
           label={
             gpuStatus === "sent"
-              ? `コマンド送信済み — pipeline-worker-gpu@${nextGpuSlot} の起動を待っています`
+              ? t("workers.add_sent", {
+                  defaultValue: "コマンド送信済み — {{unit}} の起動を待っています",
+                  unit: `pipeline-worker-gpu@${nextGpuSlot}`,
+                })
               : gpuStatus === "error"
-              ? "コマンド送信に失敗しました"
-              : `pipeline-worker-gpu@${nextGpuSlot}.service を新規起動してワーカーを追加`
+              ? t("workers.add_send_failed", "コマンド送信に失敗しました")
+              : t("workers.add_tip", {
+                  defaultValue: "{{unit}}.service を新規起動してワーカーを追加",
+                  unit: `pipeline-worker-gpu@${nextGpuSlot}`,
+                })
           }
           withArrow
         >
@@ -215,7 +230,9 @@ function AddWorkerButtons({ hostWorkers, physHost }: { hostWorkers: WorkerInfo[]
             loading={addGpu.isPending}
             onClick={() => { setGpuStatus("idle"); addGpu.mutate(); }}
           >
-            {gpuStatus === "sent" ? `GPU ${nextGpuSlot} 待機中…` : `+ GPU ${nextGpuSlot}`}
+            {gpuStatus === "sent"
+              ? t("workers.add_waiting_gpu", { defaultValue: "GPU {{n}} 待機中…", n: nextGpuSlot })
+              : `+ GPU ${nextGpuSlot}`}
           </Button>
         </Tooltip>
       )}
@@ -608,7 +625,7 @@ function RuntimeSection() {
 
       {rawWorkers.length === 0 && !q.isLoading && !q.error && (
         <EmptyState icon={IconUsersGroup} title={t("workers.empty")}
-          description="登録ワーカーで pipeline-worker.service が稼働するとここに heartbeat が表示されます。"
+          description={t("workers.empty_desc", "登録ワーカーで pipeline-worker.service が稼働するとここに heartbeat が表示されます。")}
           minHeight={140}
         />
       )}

@@ -37,6 +37,10 @@ import {
   IconSettingsAutomation,
 } from "@tabler/icons-react";
 
+import { Trans, useTranslation } from "react-i18next";
+
+import { fieldGroup, fieldHelp, fieldLabel } from "@/lib/manifestI18n";
+
 import {
   api,
   type AvailablePlugin,
@@ -46,7 +50,7 @@ import {
 
 const SLUG = "pipeline-supervisor";
 const PLUGIN_SLUG = "pipeline_supervisor";
-const UNGROUPED = "その他";
+const UNGROUPED = "__ungrouped__";
 
 /** apply_mode 系 (= 実適用 / dry-run の切替) は誤操作の影響が大きいので強調する */
 function isApplySwitch(key: string): boolean {
@@ -71,6 +75,7 @@ function sameValue(a: unknown, b: unknown): boolean {
 }
 
 export default function SupervisorPage() {
+  const { t, i18n } = useTranslation();
   const qc = useQueryClient();
   const [values, setValues] = useState<Record<string, unknown>>({});
   const [search, setSearch] = useState("");
@@ -112,7 +117,7 @@ export default function SupervisorPage() {
 
   const save = useMutation({
     mutationFn: async () => {
-      if (!workload) throw new Error("workload 未取得");
+      if (!workload) throw new Error(t("supervisor.err_no_workload", "workload 未取得"));
       const cfg = {
         ...((workload.executor_config ?? {}) as Record<string, unknown>),
       };
@@ -146,17 +151,17 @@ export default function SupervisorPage() {
       if (
         q &&
         !f.key.toLowerCase().includes(q) &&
-        !(f.label ?? "").toLowerCase().includes(q) &&
-        !(f.help ?? "").toLowerCase().includes(q)
+        !fieldLabel(f).toLowerCase().includes(q) &&
+        !(fieldHelp(f) ?? "").toLowerCase().includes(q)
       ) {
         continue;
       }
-      const g = f.group || UNGROUPED;
+      const g = fieldGroup(f) || UNGROUPED;
       if (!map.has(g)) map.set(g, []);
       map.get(g)!.push(f);
     }
     return [...map.entries()];
-  }, [fields, search]);
+  }, [fields, search, i18n.language]);
 
   const renderField = (f: PluginKwargField) => {
     const v = values[f.key];
@@ -164,16 +169,16 @@ export default function SupervisorPage() {
     const label = (
       <Group gap={6} wrap="nowrap">
         <Text size="sm" fw={dirty ? 700 : 400}>
-          {f.label || f.key}
+          {fieldLabel(f)}
         </Text>
         {dirty && (
           <Badge size="xs" color="yellow">
-            変更
+            {t("supervisor.badge_changed", "変更")}
           </Badge>
         )}
         {isApplySwitch(f.key) && (
           <Badge size="xs" color="red" variant="light">
-            実適用
+            {t("supervisor.badge_apply", "実適用")}
           </Badge>
         )}
       </Group>
@@ -181,7 +186,7 @@ export default function SupervisorPage() {
     const description = (
       <Text span size="xs" c="dimmed">
         <Code fz="xs">{f.key}</Code>
-        {f.help ? ` — ${f.help}` : ""}
+        {fieldHelp(f) ? ` — ${fieldHelp(f)}` : ""}
       </Text>
     );
     const set = (val: unknown) => setValues((p) => ({ ...p, [f.key]: val }));
@@ -242,16 +247,20 @@ export default function SupervisorPage() {
   if (workloadQ.isLoading || pluginsQ.isLoading) return <Loader />;
   if (workloadQ.isError) {
     return (
-      <Alert color="red" title="supervisor workload を取得できません">
+      <Alert color="red" title={t("supervisor.err_fetch_workload", "supervisor workload を取得できません")}>
         {String(workloadQ.error)}
       </Alert>
     );
   }
   if (!plugin?.manifest) {
     return (
-      <Alert color="orange" title="plugin manifest が読めません">
-        control plane の <Code>PIPELINE_PLUGIN_ROOT</Code> 配下に{" "}
-        <Code>{PLUGIN_SLUG}/plugin.yaml</Code> が必要です。
+      <Alert color="orange" title={t("supervisor.err_manifest", "plugin manifest が読めません")}>
+        <Trans
+          i18nKey="supervisor.err_manifest_body"
+          defaults="control plane の <0>PIPELINE_PLUGIN_ROOT</0> 配下に <1>{{path}}</1> が必要です。"
+          values={{ path: `${PLUGIN_SLUG}/plugin.yaml` }}
+          components={[<Code key="0" />, <Code key="1" />]}
+        />
       </Alert>
     );
   }
@@ -265,11 +274,15 @@ export default function SupervisorPage() {
           <Title order={3}>
             <Group gap={8}>
               <IconSettingsAutomation size={22} />
-              Supervisor 設定
+              {t("supervisor.title", "Supervisor 設定")}
             </Group>
           </Title>
           <Text size="sm" c="dimmed">
-            {fields.length} 項目 / {groups.length} グループ
+            {t("supervisor.counts", {
+              defaultValue: "{{fields}} 項目 / {{groups}} グループ",
+              fields: fields.length,
+              groups: groups.length,
+            })}
           </Text>
         </div>
         <Group>
@@ -279,7 +292,7 @@ export default function SupervisorPage() {
             disabled={changed.length === 0}
             onClick={() => setValues(saved)}
           >
-            変更を破棄
+            {t("supervisor.discard", "変更を破棄")}
           </Button>
           <Button
             leftSection={<IconCheck size={16} />}
@@ -287,33 +300,36 @@ export default function SupervisorPage() {
             disabled={changed.length === 0}
             onClick={() => save.mutate()}
           >
-            保存 ({changed.length})
+            {t("supervisor.save_n", { defaultValue: "保存 ({{n}})", n: changed.length })}
           </Button>
         </Group>
       </Group>
 
       {!applyOn && (
-        <Alert color="blue" title="dry-run 中" icon={<IconAlertTriangle size={16} />}>
-          <Code>apply_mode = 0</Code> のため、 supervisor は判断をログに出すだけで実際の変更を
-          行いません。 各サブシステムの <Code>*_apply_mode</Code> も同様です。
+        <Alert color="blue" title={t("supervisor.dry_run", "dry-run 中")} icon={<IconAlertTriangle size={16} />}>
+          <Trans
+            i18nKey="supervisor.dry_run_body"
+            defaults="<0>apply_mode = 0</0> のため、 supervisor は判断をログに出すだけで実際の変更を行いません。 各サブシステムの <1>*_apply_mode</1> も同様です。"
+            components={[<Code key="0" />, <Code key="1" />]}
+          />
         </Alert>
       )}
 
       {save.isError && (
-        <Alert color="red" title="保存に失敗しました">
+        <Alert color="red" title={t("supervisor.save_failed", "保存に失敗しました")}>
           {String(save.error)}
         </Alert>
       )}
       {save.isSuccess && changed.length === 0 && (
-        <Alert color="green" title="保存しました">
-          次の tick (既定 30 秒) から反映されます。 worker の再起動は不要です。
+        <Alert color="green" title={t("supervisor.saved", "保存しました")}>
+          {t("supervisor.saved_body", "次の tick (既定 30 秒) から反映されます。 worker の再起動は不要です。")}
         </Alert>
       )}
 
       {changed.length > 0 && (
         <Paper withBorder p="sm">
           <Text size="sm" fw={600} mb={4}>
-            未保存の変更 {changed.length} 件
+            {t("supervisor.unsaved_n", { defaultValue: "未保存の変更 {{n}} 件", n: changed.length })}
           </Text>
           <ScrollArea.Autosize mah={200}>
             <Table fz="xs" withRowBorders={false}>
@@ -335,7 +351,7 @@ export default function SupervisorPage() {
       )}
 
       <TextInput
-        placeholder="キー / ラベル / 説明で絞り込み"
+        placeholder={t("supervisor.search_placeholder", "キー / ラベル / 説明で絞り込み")}
         leftSection={<IconSearch size={16} />}
         value={search}
         onChange={(e) => setSearch(e.currentTarget.value)}
@@ -343,7 +359,7 @@ export default function SupervisorPage() {
 
       {groups.length === 0 ? (
         <Text c="dimmed" size="sm">
-          該当する設定はありません。
+          {t("supervisor.no_match", "該当する設定はありません。")}
         </Text>
       ) : (
         <Accordion multiple defaultValue={groups.map(([g]) => g)} variant="separated">
@@ -353,12 +369,12 @@ export default function SupervisorPage() {
               <Accordion.Item key={g} value={g}>
                 <Accordion.Control>
                   <Group gap={8}>
-                    <Text fw={600}>{g}</Text>
+                    <Text fw={600}>{g === UNGROUPED ? t("supervisor.ungrouped", "その他") : g}</Text>
                     <Badge size="sm" variant="light">
                       {fs.length}
                     </Badge>
                     {nDirty > 0 && (
-                      <Tooltip label="未保存の変更">
+                      <Tooltip label={t("supervisor.unsaved", "未保存の変更")}>
                         <Badge size="sm" color="yellow">
                           {nDirty}
                         </Badge>

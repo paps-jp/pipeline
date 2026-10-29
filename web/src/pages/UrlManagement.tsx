@@ -23,7 +23,7 @@ import { notifications } from "@mantine/notifications";
 import { IconPlus, IconRefresh, IconSearch, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 
 import { mariadbTablesApi, UrlSiteRow, urlManagementApi } from "@/api/client";
 import { PageHeader } from "@/components/PageHeader";
@@ -258,9 +258,12 @@ function SitesTable({ sites }: { sites: UrlSiteRow[] }) {
       children: (
         <Stack gap={4}>
           <Text size="sm">
-            <b>{row.site}</b>{" "}
-            {t("urlManagement.reseed_body",
-              "の種URL を「未投入」状態に戻します。数分以内に priority filler が拾い直します。")}
+            <Trans
+              i18nKey="urlManagement.reseed_body_full"
+              defaults="<0>{{site}}</0> の種URL を「未投入」状態に戻します。数分以内に priority filler が拾い直します。"
+              values={{ site: row.site }}
+              components={[<b key="0" />]}
+            />
           </Text>
           <Text size="xs" c="dimmed">{row.url}</Text>
         </Stack>
@@ -277,9 +280,12 @@ function SitesTable({ sites }: { sites: UrlSiteRow[] }) {
       title: t("urlManagement.disable_title", "無効化しますか"),
       children: (
         <Text size="sm">
-          <b>{row.site}</b>{" "}
-          {t("urlManagement.disable_body",
-            "の enabled を -1 (恒久除外) に変更します。行自体は残り、後から priority tier に戻せます。")}
+          <Trans
+            i18nKey="urlManagement.disable_body_full"
+            defaults="<0>{{site}}</0> の enabled を -1 (恒久除外) に変更します。行自体は残り、後から priority tier に戻せます。"
+            values={{ site: row.site }}
+            components={[<b key="0" />]}
+          />
         </Text>
       ),
       labels: { confirm: t("urlManagement.disable_confirm", "無効化"),

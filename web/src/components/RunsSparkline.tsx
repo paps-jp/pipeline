@@ -1,4 +1,5 @@
 import { Box, Group, Text, Tooltip } from "@mantine/core";
+import { useTranslation } from "react-i18next";
 
 /**
  * 直近 N 件の run 成否を縦棒で並べる。
@@ -20,6 +21,7 @@ export function RunsSparkline({
   barWidth?: number;
   gap?: number;
 }) {
+  const { t } = useTranslation();
   if (bits.length === 0) {
     return <Text size="xs" c="dimmed">—</Text>;
   }
@@ -31,7 +33,7 @@ export function RunsSparkline({
 
   return (
     <Tooltip
-      label={`直近 ${bits.length} 件 成功率 ${rateText}`}
+      label={t("runs.sparkline_tip", { defaultValue: "直近 {{n}} 件 成功率 {{rate}}", n: bits.length, rate: rateText })}
       withArrow
       position="top"
     >

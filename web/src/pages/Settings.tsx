@@ -36,6 +36,8 @@ import {
   IconX,
 } from "@tabler/icons-react";
 
+import { useTranslation } from "react-i18next";
+
 import { api, type LlmCallDetail, type SettingItem } from "@/api/client";
 
 function findSetting(items: SettingItem[], key: string): SettingItem | undefined {
@@ -49,6 +51,7 @@ function settingValue(item?: SettingItem): string {
 }
 
 export default function Settings() {
+  const { t } = useTranslation();
   return (
     <Box p="md">
       <Tabs defaultValue="llm">
@@ -57,7 +60,7 @@ export default function Settings() {
             LLM advisor
           </Tabs.Tab>
           <Tabs.Tab value="calls" leftSection={<IconList size={16} />}>
-            呼び出し履歴
+            {t("settings.tab_calls", "呼び出し履歴")}
           </Tabs.Tab>
         </Tabs.List>
         <Tabs.Panel value="llm" pt="md">
@@ -74,6 +77,7 @@ export default function Settings() {
 // ---------------- LLM config ----------------
 
 function LlmConfigSection() {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const q = useQuery({
     queryKey: ["settings"],
@@ -130,9 +134,9 @@ function LlmConfigSection() {
 
   return (
     <Stack gap="md">
-      <Title order={3}>LLM advisor 設定</Title>
+      <Title order={3}>{t("settings.llm_title", "LLM advisor 設定")}</Title>
       <Text size="sm" c="dimmed">
-        supervisor が定期的に LLM にパイプライン状態を投げて、 最適化提案を受け取り適用します。
+        {t("settings.llm_desc", "supervisor が定期的に LLM にパイプライン状態を投げて、 最適化提案を受け取り適用します。")}
       </Text>
 
       <Paper p="md" withBorder>
@@ -140,9 +144,11 @@ function LlmConfigSection() {
           <Group gap="xs">
             <IconRobot size={20} color={enabled ? "var(--mantine-color-green-6)" : undefined} />
             <Box>
-              <Text fw={600}>LLM advisor 有効化</Text>
+              <Text fw={600}>{t("settings.llm_enable", "LLM advisor 有効化")}</Text>
               <Text size="xs" c="dimmed">
-                {enabled ? "ON: 定期コール中" : "OFF: コールしない"}
+                {enabled
+                  ? t("settings.llm_enable_on", "ON: 定期コール中")
+                  : t("settings.llm_enable_off", "OFF: コールしない")}
               </Text>
             </Box>
           </Group>
@@ -159,9 +165,11 @@ function LlmConfigSection() {
           <Group gap="xs">
             <IconCheck size={20} color={applyMode ? "var(--mantine-color-green-6)" : undefined} />
             <Box>
-              <Text fw={600}>apply_mode (= 提案を実適用)</Text>
+              <Text fw={600}>{t("settings.apply_mode", "apply_mode (= 提案を実適用)")}</Text>
               <Text size="xs" c="dimmed">
-                {applyMode ? "ON: 自動で priority/filter を上書き" : "OFF (dry-run): 提案だけログに記録"}
+                {applyMode
+                  ? t("settings.apply_mode_on", "ON: 自動で priority/filter を上書き")
+                  : t("settings.apply_mode_off", "OFF (dry-run): 提案だけログに記録")}
               </Text>
             </Box>
           </Group>
@@ -175,36 +183,36 @@ function LlmConfigSection() {
 
       <Paper p="md" withBorder>
         <Stack gap="sm">
-          <Title order={5}>接続</Title>
+          <Title order={5}>{t("settings.connection", "接続")}</Title>
           <Select
-            label="プロバイダ"
+            label={t("settings.provider", "プロバイダ")}
             value={provider}
             data={[
               { value: "deepseek", label: "DeepSeek" },
               { value: "openai", label: "OpenAI" },
               { value: "anthropic", label: "Anthropic" },
-              { value: "custom", label: "Custom (OpenAI 互換)" },
+              { value: "custom", label: t("settings.provider_custom", "Custom (OpenAI 互換)") },
             ]}
             onChange={(v) => v && onSetKV("llm.provider", v)}
           />
           <TextInput
-            label="エンドポイント (chat completions)"
+            label={t("settings.endpoint", "エンドポイント (chat completions)")}
             placeholder="https://api.deepseek.com/v1/chat/completions"
             value={endpoint}
             onChange={(e) => onSetKV("llm.endpoint", e.currentTarget.value)}
           />
           <TextInput
-            label="モデル名"
+            label={t("settings.model", "モデル名")}
             placeholder="deepseek-chat"
             value={model}
             onChange={(e) => onSetKV("llm.model", e.currentTarget.value)}
           />
           <Box>
             <Text size="sm" fw={500} mb={4}>
-              API キー
+              {t("settings.api_key", "API キー")}
               {apiKeyMasked && (
                 <Code ml={6} fz={11}>
-                  現在: {apiKeyMasked}
+                  {t("settings.api_key_current", { defaultValue: "現在: {{masked}}", masked: apiKeyMasked })}
                 </Code>
               )}
             </Text>
@@ -216,12 +224,12 @@ function LlmConfigSection() {
                 style={{ flex: 1 }}
               />
               <Button onClick={onSaveApiKey} disabled={!newApiKey} loading={setMut.isPending}>
-                保存
+                {t("common.save", "保存")}
               </Button>
             </Group>
             {showSaved && (
               <Text size="xs" c="green" mt={4}>
-                ✓ API キー保存しました(マスク表示に変わります)
+                {t("settings.api_key_saved", "✓ API キー保存しました(マスク表示に変わります)")}
               </Text>
             )}
           </Box>
@@ -232,7 +240,7 @@ function LlmConfigSection() {
               onClick={onTest}
               loading={testMut.isPending}
             >
-              接続テスト(保存済 API キーで実行)
+              {t("settings.test_connection", "接続テスト(保存済 API キーで実行)")}
             </Button>
           </Group>
           {testMut.data && (
@@ -242,7 +250,9 @@ function LlmConfigSection() {
             >
               <Stack gap={4}>
                 <Text size="sm" fw={600}>
-                  {testMut.data.ok ? "接続成功" : "接続失敗"}
+                  {testMut.data.ok
+                    ? t("settings.test_ok", "接続成功")
+                    : t("settings.test_ng", "接続失敗")}
                 </Text>
                 <Text size="xs">
                   status={testMut.data.status_code ?? "-"} | latency={testMut.data.latency_ms}ms |
@@ -264,17 +274,17 @@ function LlmConfigSection() {
 
       <Paper p="md" withBorder>
         <Stack gap="sm">
-          <Title order={5}>挙動</Title>
+          <Title order={5}>{t("settings.behavior", "挙動")}</Title>
           <Group grow>
             <NumberInput
-              label="コール間隔(分)"
+              label={t("settings.interval_min", "コール間隔(分)")}
               value={intervalMin}
               min={1}
               max={120}
               onChange={(v) => onSetKV("llm.interval_min", String(v ?? 15))}
             />
             <NumberInput
-              label="1 サイクル最大 action 数"
+              label={t("settings.max_actions", "1 サイクル最大 action 数")}
               value={maxActions}
               min={1}
               max={20}
@@ -283,7 +293,7 @@ function LlmConfigSection() {
           </Group>
           <Group grow>
             <NumberInput
-              label="confidence 閾値 (apply_mode 時)"
+              label={t("settings.confidence", "confidence 閾値 (apply_mode 時)")}
               value={confidence}
               min={0}
               max={1}
@@ -291,7 +301,7 @@ function LlmConfigSection() {
               onChange={(v) => onSetKV("llm.confidence_threshold", String(v ?? 0.7))}
             />
             <NumberInput
-              label="HTTP timeout (秒)"
+              label={t("settings.timeout_s", "HTTP timeout (秒)")}
               value={timeoutS}
               min={5}
               max={300}
@@ -307,6 +317,7 @@ function LlmConfigSection() {
 // ---------------- LLM call history ----------------
 
 function LlmCallsSection() {
+  const { t } = useTranslation();
   const q = useQuery({
     queryKey: ["llm-calls"],
     queryFn: () => api.listLlmCalls(50),
@@ -319,20 +330,20 @@ function LlmCallsSection() {
 
   return (
     <Stack gap="md">
-      <Title order={3}>LLM 呼び出し履歴</Title>
-      <Text size="sm" c="dimmed">直近 50 件。 クリックで prompt / response 詳細表示</Text>
+      <Title order={3}>{t("settings.calls_title", "LLM 呼び出し履歴")}</Title>
+      <Text size="sm" c="dimmed">{t("settings.calls_desc", "直近 50 件。 クリックで prompt / response 詳細表示")}</Text>
 
       <Paper withBorder>
         <Table verticalSpacing="sm" highlightOnHover>
           <Table.Thead>
             <Table.Tr>
               <Table.Th>id</Table.Th>
-              <Table.Th>時刻</Table.Th>
+              <Table.Th>{t("settings.col_time", "時刻")}</Table.Th>
               <Table.Th>model</Table.Th>
-              <Table.Th>状態</Table.Th>
-              <Table.Th>適用</Table.Th>
+              <Table.Th>{t("settings.col_status", "状態")}</Table.Th>
+              <Table.Th>{t("settings.col_applied", "適用")}</Table.Th>
               <Table.Th>tokens</Table.Th>
-              <Table.Th>分析</Table.Th>
+              <Table.Th>{t("settings.col_analysis", "分析")}</Table.Th>
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
@@ -379,7 +390,7 @@ function LlmCallsSection() {
               <Table.Tr>
                 <Table.Td colSpan={7}>
                   <Text c="dimmed" ta="center" size="sm">
-                    まだ呼び出しがありません
+                    {t("settings.no_calls", "まだ呼び出しがありません")}
                   </Text>
                 </Table.Td>
               </Table.Tr>
@@ -408,6 +419,7 @@ function CallDetailModal({ callId, onClose }: { callId: number | null; onClose: 
 }
 
 function CallDetail({ call }: { call: LlmCallDetail }) {
+  const { t } = useTranslation();
   const promptPretty = useMemo(() => {
     try {
       return JSON.stringify(call.prompt_json, null, 2);
@@ -429,7 +441,7 @@ function CallDetail({ call }: { call: LlmCallDetail }) {
       </Text>
       {call.analysis && (
         <Box>
-          <Text size="sm" fw={600}>分析</Text>
+          <Text size="sm" fw={600}>{t("settings.col_analysis", "分析")}</Text>
           <Code block fz={12}>
             {call.analysis}
           </Code>
@@ -437,7 +449,9 @@ function CallDetail({ call }: { call: LlmCallDetail }) {
       )}
       {actionsPretty && (
         <Box>
-          <Text size="sm" fw={600}>提案 actions ({call.actions_applied} 適用)</Text>
+          <Text size="sm" fw={600}>
+            {t("settings.proposed_actions", { defaultValue: "提案 actions ({{n}} 適用)", n: call.actions_applied })}
+          </Text>
           <Code block fz={11} style={{ maxHeight: 300, overflow: "auto" }}>
             {actionsPretty}
           </Code>
@@ -453,7 +467,7 @@ function CallDetail({ call }: { call: LlmCallDetail }) {
       )}
       {promptPretty && (
         <Box>
-          <Text size="sm" fw={600}>送信した prompt (snapshot 含む)</Text>
+          <Text size="sm" fw={600}>{t("settings.sent_prompt", "送信した prompt (snapshot 含む)")}</Text>
           <Code block fz={11} style={{ maxHeight: 400, overflow: "auto" }}>
             {promptPretty}
           </Code>

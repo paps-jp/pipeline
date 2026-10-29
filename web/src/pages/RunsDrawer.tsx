@@ -18,6 +18,7 @@ import { notifications } from "@mantine/notifications";
 import { IconChevronDown, IconChevronRight, IconRefresh } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 
 import { RunRecord, Workload, api } from "@/api/client";
@@ -42,7 +43,7 @@ function fmtMs(ms: number | null): string {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
-function ResultBadge({ run, t }: { run: RunRecord; t: (k: string) => string }) {
+function ResultBadge({ run, t }: { run: RunRecord; t: TFunction }) {
   if (run.success === true) {
     return <Badge color="teal" variant="light">{t("workloads.runs.success")}</Badge>;
   }
@@ -73,7 +74,7 @@ function RunRow({
   slug,
 }: {
   run: RunRecord;
-  t: (k: string) => string;
+  t: TFunction;
   slug: string;
 }) {
   const [opened, setOpened] = useState(false);
@@ -86,14 +87,16 @@ function RunRow({
     onSuccess: (r) => {
       notifications.show({
         color: r.inserted > 0 ? "teal" : "yellow",
-        title: r.inserted > 0 ? "再投入しました" : "既にキューに有り",
+        title: r.inserted > 0
+          ? t("runs.requeued", "再投入しました")
+          : t("runs.already_queued", "既にキューに有り"),
         message: `pk=${run.pk}`,
       });
       qc.invalidateQueries({ queryKey: ["queue", slug] });
       qc.invalidateQueries({ queryKey: ["runs", slug] });
     },
     onError: (e: Error) =>
-      notifications.show({ color: "red", title: "再投入失敗", message: e.message }),
+      notifications.show({ color: "red", title: t("runs.requeue_failed", "再投入失敗"), message: e.message }),
   });
 
   const reason = shortReason(run);
@@ -129,7 +132,7 @@ function RunRow({
           )}
         </Table.Td>
         <Table.Td onClick={(e) => e.stopPropagation()} style={{ width: 60 }}>
-          <Tooltip label="同じ pk を再投入">
+          <Tooltip label={t("runs.requeue_same_pk", "同じ pk を再投入")}>
             <ActionIcon
               size="sm"
               variant="subtle"
@@ -176,7 +179,7 @@ function RunRow({
                       onClick={() => rerunMut.mutate()}
                       loading={rerunMut.isPending}
                     >
-                      この pk を再投入
+                      {t("runs.requeue_this_pk", "この pk を再投入")}
                     </Button>
                     <Text size="xs" c="dimmed">
                       run_id: <Code>{run.id}</Code> · worker: <Code>{run.worker_id || "—"}</Code>
@@ -273,7 +276,7 @@ export default function RunsDrawer({ opened, onClose, workload }: Props) {
         {runsQ.data && runsQ.data.runs.length === 0 && !runsQ.isLoading && (
           <EmptyState
             title={t("workloads.runs.empty")}
-            description="まだ実行履歴がありません。タスクを投入すると ここに表示されます。"
+            description={t("runs.empty_desc", "まだ実行履歴がありません。タスクを投入すると ここに表示されます。")}
           />
         )}
 

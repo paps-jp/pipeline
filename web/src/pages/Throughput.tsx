@@ -235,20 +235,21 @@ function Spark({
 
 // 前回バケット比の増減矢印。増=緑▲ / 減=赤▼ / 変化なし=灰→。
 function DeltaArrow({ delta }: { delta: number }) {
+  const { t } = useTranslation();
   if (delta > 0)
     return (
-      <Text span size="xs" c="teal.6" style={{ whiteSpace: "nowrap" }} title={`+${fmtNum(delta)}/分`}>
+      <Text span size="xs" c="teal.6" style={{ whiteSpace: "nowrap" }} title={`+${fmtNum(delta)}${t("throughput.per_min", "/分")}`}>
         ▲ {fmtNum(delta)}
       </Text>
     );
   if (delta < 0)
     return (
-      <Text span size="xs" c="red.6" style={{ whiteSpace: "nowrap" }} title={`${fmtNum(delta)}/分`}>
+      <Text span size="xs" c="red.6" style={{ whiteSpace: "nowrap" }} title={`${fmtNum(delta)}${t("throughput.per_min", "/分")}`}>
         ▼ {fmtNum(-delta)}
       </Text>
     );
   return (
-    <Text span size="xs" c="dimmed" title="変化なし">
+    <Text span size="xs" c="dimmed" title={t("throughput.no_change", "変化なし")}>
       →
     </Text>
   );
@@ -296,6 +297,7 @@ function OverlayChart({
   colorFor: (slug: string) => string;
   labelFor: (slug: string) => string;
 }) {
+  const { t } = useTranslation();
   const [hover, setHover] = useState<{ vx: number; vy: number } | null>(null);
 
   const allMins = nodes.flatMap((n) => n.points.map((p) => p.m));
@@ -545,7 +547,9 @@ function OverlayChart({
               </Text>
               <Text span c="dimmed">
                 {" "}
-                /分 · {METRIC_LABEL[active.node.metric]} · {fmtClock(active.m)}
+                {t("throughput.per_min", "/分")} ·{" "}
+                {t(`throughput.metric.${active.node.metric}`, METRIC_LABEL[active.node.metric])} ·{" "}
+                {fmtClock(active.m)}
               </Text>
             </Text>
           </div>
@@ -608,12 +612,19 @@ export default function Throughput() {
               <>
                 {" · "}
                 <Text span c="indigo" fw={600}>
-                  Paprika投入 {fmtNum(paprika.current)}/分
+                  {t("throughput.paprika_submit", {
+                    defaultValue: "Paprika投入 {{n}}/分",
+                    n: fmtNum(paprika.current),
+                  })}
                 </Text>
               </>
             )}
             {nodes.length > 0 &&
-              ` · ${nodes.length} ノード · 合計 ${fmtNum(totalCurrent)}/分`}
+              ` · ${t("throughput.nodes_total", {
+                defaultValue: "{{n}} ノード · 合計 {{total}}/分",
+                n: nodes.length,
+                total: fmtNum(totalCurrent),
+              })}`}
           </Text>
         </div>
         <Group gap="sm" wrap="nowrap">
@@ -659,7 +670,7 @@ export default function Throughput() {
                 variant="subtle"
                 color="gray"
                 onClick={() => setSelected(defaultSel)}
-                title="Paprika投入のみ"
+                title={t("throughput.reset_tip", "Paprika投入のみ")}
               >
                 {t("throughput.reset", "Paprikaのみ")}
               </Button>
@@ -693,7 +704,7 @@ export default function Throughput() {
                   key={n.slug}
                   onClick={() => toggle(n.slug)}
                   style={{ opacity: on ? 1 : 0.4 }}
-                  title={on ? "クリックで非表示" : "クリックで表示"}
+                  title={on ? t("throughput.click_hide", "クリックで非表示") : t("throughput.click_show", "クリックで表示")}
                 >
                   <Group gap={6} wrap="nowrap">
                     <span
@@ -747,7 +758,7 @@ export default function Throughput() {
                     {fmtNum(n.current)}
                     <Text span size="xs" c="dimmed">
                       {" "}
-                      /分
+                      {t("throughput.per_min", "/分")}
                     </Text>
                   </Text>
                   <DeltaArrow delta={n.delta} />
@@ -755,7 +766,7 @@ export default function Throughput() {
               </Group>
               <Group gap={6} mb={4} wrap="nowrap">
                 <Text size="10px" c="dimmed">
-                  {METRIC_LABEL[n.metric]}
+                  {t(`throughput.metric.${n.metric}`, METRIC_LABEL[n.metric])}
                 </Text>
               </Group>
               <Spark points={n.points} peak={n.peak} gradientId={`sp-${n.slug}`} />

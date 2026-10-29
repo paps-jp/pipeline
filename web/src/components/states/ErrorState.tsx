@@ -1,6 +1,7 @@
 import { Alert, Button, Code, Collapse, Stack } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconRefresh } from "@tabler/icons-react";
+import { useTranslation } from "react-i18next";
 
 /**
  * 共通 Error 状態。
@@ -10,12 +11,13 @@ import { IconAlertTriangle, IconRefresh } from "@tabler/icons-react";
 export function ErrorState({
   error,
   onRetry,
-  title = "通信エラー",
+  title,
 }: {
   error: unknown;
   onRetry?: () => void;
   title?: string;
 }) {
+  const { t } = useTranslation();
   const message = (error instanceof Error ? error.message : String(error)).slice(0, 200);
   const detail = error instanceof Error ? (error.stack ?? "") : JSON.stringify(error, null, 2);
   const [opened, { toggle }] = useDisclosure(false);
@@ -25,7 +27,7 @@ export function ErrorState({
       color="red"
       variant="light"
       icon={<IconAlertTriangle size={18} />}
-      title={title}
+      title={title ?? t("errors.network", "通信エラー")}
       radius="md"
     >
       <Stack gap="xs">
@@ -39,12 +41,12 @@ export function ErrorState({
               leftSection={<IconRefresh size={14} />}
               onClick={onRetry}
             >
-              再試行
+              {t("common.retry", "再試行")}
             </Button>
           )}
           {detail && (
             <Button size="xs" variant="subtle" color="red" onClick={toggle}>
-              {opened ? "詳細を隠す" : "詳細"}
+              {opened ? t("common.hide_detail", "詳細を隠す") : t("common.detail", "詳細")}
             </Button>
           )}
         </Stack>

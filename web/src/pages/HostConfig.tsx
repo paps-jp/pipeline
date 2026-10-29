@@ -50,11 +50,11 @@ import { ErrorState } from "@/components/states";
 //   3. VRAM / host_policy     … planner が実測で丸める上限
 // ============================================================
 
-const TIER_OPTIONS = [
-  { value: "", label: "自動判定 (VRAM から推定)" },
-  { value: "gpu-16g-pro", label: "gpu-16g-pro (16GB 以上)" },
-  { value: "gpu-10g-consumer", label: "gpu-10g-consumer (10GB 民生)" },
-  { value: "cpu-only", label: "cpu-only (GPU 無し)" },
+const TIER_OPTIONS: { value: string; labelKey: string; labelJa: string }[] = [
+  { value: "", labelKey: "hostcfg.tier_auto", labelJa: "自動判定 (VRAM から推定)" },
+  { value: "gpu-16g-pro", labelKey: "hostcfg.tier_gpu16", labelJa: "gpu-16g-pro (16GB 以上)" },
+  { value: "gpu-10g-consumer", labelKey: "hostcfg.tier_gpu10", labelJa: "gpu-10g-consumer (10GB 民生)" },
+  { value: "cpu-only", labelKey: "hostcfg.tier_cpu", labelJa: "cpu-only (GPU 無し)" },
 ];
 
 function fmtRelative(iso: string | null): string {
@@ -190,8 +190,10 @@ function HostCard({
       qc.invalidateQueries({ queryKey: ["agents"] });
       notifications.show({
         color: "teal",
-        message: t("hostcfg.saved_desired", { host: policy.host,
-          defaultValue: `${policy.host} の割り当てを保存しました` }),
+        message: t("hostcfg.saved_desired", {
+          host: policy.host,
+          defaultValue: "{{host}} の割り当てを保存しました",
+        }),
       });
     },
     onError: (e: unknown) =>
@@ -205,8 +207,10 @@ function HostCard({
       qc.invalidateQueries({ queryKey: ["host-policy"] });
       notifications.show({
         color: "teal",
-        message: t("hostcfg.saved_policy", { host: policy.host,
-          defaultValue: `${policy.host} のホスト能力を保存しました` }),
+        message: t("hostcfg.saved_policy", {
+          host: policy.host,
+          defaultValue: "{{host}} のホスト能力を保存しました",
+        }),
       });
     },
     onError: (e: unknown) =>
@@ -234,8 +238,10 @@ function HostCard({
       qc.invalidateQueries({ queryKey: ["agents"] });
       notifications.show({
         color: "teal",
-        message: t("hostcfg.resynced", { host: policy.host,
-          defaultValue: `${policy.host} の実効を目標に戻しました` }),
+        message: t("hostcfg.resynced", {
+          host: policy.host,
+          defaultValue: "{{host}} の実効を目標に戻しました",
+        }),
       });
     },
     onError: (e: unknown) =>
@@ -323,7 +329,7 @@ function HostCard({
           <Select
             size="xs"
             label={t("hostcfg.tier", "ティア")}
-            data={TIER_OPTIONS}
+            data={TIER_OPTIONS.map((o) => ({ value: o.value, label: t(o.labelKey, o.labelJa) }))}
             value={polValue("tier", policy.tier) ?? ""}
             onChange={(v) => setPol((p) => ({ ...p, tier: v || null }))}
           />
@@ -609,7 +615,9 @@ function HostCard({
                       </Text>
                     )}
                     {w?.requires_gpu && e.count > 0 && (
-                      <Text size="xs" c="dimmed">~{vramEstimate(w)} MB/台</Text>
+                      <Text size="xs" c="dimmed">
+                      {t("hostcfg.vram_per_child", { defaultValue: "~{{mb}} MB/台", mb: vramEstimate(w) })}
+                    </Text>
                     )}
                   </Table.Td>
                 </Table.Tr>

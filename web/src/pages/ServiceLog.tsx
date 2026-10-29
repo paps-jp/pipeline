@@ -36,8 +36,9 @@ function levelColor(level: string): string {
 
 /** paprika 風 淡い点滅 (動作中 indicator) */
 function LiveBadge({ paused }: { paused: boolean }) {
+  const { t } = useTranslation();
   if (paused) {
-    return <Badge color="gray" variant="dot" size="md">一時停止</Badge>;
+    return <Badge color="gray" variant="dot" size="md">{t("logs.paused_badge", "一時停止")}</Badge>;
   }
   return (
     <Badge
@@ -48,7 +49,7 @@ function LiveBadge({ paused }: { paused: boolean }) {
         animation: "pulse-soft 1.6s ease-in-out infinite",
       }}
     >
-      動作中
+      {t("logs.live_badge", "動作中")}
     </Badge>
   );
 }
@@ -64,6 +65,7 @@ function LogPanel({
   service?: string;
   emptyMessage: string;
 }) {
+  const { t } = useTranslation();
   const [paused, setPaused] = useState(false);
   const viewportRef = useRef<HTMLDivElement | null>(null);
 
@@ -125,10 +127,13 @@ function LogPanel({
         </Group>
         <Group gap="xs">
           <Text size="xs" c="dimmed">
-            {records.length} 行 {records.length >= MAX_DISPLAY_LINES ? `(上限 ${MAX_DISPLAY_LINES})` : ""}
+            {t("logs.lines_n", { defaultValue: "{{n}} 行", n: records.length })}{" "}
+            {records.length >= MAX_DISPLAY_LINES
+              ? t("logs.lines_cap", { defaultValue: "(上限 {{max}})", max: MAX_DISPLAY_LINES })
+              : ""}
           </Text>
           <Button size="xs" variant="light" onClick={() => setPaused((p) => !p)}>
-            {paused ? "再開" : "一時停止"}
+            {paused ? t("logs.resume", "再開") : t("logs.pause", "一時停止")}
           </Button>
         </Group>
       </Group>
@@ -274,10 +279,10 @@ export default function ServiceLog() {
 
       <Tabs defaultValue="pipeline" variant="outline">
         <Tabs.List>
-          <Tabs.Tab value="pipeline">Pipeline (制御)</Tabs.Tab>
-          {enabledTargets.map((t) => (
-            <Tabs.Tab key={t.id} value={`host-${t.host}`}>
-              {t.label}
+          <Tabs.Tab value="pipeline">{t("logs.tab_pipeline", "Pipeline (制御)")}</Tabs.Tab>
+          {enabledTargets.map((tg) => (
+            <Tabs.Tab key={tg.id} value={`host-${tg.host}`}>
+              {tg.label}
             </Tabs.Tab>
           ))}
         </Tabs.List>
@@ -285,15 +290,23 @@ export default function ServiceLog() {
         <Tabs.Panel value="pipeline" pt="md" keepMounted={false}>
           <LogPanel
             service="pipeline-oss-control"
-            emptyMessage="Pipeline (制御平面) のログはまだありません。 control plane が起動して何か動作するとここに流れます。"
+            emptyMessage={t(
+              "logs.empty_pipeline",
+              "Pipeline (制御平面) のログはまだありません。 control plane が起動して何か動作するとここに流れます。",
+            )}
           />
         </Tabs.Panel>
 
-        {enabledTargets.map((t) => (
-          <Tabs.Panel key={t.id} value={`host-${t.host}`} pt="md" keepMounted={false}>
+        {enabledTargets.map((tg) => (
+          <Tabs.Panel key={tg.id} value={`host-${tg.host}`} pt="md" keepMounted={false}>
             <LogPanel
-              host={t.label}
-              emptyMessage={`${t.label} (${t.host}) のログはまだありません。 service が起動して何か出力するとここに流れます。`}
+              host={tg.label}
+              emptyMessage={t("logs.empty_host", {
+                defaultValue:
+                  "{{label}} ({{host}}) のログはまだありません。 service が起動して何か出力するとここに流れます。",
+                label: tg.label,
+                host: tg.host,
+              })}
             />
           </Tabs.Panel>
         ))}

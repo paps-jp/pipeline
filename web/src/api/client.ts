@@ -161,17 +161,22 @@ export interface PluginKwargField {
   default?: unknown;
   label?: string;
   help?: string;
+  /** 英語版 (UI が en のとき優先。 無ければ label/help にフォールバック) */
+  label_en?: string;
+  help_en?: string;
   min?: number;
   max?: number;
   options?: unknown[];
   required?: boolean;
   /** UI のセクション名 (= supervisor のようにキーが数十個ある plugin を畳むため) */
   group?: string;
+  group_en?: string;
 }
 
 export interface PluginManifest {
   name?: string;
   description?: string;
+  description_en?: string;
   init_kwargs: PluginKwargField[];
   hidden_kwargs: string[];
   ui_panel?: boolean;

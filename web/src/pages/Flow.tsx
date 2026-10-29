@@ -460,8 +460,13 @@ function WorkloadNode({
   const biasTitle =
     trend == null
       ? t("flow.backlog_trend_none", "上流バックログ: 履歴待ち")
-      : `${t("flow.backlog_trend", "上流バックログ")} ${trend > 0 ? "+" : ""}${fmtNum(trend)}/分` +
-        ` (${data.backlog_trend_span_min ?? 0}分, ${(data.backlog_tanks ?? []).join(", ")})`;
+      : t("flow.backlog_trend_value", {
+          defaultValue: "上流バックログ {{sign}}{{rate}}/分 ({{span}}分, {{tanks}})",
+          sign: trend > 0 ? "+" : "",
+          rate: fmtNum(trend),
+          span: data.backlog_trend_span_min ?? 0,
+          tanks: (data.backlog_tanks ?? []).join(", "),
+        });
   const cardText = isLight ? "#1f2937" : "#e2e8f0";
   const cardBorder = isLight ? `1.5px solid ${color}cc` : `2px solid ${color}`;
   // 旧版は running 時に `0 0 18px ${color}66` の強い neon glow が出て
@@ -913,6 +918,7 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
                                                           inflow_per_min?: number;
                                                           outflow_per_min?: number };
                                        selected?: boolean }) {
+  const { t } = useTranslation();
   const { colorScheme } = useMantineColorScheme();
   const isLight = colorScheme === "light";
   const nodeLabel = useNodeLabel(data);
@@ -1017,7 +1023,7 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
             IN/OUT ラベルは黒(地味)、 数値は意味色 (緑=in, 橙=out)。
             /min 単位は OUT 側だけに付ける (= IN は同一行なので共通単位と分かる)。 */}
         <Group gap={8} wrap="nowrap" mt={2} style={{ lineHeight: 1 }}>
-          <Tooltip label="1 分間の流入量">
+          <Tooltip label={t("flow.inflow_tip", "1 分間の流入量")}>
             <Group gap={3} wrap="nowrap">
               <Text size="xs" fw={600} c={isLight ? "#475569" : "#cbd5e1"}
                     style={{ lineHeight: 1 }}>
@@ -1029,7 +1035,7 @@ function TankNode({ data, selected }: { data: FlowNode & { activeHandles?: strin
               </Text>
             </Group>
           </Tooltip>
-          <Tooltip label="1 分間の流出量">
+          <Tooltip label={t("flow.outflow_tip", "1 分間の流出量")}>
             <Group gap={3} wrap="nowrap">
               <Text size="xs" fw={600} c={isLight ? "#475569" : "#cbd5e1"}
                     style={{ lineHeight: 1 }}>
@@ -1390,6 +1396,7 @@ function AnnotationToolbar({
   onClear: () => void;
   isLight: boolean;
 }) {
+  const { t } = useTranslation();
   const bg = isLight ? '#ffffff' : '#1e293b';
   const border = `1px solid ${isLight ? '#e2e8f0' : '#334155'}`;
   const textC = isLight ? '#475569' : '#94a3b8';
@@ -1434,16 +1441,18 @@ function AnnotationToolbar({
         boxShadow: '0 2px 8px rgba(0,0,0,0.18)',
       }}
     >
-      <Text size="xs" c="dimmed" fw={600} style={{ marginRight: 2, whiteSpace: 'nowrap' }}>加筆</Text>
+      <Text size="xs" c="dimmed" fw={600} style={{ marginRight: 2, whiteSpace: 'nowrap' }}>{t("flow.anno.title", "加筆")}</Text>
       {divider}
-      {toolBtn('text', 'T', 'テキスト追加')}
-      {toolBtn('line', '╱', '線を引く')}
-      {toolBtn('rect', '□', '四角を描く')}
-      {toolBtn('erase', '✕', '加筆を消す（クリックで削除）')}
+      {toolBtn('text', 'T', t("flow.anno.add_text", 'テキスト追加'))}
+      {toolBtn('line', '╱', t("flow.anno.draw_line", '線を引く'))}
+      {toolBtn('rect', '□', t("flow.anno.draw_rect", '四角を描く'))}
+      {toolBtn('erase', '✕', t("flow.anno.erase", '加筆を消す（クリックで削除）'))}
       {divider}
       {/* 図形を選択していればその色を編集、 未選択ならこれから描く色を決める。
           どちらを編集しているのか分かる様に、 選択中は枠を光らせる。 */}
-      <Tooltip label={selectedColor ? '選択中の図形の色を変える' : 'これから描く色'}>
+      <Tooltip label={selectedColor
+        ? t("flow.anno.color_selected", '選択中の図形の色を変える')
+        : t("flow.anno.color_next", 'これから描く色')}>
         <input
           type="color"
           value={selectedColor ?? annoColor}
@@ -1468,12 +1477,12 @@ function AnnotationToolbar({
         </select>
       )}
       {divider}
-      <Tooltip label="全消去">
+      <Tooltip label={t("flow.anno.clear_all", "全消去")}>
         <button
           onClick={onClear}
           style={{ background: 'transparent', color: '#ef4444', border: 'none', cursor: 'pointer', fontSize: 12, padding: '2px 5px', borderRadius: 4, whiteSpace: 'nowrap' }}
         >
-          全消去
+          {t("flow.anno.clear_all", "全消去")}
         </button>
       </Tooltip>
     </div>
@@ -1514,6 +1523,7 @@ function DragHandles({
   onSelect: (id: string | null) => void;
   onMove: (id: string, x: number, y: number, x2: number, y2: number) => void;
 }) {
+  const { t } = useTranslation();
   const vp = useViewport();
   // 最新の zoom を ref で保持 (useEffect の stale closure 対策)
   const vpRef = useRef(vp);
@@ -1635,7 +1645,7 @@ function DragHandles({
         return (
           <div
             key={a.id}
-            title="ドラッグで移動 / クリックで選択 (四隅・四辺をドラッグでリサイズ)"
+            title={t("flow.anno.drag_move", "ドラッグで移動 / クリックで選択 (四隅・四辺をドラッグでリサイズ)")}
             onMouseDown={(e) => {
               e.stopPropagation();
               e.preventDefault();
@@ -1683,7 +1693,7 @@ function DragHandles({
         gripsFor(a).map((g) => (
           <div
             key={`${a.id}-${g.dir}`}
-            title="ドラッグでリサイズ"
+            title={t("flow.anno.drag_resize", "ドラッグでリサイズ")}
             onMouseDown={(e) => {
               e.stopPropagation();
               e.preventDefault();
@@ -1732,6 +1742,7 @@ function GpuAlertBox({
   nodes: FlowNode[];
   infraAlerts?: InfraAlert[];
 }) {
+  const { t } = useTranslation();
   const { colorScheme } = useMantineColorScheme();
   const isLight = colorScheme === "light";
   const gpu = useMemo(
@@ -1816,12 +1827,12 @@ function GpuAlertBox({
                 ? IconCpu
                 : IconServerOff;
           const head = full
-            ? `ストレージ逼迫 · ${a.name}`
+            ? `${t("flow.alert.storage_tight", "ストレージ逼迫")} · ${a.name}`
             : a.kind === "faiss"
-              ? `顔検索 (FAISS) · ${a.name}`
+              ? `${t("flow.alert.faiss", "顔検索 (FAISS)")} · ${a.name}`
               : a.kind === "gpu"
-                ? `GPU センサー無応答 · ${a.name}`
-                : `ストレージ停止 · ${a.name}`;
+                ? `${t("flow.alert.gpu_sensor", "GPU センサー無応答")} · ${a.name}`
+                : `${t("flow.alert.storage_down", "ストレージ停止")} · ${a.name}`;
           return (
             <div key={`infra-${a.name}`} style={{ fontSize: 12, lineHeight: 1.35 }}>
               <div style={{ fontWeight: 700, display: "flex", alignItems: "center", gap: 5 }}>
@@ -1839,7 +1850,7 @@ function GpuAlertBox({
                   wordBreak: "break-word",
                 }}
               >
-                {String(a.detail ?? a.error ?? "到達できません").slice(0, 160)}
+                {String(a.detail ?? a.error ?? t("flow.alert.unreachable", "到達できません")).slice(0, 160)}
               </div>
             </div>
           );
@@ -1870,7 +1881,7 @@ function GpuAlertBox({
             <div style={{ fontWeight: 700, display: "flex", alignItems: "center", gap: 5 }}>
               <IconClockExclamation size={14} style={{ flexShrink: 0 }} />
               <span>
-                ハング検知/復旧 · {a.label}
+                {t("flow.alert.hang", "ハング検知/復旧")} · {a.label}
                 {a.error_worker ? ` · ${a.error_worker}` : ""}
               </span>
             </div>
@@ -2430,7 +2441,11 @@ export default function Flow() {
         selectedColor={annos.find((a) => a.id === selAnno)?.color ?? null}
         annoFontSize={annoFontSize}
         setAnnoFontSize={setAnnoFontSize}
-        onClear={() => { if (window.confirm('加筆を全て消去しますか?')) { setAnnos([]); setSelAnno(null); pushAnnos([]); } }}
+        onClear={() => {
+          if (window.confirm(t("flow.anno.clear_confirm", '加筆を全て消去しますか?'))) {
+            setAnnos([]); setSelAnno(null); pushAnnos([]);
+          }
+        }}
         isLight={isLight}
       />
       <Modal
@@ -2516,7 +2531,7 @@ export default function Flow() {
             fontFamily: 'inherit',
             pointerEvents: 'all',
           }}
-          placeholder="Enter で確定 / Esc でキャンセル"
+          placeholder={t("flow.anno.text_placeholder", "Enter で確定 / Esc でキャンセル")}
         />
       )}
     </Box>

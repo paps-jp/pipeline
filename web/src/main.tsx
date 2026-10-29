@@ -9,7 +9,7 @@ import { BrowserRouter } from "react-router-dom";
 import "@mantine/core/styles.css";
 import "@mantine/notifications/styles.css";
 import "./styles.css";
-import "./i18n";
+import i18n from "./i18n";
 
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -28,7 +28,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <ColorSchemeScript defaultColorScheme="auto" />
     <MantineProvider defaultColorScheme="auto" theme={theme}>
-      <ModalsProvider labels={{ confirm: "実行", cancel: "キャンセル" }}>
+      <ModalsProvider
+        labels={{ confirm: i18n.t("common.execute", "実行"), cancel: i18n.t("common.cancel", "キャンセル") }}
+      >
         <Notifications position="top-right" />
         <QueryClientProvider client={queryClient}>
           <BrowserRouter>

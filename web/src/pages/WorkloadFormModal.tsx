@@ -20,6 +20,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { fieldGroup, fieldHelp, fieldLabel, manifestDescription } from "@/lib/manifestI18n";
+
 import {
   ApiError,
   AvailablePlugin,
@@ -103,7 +105,7 @@ const DEFAULT_VALUES: FormValues = {
 };
 
 export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const qc = useQueryClient();
   const isEdit = !!editing;
   // python_module の dropdown 選択: ローカル plugins/ から source_path + module
@@ -155,17 +157,18 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
     const fields = selectedPlugin?.manifest?.init_kwargs ?? [];
     const grouped = new Map<string, PluginKwargField[]>();
     for (const f of fields) {
-      if (!f.group) continue;
-      grouped.set(f.group, [...(grouped.get(f.group) ?? []), f]);
+      const g = fieldGroup(f);
+      if (!g) continue;
+      grouped.set(g, [...(grouped.get(g) ?? []), f]);
     }
-    return { ungrouped: fields.filter((f) => !f.group), grouped: [...grouped] };
-  }, [selectedPlugin]);
+    return { ungrouped: fields.filter((f) => !fieldGroup(f)), grouped: [...grouped] };
+  }, [selectedPlugin, i18n.language]);
 
   const renderKwargField = (f: PluginKwargField) => {
     const v = initKwargs[f.key];
     const common = {
-      label: f.label || f.key,
-      description: f.help,
+      label: fieldLabel(f),
+      description: fieldHelp(f),
       required: f.required,
     };
     switch (f.type) {
@@ -428,7 +431,7 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
                 }
                 data={availablePlugins.map((p) => ({
                   value: p.path,
-                  label: `${p.slug}${p.has_requirements ? " (= requirements.txt あり)" : ""}`,
+                  label: `${p.slug}${p.has_requirements ? t("workloads.create.plugin_has_requirements", " (= requirements.txt あり)") : ""}`,
                 }))}
                 // workload に保存されてる source_path が control plane の path と
                 // 違っていても (e.g. worker side /opt/pipeline/... vs control side
@@ -460,10 +463,10 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
                 <>
                   {selectedPlugin.manifest.description && (
                     <Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
-                      {selectedPlugin.manifest.description}
+                      {manifestDescription(selectedPlugin.manifest)}
                     </Text>
                   )}
-                  <Text size="sm" fw={500}>プラグイン設定</Text>
+                  <Text size="sm" fw={500}>{t("workloads.create.plugin_settings", "プラグイン設定")}</Text>
                   {kwargSections.ungrouped.map(renderKwargField)}
                   {kwargSections.grouped.map(([group, fields]) => (
                     <Fieldset key={group} legend={group} variant="filled">
@@ -473,7 +476,7 @@ export default function WorkloadFormModal({ opened, onClose, editing }: Props) {
                   <Accordion variant="separated">
                     <Accordion.Item value="raw">
                       <Accordion.Control>
-                        <Text size="xs">詳細 (= raw JSON / hidden_kwargs を直接編集)</Text>
+                        <Text size="xs">{t("workloads.create.raw_detail", "詳細 (= raw JSON / hidden_kwargs を直接編集)")}</Text>
                       </Accordion.Control>
                       <Accordion.Panel>
                         <JsonInput

@@ -31,6 +31,9 @@ class PluginKwargField(BaseModel):
     default: Any | None = None
     label: str | None = None
     help: str | None = None
+    # 英語版 (= UI の言語切替が en のとき優先される)。 未指定なら日本語にフォールバック。
+    label_en: str | None = None
+    help_en: str | None = None
     min: float | None = None
     max: float | None = None
     options: list[Any] | None = None
@@ -38,11 +41,13 @@ class PluginKwargField(BaseModel):
     # UI のセクション名。 設定項目が数十個ある plugin (= supervisor) を
     # サブシステム単位に畳んで表示するために使う。 未指定なら「その他」扱い。
     group: str | None = None
+    group_en: str | None = None
 
 
 class PluginManifest(BaseModel):
     name: str | None = None
     description: str | None = None
+    description_en: str | None = None
     init_kwargs: list[PluginKwargField] = []
     hidden_kwargs: list[str] = []
     ui_panel: bool = False
@@ -118,6 +123,7 @@ def _load_manifest(plugin_dir: Path) -> PluginManifest | None:
     return PluginManifest(
         name=data.get("name"),
         description=data.get("description"),
+        description_en=data.get("description_en"),
         init_kwargs=[PluginKwargField(**k) for k in (data.get("init_kwargs") or [])],
         hidden_kwargs=list(data.get("hidden_kwargs") or []),
         ui_panel=bool(data.get("ui_panel", False)),

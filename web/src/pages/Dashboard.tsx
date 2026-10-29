@@ -177,8 +177,9 @@ function MetricSparkline({
   colorOf?: (last: number) => string;
   gradientId: string;
 }) {
+  const { t } = useTranslation();
   if (points.length < 2) {
-    return <Text size="xs" c="dimmed">(データ収集中…)</Text>;
+    return <Text size="xs" c="dimmed">{t("dashboard.collecting", "(データ収集中…)")}</Text>;
   }
   const W = 280, H = 56, PAD = 4;
   const vals = points.map(accessor).filter((v): v is number => typeof v === "number");
@@ -262,6 +263,7 @@ function relativeAge(iso: string): string {
 // ---- パネル: 稼働中ワーカー -------------------------------------------------------
 
 function RunningPanel() {
+  const { t } = useTranslation();
   const q = useQuery({
     queryKey: ["workers-list"],
     queryFn: api.listWorkers,
@@ -309,24 +311,24 @@ function RunningPanel() {
             ) : (
               <span className="paprika-status-dot" style={{ background: "var(--mantine-color-dimmed)" }} />
             )}
-            <Text fw={700} size="sm" tt="uppercase" c="dimmed" style={{ letterSpacing: 0.6 }}>稼働ワーカー</Text>
+            <Text fw={700} size="sm" tt="uppercase" c="dimmed" style={{ letterSpacing: 0.6 }}>{t("dashboard.panel_running", "稼働ワーカー")}</Text>
           </Group>
-          <Text size="xs" c="dimmed">3s 更新</Text>
+          <Text size="xs" c="dimmed">{t("dashboard.refresh_3s", "3s 更新")}</Text>
         </Group>
         <Group align="baseline" gap={6}>
           <Text fw={800} c={live ? "indigo" : "dimmed"} style={{ fontSize: 44, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>
             {q.isLoading ? "—" : active.length}
           </Text>
-          <Text size="sm" c="dimmed" fw={500}>台</Text>
+          <Text size="sm" c="dimmed" fw={500}>{t("dashboard.unit_workers", "台")}</Text>
           {idle.length > 0 && (
             <Text size="xs" c="dimmed" style={{ alignSelf: "flex-end", paddingBottom: 4 }}>
-              / 待機 {idle.length}台
+              {t("dashboard.idle_count", { defaultValue: "/ 待機 {{n}}台", n: idle.length })}
             </Text>
           )}
         </Group>
         {q.error && <ErrorState error={q.error} onRetry={() => q.refetch()} />}
         {!q.error && active.length === 0 && !q.isLoading && (
-          <Text size="xs" c="dimmed">稼働中のワーカーはいません。</Text>
+          <Text size="xs" c="dimmed">{t("dashboard.no_running_workers", "稼働中のワーカーはいません。")}</Text>
         )}
         {active.length > 0 && (
           <Stack gap={6} mt={4} className="paprika-divided-rows">
@@ -340,13 +342,13 @@ function RunningPanel() {
                     {ws.map((w) => w.id).join(", ")}
                   </Text>
                   <Badge size="sm" color="indigo" variant="outline" style={{ fontVariantNumeric: "tabular-nums" }}>
-                    {ws.length}台
+                    {t("dashboard.n_workers", { defaultValue: "{{n}}台", n: ws.length })}
                   </Badge>
                 </Group>
               </Group>
             ))}
             {rows.length > RUNNING_PANEL_ROWS && (
-              <Text size="xs" c="dimmed">…他 {rows.length - RUNNING_PANEL_ROWS} workload</Text>
+              <Text size="xs" c="dimmed">{t("dashboard.more_workloads", { defaultValue: "…他 {{n}} workload", n: rows.length - RUNNING_PANEL_ROWS })}</Text>
             )}
           </Stack>
         )}
@@ -358,6 +360,7 @@ function RunningPanel() {
 // ---- パネル: 最近の失敗 ---------------------------------------------------
 
 function RecentFailuresPanel() {
+  const { t } = useTranslation();
   const q = useQuery({
     queryKey: ["dashboard-overview"],
     queryFn: api.dashboardOverview,
@@ -402,18 +405,18 @@ function RecentFailuresPanel() {
                   : "var(--mantine-color-green-6)",
               }}
             />
-            <Text fw={700} size="sm" tt="uppercase" c="dimmed" style={{ letterSpacing: 0.6 }}>最近の失敗</Text>
+            <Text fw={700} size="sm" tt="uppercase" c="dimmed" style={{ letterSpacing: 0.6 }}>{t("dashboard.panel_failures", "最近の失敗")}</Text>
           </Group>
-          <Text size="xs" c="dimmed">直近 10 件</Text>
+          <Text size="xs" c="dimmed">{t("dashboard.last_10", "直近 10 件")}</Text>
         </Group>
         <Group align="baseline" gap={6}>
           <Text fw={800} c={bad ? "red" : "green"} style={{ fontSize: 44, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>
             {q.isLoading ? "—" : count}
           </Text>
-          <Text size="sm" c="dimmed" fw={500}>件</Text>
+          <Text size="sm" c="dimmed" fw={500}>{t("dashboard.unit_items", "件")}</Text>
         </Group>
         {!bad && !q.isLoading && (
-          <Text size="xs" c="dimmed">直近 run に failure 無し。順調です。</Text>
+          <Text size="xs" c="dimmed">{t("dashboard.no_failures", "直近 run に failure 無し。順調です。")}</Text>
         )}
         {bad && (
           <Stack gap={8} mt={4} className="paprika-divided-rows">
@@ -426,7 +429,7 @@ function RecentFailuresPanel() {
                     </Badge>
                     <Code style={{ fontSize: 11, ...ELLIPSIS }}>{f.pk}</Code>
                   </Group>
-                  <Text size="xs" c="dimmed" style={{ flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{relativeAge(f.started_at)} 前</Text>
+                  <Text size="xs" c="dimmed" style={{ flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{t("dashboard.ago", { defaultValue: "{{age}} 前", age: relativeAge(f.started_at) })}</Text>
                 </Group>
                 {f.reason && (
                   <Text size="xs" c="red" lineClamp={1} className="paprika-fail-reason">{f.reason}</Text>
@@ -443,6 +446,7 @@ function RecentFailuresPanel() {
 // ---- パネル: キュー深さ ---------------------------------------------------
 
 function QueueDepthsPanel() {
+  const { t } = useTranslation();
   const q = useQuery({
     queryKey: ["dashboard-overview"],
     queryFn: api.dashboardOverview,
@@ -479,7 +483,7 @@ function QueueDepthsPanel() {
                   : "var(--mantine-color-dimmed)",
               }}
             />
-            <Text fw={700} size="sm" tt="uppercase" c="dimmed" style={{ letterSpacing: 0.6 }}>キュー深さ</Text>
+            <Text fw={700} size="sm" tt="uppercase" c="dimmed" style={{ letterSpacing: 0.6 }}>{t("dashboard.panel_queue", "キュー深さ")}</Text>
           </Group>
           <Text size="xs" c="dimmed">{depths.length} workload</Text>
         </Group>
@@ -495,7 +499,7 @@ function QueueDepthsPanel() {
           )}
         </Group>
         {depths.length === 0 && !q.isLoading && (
-          <Text size="xs" c="dimmed">enable な workload がありません。</Text>
+          <Text size="xs" c="dimmed">{t("dashboard.no_enabled_workloads", "enable な workload がありません。")}</Text>
         )}
         {depths.length > 0 && (
           <Stack gap={6} mt={4}>
@@ -514,7 +518,7 @@ function QueueDepthsPanel() {
                       {claimed > 0 && <Badge size="xs" color="yellow" variant="light">{claimed}</Badge>}
                       {failed > 0 && <Badge size="xs" color="red" variant="light">{failed}</Badge>}
                       {total === 0 && (
-                        <Text size="xs" c="dimmed">空</Text>
+                        <Text size="xs" c="dimmed">{t("dashboard.empty_queue", "空")}</Text>
                       )}
                     </Group>
                   </Group>
@@ -544,6 +548,7 @@ function GpuHostCard({
   workerIds: string[];
   gpus: Record<string, GpuPoint[]>;
 }) {
+  const { t } = useTranslation();
   const latestTemps: number[] = [];
   const latestUtils: number[] = [];
   for (const points of Object.values(gpus)) {
@@ -585,12 +590,12 @@ function GpuHostCard({
               <Badge size="xs" variant="dot" color="indigo">GPU {gpuIdx}</Badge>
               <Text size="10px" c="dimmed">{points.length} samples</Text>
             </Group>
-            <MetricSparkline points={points} label="温度" unit="℃"
+            <MetricSparkline points={points} label={t("dashboard.gpu_temp", "温度")} unit="℃"
               gradientId={`g-${baseHost}-${gpuIdx}-temp`}
               accessor={(p) => p.temp_c}
               scaleMin={30} scaleMax={80}
               colorOf={(t) => (t >= 75 ? "#ef4444" : t >= 65 ? "#f59e0b" : "#10b981")} />
-            <MetricSparkline points={points} label="電力" unit="W"
+            <MetricSparkline points={points} label={t("dashboard.gpu_power", "電力")} unit="W"
               gradientId={`g-${baseHost}-${gpuIdx}-pow`}
               accessor={(p) => {
                 // hardware sensor / driver bug 除外: 物理上限 (= 民生最高 RTX4090=450W,
@@ -599,7 +604,7 @@ function GpuHostCard({
                 return p.power_w !== null && p.power_w > 500 ? null : p.power_w;
               }}
               colorOf={() => "#f59e0b"} />
-            <MetricSparkline points={points} label="GPU 使用率" unit="%"
+            <MetricSparkline points={points} label={t("dashboard.gpu_util", "GPU 使用率")} unit="%"
               gradientId={`g-${baseHost}-${gpuIdx}-util`}
               accessor={(p) => p.util_pct}
               scaleMin={0} scaleMax={100}
@@ -611,7 +616,7 @@ function GpuHostCard({
               scaleMax={Math.max(0, ...points.map((p) => p.mem_total_mb ?? 0)) || undefined}
               fmt={(v) => (v / 1024).toFixed(1)}
               colorOf={() => "#8b5cf6"} />
-            <MetricSparkline points={points} label="Mem 帯域" unit="%"
+            <MetricSparkline points={points} label={t("dashboard.gpu_membw", "Mem 帯域")} unit="%"
               gradientId={`g-${baseHost}-${gpuIdx}-mbw`}
               accessor={(p) => p.mem_util_pct}
               scaleMin={0} scaleMax={100}
@@ -682,10 +687,13 @@ export default function Dashboard() {
             <Group gap={8} align="center">
               <IconListNumbers size={18} stroke={1.6} color="var(--mantine-color-indigo-6)" />
               <Text fw={700} size="md">
-                GPU メトリクス
+                {t("dashboard.gpu_metrics", "GPU メトリクス")}
               </Text>
               <Text size="xs" c="dimmed">
-                過去 {metrics?.since_minutes ?? 30} 分 · 10s 更新
+                {t("dashboard.gpu_metrics_window", {
+                  defaultValue: "過去 {{n}} 分 · 10s 更新",
+                  n: metrics?.since_minutes ?? 30,
+                })}
               </Text>
             </Group>
             <Badge variant="light" color="indigo">{hostGroups.length} hosts</Badge>
