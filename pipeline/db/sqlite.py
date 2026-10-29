@@ -69,6 +69,12 @@ class SqliteDatabase(Database):
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = NORMAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
+        # 別プロセス (pipeline-db-cleanup 等) が chunk DELETE で書き込みロックを
+        # 握っている間、 この接続の書き込みは待たずに即 database is locked に
+        # なっていた (2026-09-05 実測、 heartbeat/claim/finish が 500 連発)。
+        # 数秒待ってリトライさせることで、 sync ハンドラは Starlette の
+        # threadpool 内でのみブロックし event loop は止めない。
+        self._conn.execute("PRAGMA busy_timeout = 5000")
 
     def ensure_schema(self) -> None:
         for ddl in ALL_DDL:
