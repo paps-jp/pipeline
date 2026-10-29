@@ -175,7 +175,8 @@ def test_cache_expires(im, monkeypatch):
 
 def test_thumbnail_generation_is_gated():
     """送らないものを作らない。 19.8ms/枚 がワーカ側で丸ごと浮く。"""
-    assert "_make_thumb(tmp_path) if make_thumb else None" in SRC
+    assert "_want_thumb = make_thumb and (thumb_admit is None or thumb_admit())" in SRC
+    assert "_make_thumb(tmp_path) if _want_thumb else None" in SRC
 
 
 def test_gate_is_evaluated_once_per_tick_not_per_asset():
@@ -232,22 +233,30 @@ def test_worker_thread_is_daemon_and_named():
 
 # ============================================ 4. レート制限 ==============
 
+# 2026-09-02 にレート制限は _thumb_submit (生成の後) から _thumb_admission
+# (生成の手前) へ移った。 作ってから捨てると _make_thumb の CPU が無駄になるため。
+
 def test_rate_limit_drops_the_excess(im):
     st = _queued_state(thumb_max_per_s=1.0)
-    assert im._thumb_submit(st, 1, b"a") == "queued"
-    assert im._thumb_submit(st, 2, b"b") == "dropped", "1 秒に 1 枚を超えている"
+    admit = im._thumb_admission(st)
+    assert admit() is True
+    assert admit() is False, "1 秒に 1 枚を超えている"
+    assert st["_thumb_skipped"] == 1
 
 
 def test_rate_limit_disabled_by_zero(im):
     st = _queued_state(thumb_max_per_s=0.0)
-    assert [im._thumb_submit(st, i, b"a") for i in range(3)] == ["queued"] * 3
+    admit = im._thumb_admission(st)
+    assert [admit() for _ in range(3)] == [True] * 3
 
 
-def test_rate_limit_applies_before_the_queue(im):
-    """間引いたぶんはキューに積まない (積むと非同期側が無駄に働く)。"""
+def test_rate_limit_applies_before_generation(im):
+    """間引きは生成の手前。 _thumb_submit は来たものをそのまま積む。"""
     st = _queued_state(thumb_max_per_s=1.0)
-    im._thumb_submit(st, 1, b"a")
-    im._thumb_submit(st, 2, b"b")
+    admit = im._thumb_admission(st)
+    for i in range(2):
+        if admit():
+            im._thumb_submit(st, i, b"a")
     assert st["thumb_queue"].qsize() == 1
 
 
