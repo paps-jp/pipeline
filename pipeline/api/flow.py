@@ -926,9 +926,13 @@ def _tank_query(to_query: dict[str, str],
         try:
             conn = connect(cfg)
             cur = conn.cursor()
-            # クエリタイムアウトをセッションで設定 (MariaDB max_statement_time = ms)
+            # クエリタイムアウトをセッションで設定。 MariaDB の max_statement_time は**秒**。
+            # 2026-10-29 まで ms のまま渡しており (120000 = 33 時間)、 driver の read_timeout
+            # で client だけ諦めた COUNT(*) FROM crawl_person が server で 30 分超走り続け、
+            # 2 分毎に 1 本ずつ積み上がっていた (crawl への ALTER の MDL も取れなかった)。
             try:
-                cur.execute(f"SET SESSION max_statement_time={_STMT_TIMEOUT_MS}")
+                cur.execute(
+                    f"SET SESSION max_statement_time={_STMT_TIMEOUT_MS / 1000:g}")
             except Exception:
                 pass  # 古い MariaDB / 権限なし でも続行
             cur.execute(sql)
@@ -943,6 +947,11 @@ def _tank_query(to_query: dict[str, str],
         except Exception as e:
             msg = f"{type(e).__name__}: {str(e)[:80]}"
             results[tid] = (None, msg)
+            # 失敗も TTL の間は覚えておく (前回値は残す)。 cache に何も書かないと
+            # 重い tank は snapshot の度に即再実行され、 timeout する COUNT が連打になる。
+            with _tank_cache_lock:
+                prev = _tank_cache.get(tid)
+                _tank_cache[tid] = (now, prev[1] if prev else None, msg)
         finally:
             if conn is not None:
                 try:
