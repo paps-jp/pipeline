@@ -171,35 +171,116 @@
   body.image-mode .tabs { display: none; }
   body.image-mode #tab-live { display: none !important; }
   body.image-mode #tab-recent { display: block !important; }
+
+  /* サンプル取得ボタン (水質検査): image モード時のみ表示 */
+  .sample-bar {
+    display: none;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+  }
+  body.image-mode .sample-bar { display: flex; }
+  .sample-btn {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .sample-btn:hover { opacity: 0.85; }
+  .sample-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .sample-status { color: var(--muted); font-size: 0.85rem; }
+  .sample-status .cnt { color: var(--fg); font-weight: 600; }
+  .sample-status .cd { color: var(--accent); font-weight: 600; margin-left: 8px; }
 </style>
 </head>
 <body>
 
 <div class="statusbar">
   <span class="status-dot idle" id="status-dot"></span>
-  <span id="status-text">接続中…</span>
+  <span id="status-text" data-i18n="connecting">接続中…</span>
   <span class="badge" id="worker-count">— workers</span>
   <span class="updated-at" id="updated-at">—</span>
 </div>
 
+<div class="sample-bar">
+  <button class="sample-btn" id="sample-btn" type="button" data-i18n="sample_btn">サンプル取得 (10秒)</button>
+  <span class="sample-status" id="sample-status">
+    <span data-i18n="stopped">停止中</span>
+    <span class="cnt" id="sample-count"></span>
+    <span class="cd" id="sample-countdown"></span>
+  </span>
+</div>
+
 <div class="tabs">
-  <button class="tab active" data-tab="live">稼働中ワーカー</button>
-  <button class="tab" data-tab="recent">最近の処理</button>
+  <button class="tab active" data-tab="live" data-i18n="tab_live">稼働中ワーカー</button>
+  <button class="tab" data-tab="recent" data-i18n="tab_recent">最近の処理</button>
 </div>
 
 <div class="tab-content active" id="tab-live">
   <div class="worker-grid" id="worker-grid">
-    <div class="empty-state">処理待機中</div>
+    <div class="empty-state" data-i18n="waiting">処理待機中</div>
   </div>
 </div>
 
 <div class="tab-content" id="tab-recent">
   <ul class="recent" id="recent-list">
-    <li><span class="info">読み込み中…</span></li>
+    <li><span class="info" data-i18n="loading">読み込み中…</span></li>
   </ul>
 </div>
 
 <script>
+// ── i18n ────────────────────────────────────────────────
+// 親 UI (React) が localStorage に置く i18nextLng をそのまま尊重する
+// (= 同一オリジンの iframe なので読める)。 無ければブラウザ設定 → ja。
+const STRINGS = {
+  ja: {
+    connecting: "接続中…", sample_btn: "サンプル取得 (10秒)", stopped: "停止中",
+    tab_live: "稼働中ワーカー", tab_recent: "最近の処理", waiting: "処理待機中",
+    loading: "読み込み中…", no_image: "画像なし", idle: "アイドル", live: "ライブ",
+    live_n: "ライブ ({n} workers)", all_stale: "全 stale", in_progress: "進行中",
+    no_history: "まだ履歴がありません", rel_now: "たった今",
+    rel_s: "{n}s 前", rel_m: "{n}m 前", rel_h: "{n}h 前",
+    sample_n: "{n} サンプル", sample_zero: "サンプル 0", sampled_n: "取得済 {n} 件",
+    sampling: "サンプル取得中 (残り {n}s)", sample_done: "取得完了 (待機中)", idle_wait: "待機中",
+    fetching: "取得中…", remaining: "残り {n}s", sample_btn_n: "サンプル取得 ({n}秒)",
+    starting: "開始中…", sample_retry: "サンプル取得 (再試行)", failed: "失敗: {msg}",
+    connect_failed: "接続失敗: {msg}"
+  },
+  en: {
+    connecting: "Connecting…", sample_btn: "Take a sample (10s)", stopped: "Stopped",
+    tab_live: "Running workers", tab_recent: "Recent activity", waiting: "Waiting for work",
+    loading: "Loading…", no_image: "No image", idle: "Idle", live: "live",
+    live_n: "live ({n} workers)", all_stale: "all stale", in_progress: "in progress",
+    no_history: "No history yet", rel_now: "just now",
+    rel_s: "{n}s ago", rel_m: "{n}m ago", rel_h: "{n}h ago",
+    sample_n: "{n} samples", sample_zero: "0 samples", sampled_n: "{n} captured",
+    sampling: "Sampling ({n}s left)", sample_done: "Done (idle)", idle_wait: "Idle",
+    fetching: "Sampling…", remaining: "{n}s left", sample_btn_n: "Take a sample ({n}s)",
+    starting: "Starting…", sample_retry: "Take a sample (retry)", failed: "Failed: {msg}",
+    connect_failed: "Connection failed: {msg}"
+  }
+};
+const LANG = (() => {
+  let v = "";
+  try { v = localStorage.getItem("i18nextLng") || ""; } catch (e) { /* private mode */ }
+  if (!v) v = navigator.language || "ja";
+  return String(v).toLowerCase().startsWith("en") ? "en" : "ja";
+})();
+function t(key, vars) {
+  const tpl = (STRINGS[LANG] && STRINGS[LANG][key]) || STRINGS.ja[key] || key;
+  return vars ? tpl.replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? vars[k] : m)) : tpl;
+}
+document.documentElement.lang = LANG;
+document.querySelectorAll("[data-i18n]").forEach((el) => {
+  el.textContent = t(el.dataset.i18n);
+});
 const SLUG = (() => {
   const m = location.pathname.match(/\/api\/v1\/plugins\/([^/]+)\/web\//);
   return m ? m[1] : "";
@@ -209,8 +290,8 @@ const MODE = new URLSearchParams(location.search).get("mode") || "video";
 if (MODE === "image") {
   document.body.classList.add("image-mode");
   // 「最近処理した」タブを「最近の処理」にラベル変更
-  const t = document.querySelector('.tab[data-tab="recent"]');
-  if (t) t.textContent = "最近の処理";
+  const el = document.querySelector('.tab[data-tab="recent"]');
+  if (el) el.textContent = t("tab_recent");
 }
 
 const renderState = {
@@ -222,10 +303,10 @@ function fmtRel(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
   const s = Math.floor((Date.now() - d.getTime()) / 1000);
-  if (s < 5) return "たった今";
-  if (s < 60) return s + "s 前";
-  if (s < 3600) return Math.floor(s / 60) + "m 前";
-  return Math.floor(s / 3600) + "h 前";
+  if (s < 5) return t("rel_now");
+  if (s < 60) return t("rel_s", { n: s });
+  if (s < 3600) return t("rel_m", { n: Math.floor(s / 60) });
+  return t("rel_h", { n: Math.floor(s / 3600) });
 }
 
 function setStatus(live, text) {
@@ -270,7 +351,7 @@ function buildTile(wid) {
       </span>
     </div>
     <div class="worker-tile-frame">
-      <span class="no-image">画像なし</span>
+      <span class="no-image">${t("no_image")}</span>
     </div>
     <div class="worker-tile-label"></div>
     <div class="worker-tile-meta"></div>
@@ -327,10 +408,10 @@ function renderPreviews(items) {
     if (!grid.querySelector(".empty-state")) {
       const ph = document.createElement("div");
       ph.className = "empty-state";
-      ph.textContent = "処理待機中";
+      ph.textContent = t("waiting");
       grid.appendChild(ph);
     }
-    setStatus(false, "アイドル");
+    setStatus(false, t("idle"));
     return;
   }
 
@@ -371,18 +452,18 @@ function renderPreviews(items) {
       }
       tile.lastFrameUpdatedAt = entry.updated_at;
     } else if (!v.image_blob_key && tile.imgEl) {
-      tile.frameEl.innerHTML = '<span class="no-image">画像なし</span>';
+      tile.frameEl.innerHTML = `<span class="no-image">${t("no_image")}</span>`;
       tile.imgEl = null;
       tile.lastFrameUpdatedAt = "";
     }
 
     tile.dotEl.classList.toggle("live", live);
     tile.dotEl.classList.toggle("idle", !live);
-    tile.statusTextEl.textContent = live ? "ライブ" : "stale";
+    tile.statusTextEl.textContent = live ? t("live") : "stale";
     tile.labelEl.textContent = v.label || v.pk || "—";
     renderMeta(tile.metaEl, v.meta);
   });
-  setStatus(anyLive, anyLive ? `ライブ (${ids.length} workers)` : "全 stale");
+  setStatus(anyLive, anyLive ? t("live_n", { n: ids.length }) : t("all_stale"));
 }
 
 function escapeHtml(s) {
@@ -394,7 +475,7 @@ function escapeHtml(s) {
 function recentItemHtml(r, opts = {}) {
   const { isLive = false } = opts;
   const v = r.value || {};
-  const status = isLive ? "進行中" : (v.status || "?");
+  const status = isLive ? t("in_progress") : (v.status || "?");
   const dur = v.duration_s != null ? `${v.duration_s.toFixed(1)}s` : "";
   const metaStr = v.meta && typeof v.meta === "object"
     ? Object.entries(v.meta)
@@ -417,7 +498,7 @@ function recentItemHtml(r, opts = {}) {
       if (key) {
         thumbs = `<div class="recent-thumb xlarge"><img src="/api/v1/plugins/${SLUG}/blob/${key}" loading="lazy" alt="" /></div>`;
       } else {
-        thumbs = '<div class="empty">画像なし</div>';
+        thumbs = `<div class="empty">${t("no_image")}</div>`;
       }
     }
   } else if (Array.isArray(v.thumb_keys) && v.thumb_keys.length > 0) {
@@ -427,7 +508,7 @@ function recentItemHtml(r, opts = {}) {
   } else if (v.image_blob_key) {
     thumbs = `<div class="recent-thumb large"><img src="/api/v1/plugins/${SLUG}/blob/${v.image_blob_key}" loading="lazy" alt="" /></div>`;
   } else {
-    thumbs = '<div class="empty">画像なし</div>';
+    thumbs = `<div class="empty">${t("no_image")}</div>`;
   }
   // page_url (任意): 表示は短縮、リンクはそのまま
   let pageUrlHtml = "";
@@ -458,9 +539,24 @@ function renderRecent(items) {
   const STALE_HIDE_MS = 60_000;
   const now = Date.now();
 
-  // image モード: worker/*/current を「進行中」エントリとして統合する
+  // image モード: サンプル窓で拾った sample/{host}/{seq} を新しい順に並べる。
+  //   window 期間中は追記され、 window 終了後も blob TTL (30分) までは残る。
+  // video モード: 従来どおり worker/*/current + recent/* を表示。
   const liveEntries = [];
+  const recent = [];
   if (MODE === "image") {
+    for (const [k, v] of Object.entries(items)) {
+      const m = k.match(/^sample\/(.+?)\/(\d+)$/);
+      if (!m) continue;
+      recent.push({
+        key: `${m[1]}/${m[2]}`,
+        value: v.value,
+        updated_at: v.updated_at,
+        isLive: false,
+      });
+    }
+    recent.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  } else {
     for (const [k, v] of Object.entries(items)) {
       const m = k.match(/^worker\/(.+)\/current$/);
       if (!m) continue;
@@ -473,23 +569,21 @@ function renderRecent(items) {
         isLive: true,
       });
     }
-    liveEntries.sort((a, b) =>
-      b.updated_at.localeCompare(a.updated_at)
-    );
+    liveEntries.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    for (const [k, v] of Object.entries(items)) {
+      const m = k.match(/^recent\/(.+)$/);
+      if (m) recent.push({ key: m[1], value: v.value, updated_at: v.updated_at, isLive: false });
+    }
+    recent.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
 
-  const recent = [];
-  for (const [k, v] of Object.entries(items)) {
-    const m = k.match(/^recent\/(.+)$/);
-    if (m) recent.push({ key: m[1], value: v.value, updated_at: v.updated_at, isLive: false });
-  }
-  recent.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-
-  const combined = [...liveEntries, ...recent.slice(0, 20)];
+  const combined = MODE === "image"
+    ? recent.slice(0, 400)   // 2 workers × 100 cap × 若干余裕
+    : [...liveEntries, ...recent.slice(0, 20)];
 
   if (combined.length === 0) {
     if (list.dataset.empty !== "1") {
-      list.innerHTML = '<li><span class="info">まだ履歴がありません</span></li>';
+      list.innerHTML = `<li><span class="info">${t("no_history")}</span></li>`;
       list.dataset.empty = "1";
       renderState.recent.clear();
     }
@@ -537,20 +631,104 @@ function renderRecent(items) {
 }
 
 function updateLiveStatus(items) {
-  // image モードでも上部の active バッジ + ライブドット表示は必要
-  const STALE_HIDE_MS = 60_000;
-  const now = Date.now();
-  let active = 0, anyLive = false;
-  for (const [k, v] of Object.entries(items)) {
-    if (!k.match(/^worker\/(.+)\/current$/)) continue;
-    const ageMs = now - new Date(v.updated_at).getTime();
-    if (ageMs > STALE_HIDE_MS) continue;
-    active++;
-    if (ageMs < 15000) anyLive = true;
+  // image モード: sample/* の件数を「サンプル済 N 件」として表示。 平時 0 PUT なので
+  // 従来の worker/*/current 経路は使わない。
+  let count = 0;
+  for (const k of Object.keys(items)) {
+    if (k.match(/^sample\/.+\/\d+$/)) count++;
   }
   document.getElementById("worker-count").textContent =
-    active > 0 ? `${active} active` : "idle";
-  setStatus(anyLive, anyLive ? `ライブ (${active} workers)` : (active > 0 ? "全 stale" : "アイドル"));
+    count > 0 ? t("sample_n", { n: count }) : t("sample_zero");
+  document.getElementById("sample-count").textContent =
+    count > 0 ? t("sampled_n", { n: count }) : "";
+  const st = sampleState;
+  if (st.active) {
+    setStatus(true, t("sampling", { n: st.remaining.toFixed(0) }));
+  } else {
+    setStatus(false, count > 0 ? t("sample_done") : t("idle_wait"));
+  }
+}
+
+// ── サンプル取得 (水質検査) ────────────────────────────
+const SAMPLE_DURATION_S = 10;
+const sampleState = { active: false, remaining: 0, epoch: 0 };
+let sampleCountdownTimer = null;
+
+async function pollSampleActive() {
+  try {
+    const r = await fetch(`/api/v1/plugins/${SLUG}/sample_active`, { cache: "no-store" });
+    if (!r.ok) return;
+    const j = await r.json();
+    sampleState.active = !!j.active;
+    sampleState.remaining = Number(j.remaining_s) || 0;
+    sampleState.epoch = Number(j.epoch) || 0;
+    updateSampleUI();
+  } catch (e) { /* ignore */ }
+}
+
+function updateSampleUI() {
+  const btn = document.getElementById("sample-btn");
+  const cd = document.getElementById("sample-countdown");
+  if (!btn) return;
+  if (sampleState.active) {
+    btn.disabled = true;
+    btn.textContent = t("fetching");
+    cd.textContent = t("remaining", { n: sampleState.remaining.toFixed(0) });
+  } else {
+    btn.disabled = false;
+    btn.textContent = t("sample_btn_n", { n: SAMPLE_DURATION_S });
+    cd.textContent = "";
+  }
+}
+
+async function startSample() {
+  const btn = document.getElementById("sample-btn");
+  btn.disabled = true;
+  btn.textContent = t("starting");
+  try {
+    // 既存 sample/* を掃除してから窓を開く (前回残骸と混ざらない)
+    const st = await (await fetch(`/api/v1/plugins/${SLUG}/state`, { cache: "no-store" })).json();
+    const items = st.items || {};
+    const dels = [];
+    for (const k of Object.keys(items)) {
+      if (k.match(/^sample\/.+\/\d+$/)) dels.push(k);
+    }
+    await Promise.all(dels.map(k =>
+      fetch(`/api/v1/plugins/${SLUG}/state/${k}`, { method: "DELETE" })
+    ));
+    const r = await fetch(
+      `/api/v1/plugins/${SLUG}/sample?duration_s=${SAMPLE_DURATION_S}`,
+      { method: "POST" }
+    );
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    sampleState.active = true;
+    sampleState.remaining = Number(j.duration_s) || SAMPLE_DURATION_S;
+    sampleState.epoch = Number(j.epoch) || 0;
+    updateSampleUI();
+    if (sampleCountdownTimer) clearInterval(sampleCountdownTimer);
+    sampleCountdownTimer = setInterval(() => {
+      sampleState.remaining -= 1;
+      if (sampleState.remaining <= 0) {
+        sampleState.active = false;
+        sampleState.remaining = 0;
+        clearInterval(sampleCountdownTimer);
+        sampleCountdownTimer = null;
+      }
+      updateSampleUI();
+    }, 1000);
+    tick();  // 即座に 1 回追いポーリング
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = t("sample_retry");
+    document.getElementById("sample-countdown").textContent = t("failed", { msg: e.message });
+  }
+}
+
+if (MODE === "image") {
+  const btn = document.getElementById("sample-btn");
+  if (btn) btn.addEventListener("click", startSample);
+  pollSampleActive();
 }
 
 async function tick() {
@@ -566,19 +744,35 @@ async function tick() {
     document.getElementById("updated-at").textContent =
       new Date().toLocaleTimeString();
   } catch (e) {
-    setStatus(false, "接続失敗: " + e.message);
+    setStatus(false, t("connect_failed", { msg: e.message }));
   }
 }
 
 // Page Visibility: フォアグラウンドで開いてる間だけ polling する。
-// polling が worker plugin への「観察者いるよ」ハートビート = state/blob GET を
-// 送るタイミング。 タブ非表示 / 別タブ移動 / タブ close で polling を止めると、
-// サーバ側 TTL が切れて worker が live preview PUT を発火しなくなる (throughput 優先)。
+// image モードはサンプル取得中だけ短周期 (1s) に切り替え、 それ以外は長周期 (POLL_MS)。
 let pollTimer = null;
+let pollingFast = false;
+function pickInterval() {
+  if (MODE === "image" && sampleState.active) return 1000;
+  return POLL_MS;
+}
 function startPolling() {
   if (pollTimer) return;
   tick();
-  pollTimer = setInterval(tick, POLL_MS);
+  const iv = pickInterval();
+  pollingFast = (iv < POLL_MS);
+  pollTimer = setInterval(pollLoop, iv);
+}
+function pollLoop() {
+  tick();
+  // サンプル窓の開始/終了で周期を切り替える
+  const iv = pickInterval();
+  const wantFast = (iv < POLL_MS);
+  if (wantFast !== pollingFast) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    pollingFast = wantFast;
+    pollTimer = setInterval(pollLoop, iv);
+  }
 }
 function stopPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }

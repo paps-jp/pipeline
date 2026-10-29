@@ -40,6 +40,16 @@ router = APIRouter(prefix="/api/v1/plugins", tags=["plugin_runtime"])
 _OBSERVER_TTL_S = 60.0
 _observers: dict[str, float] = {}
 
+# ── sample window (水質検査ボタン) ────────────────────────────────
+# panel の「サンプル取得」ボタンでこの窓を開き、 worker はここが open の間だけ
+# per-image で `sample/{host}/{seq}` を PUT する。 平時 0 PUT で throughput を殺さず、
+# 押したときだけ流れをコップですくって検査する用途。
+# epoch は窓を開く度にインクリメントし、 worker は自分の seq counter を epoch 変化で
+# リセットする (= 前回の窓のカウンタが今回に持ち込まれない)。
+_SAMPLE_MAX_DURATION_S = 30.0
+_sample_windows: dict[str, float] = {}   # slug -> expire monotonic
+_sample_epoch: dict[str, int] = {}        # slug -> 単調 epoch (窓を開くたび +1)
+
 
 def _touch_observer(slug: str) -> None:
     """state/blob GET を受けたら呼ぶ。 slug は _canonical_slug 通過後を渡す。"""
@@ -233,6 +243,41 @@ def delete_blob(slug: str, key: str, request: Request) -> Response:
 
 
 # ---------------- presence check (live preview 発火判定) ----------------
+
+
+@router.post("/{slug}/sample")
+def start_sample(slug: str, duration_s: float = 10.0) -> dict[str, Any]:
+    """「サンプル取得」ボタン: `duration_s` 秒だけ worker plugin に「PUT していい」窓を開く。
+
+    - `duration_s` は 1〜30 秒で clamp。
+    - epoch を +1 して返す。 worker は epoch 変化を検知して自分の seq counter を 0 に戻す。
+    - 二重押しはただ窓を延長 + epoch 更新するだけ (= 新規サンプル取り直し)。
+    """
+    _check_slug(slug)
+    slug = _canonical_slug(slug)
+    d = min(max(1.0, float(duration_s)), _SAMPLE_MAX_DURATION_S)
+    _sample_windows[slug] = time.monotonic() + d
+    _sample_epoch[slug] = _sample_epoch.get(slug, 0) + 1
+    return {"active": True, "duration_s": d, "epoch": _sample_epoch[slug]}
+
+
+@router.get("/{slug}/sample_active")
+def sample_active(slug: str) -> dict[str, Any]:
+    """worker plugin が「今サンプル窓 open?」を照会する。
+
+    active=True の間だけ worker は per-image PUT を発火する。 平時 0 PUT で
+    throughput を守り、 押した瞬間だけ流れをすくって検査する。
+    """
+    _check_slug(slug)
+    slug = _canonical_slug(slug)
+    exp = _sample_windows.get(slug)
+    now = time.monotonic()
+    epoch = int(_sample_epoch.get(slug, 0))
+    if exp and now < exp:
+        return {"active": True, "remaining_s": round(exp - now, 1),
+                "epoch": epoch, "max_duration_s": _SAMPLE_MAX_DURATION_S}
+    return {"active": False, "remaining_s": 0.0,
+            "epoch": epoch, "max_duration_s": _SAMPLE_MAX_DURATION_S}
 
 
 @router.get("/{slug}/preview_active")
