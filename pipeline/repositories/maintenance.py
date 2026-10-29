@@ -64,14 +64,26 @@ class MaintenanceRepository:
     # ------------------------------------------------------------------ #
 
     def purge_plugin_runtime_blob(self, *, ttl_minutes: int = 30) -> int:
-        """ttl_minutes より古い blob キャッシュを削除する。"""
+        """ttl_minutes より古い blob キャッシュを削除する。
+
+        2026-08-25: 実体は RAM ディスク MinIO (`plugin_blob_store`) に移設済み。
+        SQLite 側の DELETE は旧データの掃き出し用に残す (新規行はもう増えない)。
+        MinIO 側の purge が失敗しても SQLite 側は独立して完了させる (どちらか
+        片方が落ちても他方の TTL 掃除を止めない)。
+        """
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)).isoformat()
         with self.db.transaction() as conn:
             cur = conn.execute(
                 "DELETE FROM plugin_runtime_blob WHERE updated_at < :cut",
                 {"cut": cutoff},
             )
-            return cur.rowcount or 0
+            n = cur.rowcount or 0
+        try:
+            from pipeline.storage import plugin_blob_store
+            n += plugin_blob_store.purge_older_than(ttl_minutes)
+        except Exception:
+            pass
+        return n
 
     # ------------------------------------------------------------------ #
     # plugin_runtime_state — TTL ベース (処理済み ID 等の state)

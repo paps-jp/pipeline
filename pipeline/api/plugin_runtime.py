@@ -6,7 +6,9 @@
 2. **blob**: バイナリ (画像 JPEG/PNG 等) を key で保存・取得 (スクショ等)
 3. **web**: plugins/<slug>/web/ 以下を静的配信 (panel.html, .js, .css)
 
-state/blob は control plane の SQLite に保存され、reaper で TTL 経過分を delete。
+state は control plane の SQLite に保存され、reaper で TTL 経過分を delete。
+blob は RAM ディスク MinIO (`pipeline.storage.plugin_blob_store`) に保存される
+(2026-08-25 に SQLite から移設。 経緯は同モジュールの docstring 参照)。
 プラグインは worker から HTTP POST で書き込み、 UI iframe が GET でポーリングする。
 """
 
@@ -22,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -172,7 +175,11 @@ MAX_BLOB_BYTES = 5 * 1024 * 1024  # 5 MB / blob
 
 @router.put("/{slug}/blob/{key:path}", status_code=204)
 async def upsert_blob(slug: str, key: str, request: Request) -> Response:
-    """raw binary body を key で保存。 Content-Type も保存。"""
+    """raw binary body を key で保存 (RAM ディスク MinIO)。 Content-Type も保存。
+
+    MinIO クライアントは同期なので threadpool へ逃がす。 event loop 上で直接呼ぶと
+    .48 不在時のリトライ待ちで :8001 全体が accept を止める (2026-09-19)。
+    """
     _check_slug(slug)
     _check_key(key)
     slug = _canonical_slug(slug)
@@ -180,22 +187,11 @@ async def upsert_blob(slug: str, key: str, request: Request) -> Response:
     if len(data) > MAX_BLOB_BYTES:
         raise HTTPException(413, detail=f"too large (max {MAX_BLOB_BYTES} bytes)")
     ct = request.headers.get("content-type", "application/octet-stream")
-    db = request.app.state.db
-    with db.transaction() as conn:
-        conn.execute(
-            """
-            INSERT INTO plugin_runtime_blob (slug, key, content_type, data, size_bytes, updated_at)
-            VALUES (:s, :k, :ct, :d, :sz, :u)
-            ON CONFLICT(slug, key) DO UPDATE SET
-                content_type = excluded.content_type,
-                data         = excluded.data,
-                size_bytes   = excluded.size_bytes,
-                updated_at   = excluded.updated_at
-            """,
-            {"s": slug, "k": key, "ct": ct, "d": data,
-             "sz": len(data),
-             "u": datetime.now(timezone.utc).isoformat()},
-        )
+    from pipeline.storage import plugin_blob_store
+    try:
+        await run_in_threadpool(plugin_blob_store.put, slug, key, data, ct)
+    except plugin_blob_store.BlobStoreUnavailable as e:
+        raise HTTPException(503, detail=str(e)) from e
     return Response(status_code=204)
 
 
@@ -205,22 +201,20 @@ def get_blob(slug: str, key: str, request: Request) -> Response:
     _check_key(key)
     slug = _canonical_slug(slug)
     _touch_observer(slug)
-    db = request.app.state.db
-    with db.transaction() as conn:
-        cur = conn.execute(
-            "SELECT content_type, data, updated_at FROM plugin_runtime_blob "
-            "WHERE slug = :s AND key = :k",
-            {"s": slug, "k": key},
-        )
-        row = cur.fetchone()
-    if not row:
+    from pipeline.storage import plugin_blob_store
+    try:
+        found = plugin_blob_store.get(slug, key)
+    except plugin_blob_store.BlobStoreUnavailable as e:
+        raise HTTPException(503, detail=str(e)) from e
+    if not found:
         raise HTTPException(404, detail="not found")
+    data, content_type, updated_at = found
     return Response(
-        content=row["data"],
-        media_type=row["content_type"],
+        content=data,
+        media_type=content_type,
         headers={
             "Cache-Control": "no-store",
-            "X-Updated-At": row["updated_at"],
+            "X-Updated-At": updated_at,
         },
     )
 
@@ -230,12 +224,11 @@ def delete_blob(slug: str, key: str, request: Request) -> Response:
     _check_slug(slug)
     _check_key(key)
     slug = _canonical_slug(slug)
-    db = request.app.state.db
-    with db.transaction() as conn:
-        conn.execute(
-            "DELETE FROM plugin_runtime_blob WHERE slug = :s AND key = :k",
-            {"s": slug, "k": key},
-        )
+    from pipeline.storage import plugin_blob_store
+    try:
+        plugin_blob_store.delete(slug, key)
+    except plugin_blob_store.BlobStoreUnavailable as e:
+        raise HTTPException(503, detail=str(e)) from e
     return Response(status_code=204)
 
 
