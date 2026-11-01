@@ -23,7 +23,7 @@ nodes:
   # 単調増加する総数タンク = バックログではない (停滞判定から除外)
   accumulator: true
   metric_ttl_s: 60
-  capacity_warn: 500000000
+  capacity_warn: 2000000000
 - id: paprika-job-submit
   kind: workload
   x: 310
