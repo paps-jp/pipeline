@@ -16,10 +16,13 @@ nodes:
   y: -432
   label: crawl (URL総数)
   icon: link
-  metric_sql: SELECT COUNT(*) FROM crawl
+  # COUNT(*) は 5.5億行で 289s かかり bg の max_statement_time (120s) で毎回 1969 になる
+  # (2026-11-01 実測)。 統計値の概算 (実数より約 5% 少ない) を 0ms で読む。
+  # MAX(id) は INSERT IGNORE が id を飛ばすので 70億になり使えない。
+  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'crawl'
   # 単調増加する総数タンク = バックログではない (停滞判定から除外)
   accumulator: true
-  metric_ttl_s: 900
+  metric_ttl_s: 60
   capacity_warn: 500000000
 - id: paprika-job-submit
   kind: workload
