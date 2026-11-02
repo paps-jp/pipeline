@@ -18,6 +18,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import re
 import ssl
 import threading
 import time
@@ -51,6 +52,31 @@ _TANK_BG_STMT_TIMEOUT_MS = 120000   # 2min — 1.8億行 COUNT(*) 用 (背景実
 # span が最低 3 分に満たない (= 起動直後・サンプル欠け) 間は None = 中立表示。
 _TANK_TREND_WINDOW_MIN = 10
 _TANK_TREND_MIN_SPAN_MIN = 3.0
+# 差分カウント tank (2026-11-02)。 億行級の総数タンクは全件 COUNT(*) が
+# max_statement_time に収まらず (crawl 5.5億行で 289s)、 TABLE_ROWS の概算は統計の
+# 取り直しで -17% まで飛ぶ。 yaml で `count_table: <表>` を宣言した tank は
+# MariaDB の flow_tank_counter に確定済みの件数を持ち、 増えた id だけを数えて足す。
+# 主キーが auto_increment の表専用 (後から小さい id が入る表では漏れる)。
+# 削除は数に反映されないので、 1 日 1 回だけ全件を数え直して補正する。
+_INCR_PREFIX = "__incr__:"
+_INCR_RECOUNT_INTERVAL_S = 86400
+_INCR_RECOUNT_RETRY_S = 3600.0        # 数え直しが失敗したら 1 時間は再試行しない
+_INCR_RECOUNT_STMT_TIMEOUT_S = 1800   # 全件 COUNT は背景で 1 本ずつ
+_INCR_DDL = (
+    "CREATE TABLE IF NOT EXISTS flow_tank_counter ("
+    " tank_id VARCHAR(64) NOT NULL PRIMARY KEY,"
+    " settled_id BIGINT UNSIGNED NOT NULL,"
+    " settled_count BIGINT NOT NULL,"
+    " seen_max_id BIGINT UNSIGNED NOT NULL,"
+    " recounted_at DATETIME NOT NULL,"
+    " recount_gen INT UNSIGNED NOT NULL DEFAULT 0,"
+    " updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)"
+)
+_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_incr_ddl_done = False
+_incr_recount_lock = threading.Lock()
+_incr_recount_inflight: set[str] = set()
+_incr_recount_failed_at: dict[str, float] = {}
 _tank_cache: dict[str, tuple[float, int | None, str | None]] = {}
 _tank_cache_lock = threading.Lock()
 _tank_refresh_inflight: set[str] = set()
@@ -878,6 +904,152 @@ def _tank_refresh_bg(to_query: dict[str, str]) -> None:
                 _tank_refresh_inflight.discard(tid)
 
 
+def _db_connector(stmt_timeout_ms: int):
+    """cfg → 接続 の関数を返す。 ドライバが無ければ None。"""
+    # ドライバ側の read_timeout は SQL の max_statement_time より少し長く取る
+    # (SQL 側で先に打ち切らせ、 ソケットを途中で切らない)。
+    read_to = int(stmt_timeout_ms / 1000) + 5
+    # mariadb (C wrapper) があれば優先、 無ければ pure-python pymysql。
+    try:
+        import mariadb  # type: ignore
+        return lambda c: mariadb.connect(**{**c, "read_timeout": read_to})
+    except ImportError:
+        pass
+    try:
+        import pymysql  # type: ignore
+    except ImportError:
+        return None
+    return lambda c: pymysql.connect(
+        host=c["host"], port=c["port"], user=c["user"],
+        password=c["password"], database=c["database"],
+        connect_timeout=c.get("connect_timeout", 3),
+        read_timeout=read_to, autocommit=True,
+    )
+
+
+def _tank_sql(n: dict[str, Any]) -> str | None:
+    """tank node の評価対象。 `count_table` 宣言は差分カウントの目印文字列にする。"""
+    if n.get("count_table"):
+        return f"{_INCR_PREFIX}{n['count_table']}:{n.get('count_key') or 'id'}"
+    return n.get("metric_sql")
+
+
+def _incr_count(conn: Any, tid: str, spec: str) -> int | None:
+    """差分カウント tank の現在値。 初回の全件集計が済むまでは None。
+
+    flow_tank_counter には「確定済みの最大 id (settled_id) までの件数」 と
+    「1 つ前の tick で見えた最大 id (seen_max_id)」 を持つ。 毎回は
+    (settled_id, seen_max_id] を数えて確定に足し、 それより上はその場で数えて
+    足すだけなので、 読むのは前回からの増分の行だけ。
+    """
+    global _incr_ddl_done
+    table, _, key = spec.partition(":")
+    if not (_IDENT_RE.match(table) and _IDENT_RE.match(key)):
+        raise ValueError(f"bad count_table: {spec}")
+    cur = conn.cursor()
+    try:
+        if not _incr_ddl_done:
+            cur.execute(_INCR_DDL)
+            _incr_ddl_done = True
+        cur.execute(
+            "SELECT settled_id, settled_count, seen_max_id,"
+            " TIMESTAMPDIFF(SECOND, recounted_at, NOW()), recount_gen"
+            " FROM flow_tank_counter WHERE tank_id = %s", (tid,))
+        row = cur.fetchone()
+        if row is None or row[3] is None or row[3] >= _INCR_RECOUNT_INTERVAL_S:
+            _start_recount(tid, table, key)
+        if row is None:
+            return None
+        settled_id, settled_count, seen_max_id = int(row[0]), int(row[1]), int(row[2])
+        gen = int(row[4])
+        cur.execute(f"SELECT MAX(`{key}`) FROM `{table}`")
+        r = cur.fetchone()
+        cur_max = int(r[0]) if r and r[0] is not None else 0
+        # 確定させるのは 1 つ前の tick で見えた最大 id まで。 id は INSERT 時に振られ
+        # コミットはその後なので、 たった今見えた最大 id まで確定させると、 その下で
+        # まだコミットされていない行を永久に数え漏らす (tick 間隔 = TTL 以上の猶予)。
+        new_settled = settled_id
+        if seen_max_id > settled_id:
+            cur.execute(
+                f"SELECT COUNT(*) FROM `{table}` WHERE `{key}` > %s AND `{key}` <= %s",
+                (settled_id, seen_max_id))
+            settled_count += int(cur.fetchone()[0])
+            new_settled = seen_max_id
+        # 全件数え直しが間で書き換えていたら上書きしない (recount_gen で楽観ロック)。
+        # settled_id では守れない: 数え直しが同じ hw を書くと一致してしまう。
+        cur.execute(
+            "UPDATE flow_tank_counter SET settled_id = %s, settled_count = %s,"
+            " seen_max_id = %s WHERE tank_id = %s AND recount_gen = %s",
+            (new_settled, settled_count, max(cur_max, new_settled), tid, gen))
+        conn.commit()
+        cur.execute(f"SELECT COUNT(*) FROM `{table}` WHERE `{key}` > %s", (new_settled,))
+        return settled_count + int(cur.fetchone()[0])
+    finally:
+        cur.close()
+
+
+def _start_recount(tid: str, table: str, key: str) -> None:
+    with _tank_cache_lock:
+        if tid in _incr_recount_inflight:
+            return
+        failed = _incr_recount_failed_at.get(tid)
+        if failed is not None and time.monotonic() - failed < _INCR_RECOUNT_RETRY_S:
+            return
+        _incr_recount_inflight.add(tid)
+    threading.Thread(target=_incr_recount_bg, args=(tid, table, key),
+                     name=f"tank-recount-{tid}", daemon=True).start()
+
+
+def _incr_recount_bg(tid: str, table: str, key: str) -> None:
+    """全件 COUNT(*) で差分カウントの基準を作り直す (初回 + 削除分の補正)。"""
+    try:
+        # 億行級の全件 COUNT を同時に何本も流さない
+        with _incr_recount_lock:
+            cfg = _read_db_cfg()
+            connect = _db_connector(_INCR_RECOUNT_STMT_TIMEOUT_S * 1000)
+            if cfg is None or connect is None:
+                raise RuntimeError("no db env / driver")
+            conn = connect(cfg)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    f"SET SESSION max_statement_time={_INCR_RECOUNT_STMT_TIMEOUT_S}")
+                # MAX と COUNT を同じスナップショットで取る = 「id <= hw の件数」。
+                # READ COMMITTED だとスナップショットにならないので RR を明示する。
+                cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+                cur.execute(f"SELECT MAX(`{key}`) FROM `{table}`")
+                r = cur.fetchone()
+                hw = int(r[0]) if r and r[0] is not None else 0
+                t0 = time.monotonic()
+                cur.execute(f"SELECT COUNT(*) FROM `{table}`")
+                cnt = int(cur.fetchone()[0])
+                conn.commit()
+                cur.execute(
+                    "INSERT INTO flow_tank_counter"
+                    " (tank_id, settled_id, settled_count, seen_max_id, recounted_at)"
+                    " VALUES (%s, %s, %s, %s, NOW()) ON DUPLICATE KEY UPDATE"
+                    " settled_id = VALUES(settled_id), settled_count = VALUES(settled_count),"
+                    " seen_max_id = VALUES(seen_max_id), recounted_at = VALUES(recounted_at),"
+                    " recount_gen = recount_gen + 1",
+                    (tid, hw, cnt, hw))
+                conn.commit()
+                cur.close()
+                log.info("tank recount %s: %d rows (id<=%d) in %.0fs",
+                         tid, cnt, hw, time.monotonic() - t0)
+            finally:
+                conn.close()
+        with _tank_cache_lock:
+            _incr_recount_failed_at.pop(tid, None)
+    except Exception as e:                       # スレッドを絶対に落とさない
+        log.warning("tank recount %s failed: %s", tid, e)
+        with _tank_cache_lock:
+            _incr_recount_failed_at[tid] = time.monotonic()
+    finally:
+        with _tank_cache_lock:
+            _incr_recount_inflight.discard(tid)
+
+
 def _tank_query(to_query: dict[str, str],
                 stmt_timeout_ms: int | None = None,
                 ) -> dict[str, tuple[float | None, str | None]]:
@@ -893,33 +1065,18 @@ def _tank_query(to_query: dict[str, str],
             results[tid] = (None, err)
         return results
 
-    # ドライバ側の read_timeout は SQL の max_statement_time より少し長く取る
-    # (SQL 側で先に打ち切らせ、 ソケットを途中で切らない)。
-    _read_to = int((stmt_timeout_ms or 25000) / 1000) + 5
-    # mariadb (C wrapper) があれば優先、 無ければ pure-python pymysql。
-    try:
-        import mariadb  # type: ignore
-        connect = lambda c: mariadb.connect(**{**c, "read_timeout": _read_to})  # noqa: E731
-    except ImportError:
-        try:
-            import pymysql  # type: ignore
-            connect = lambda c: pymysql.connect(    # noqa: E731
-                host=c["host"], port=c["port"], user=c["user"],
-                password=c["password"], database=c["database"],
-                connect_timeout=c.get("connect_timeout", 3),
-                read_timeout=_read_to, autocommit=True,
-            )
-        except ImportError:
-            err = "no mysql driver (install pymysql)"
-            for tid in to_query:
-                results[tid] = (None, err)
-            return results
+    _STMT_TIMEOUT_MS = int(stmt_timeout_ms or 25000)  # 既定 25s — 大テーブル COUNT の上限
+    connect = _db_connector(_STMT_TIMEOUT_MS)
+    if connect is None:
+        err = "no mysql driver (install pymysql)"
+        for tid in to_query:
+            results[tid] = (None, err)
+        return results
 
     # tank ごとに独立した短命接続を張る (= 1 query の失敗が他 tank を巻き込まない)。
     # 大きな表の COUNT が timeout しても他 tank の water level は読める。
-    _STMT_TIMEOUT_MS = int(stmt_timeout_ms or 25000)  # 既定 25s — 大テーブル COUNT の上限
     for tid, sql in to_query.items():
-        if not _safe_sql(sql):
+        if not sql.startswith(_INCR_PREFIX) and not _safe_sql(sql):
             results[tid] = (None, "unsafe sql")
             continue
         conn = None
@@ -935,11 +1092,21 @@ def _tank_query(to_query: dict[str, str],
                     f"SET SESSION max_statement_time={_STMT_TIMEOUT_MS / 1000:g}")
             except Exception:
                 pass  # 古い MariaDB / 権限なし でも続行
-            cur.execute(sql)
-            row = cur.fetchone()
-            # COUNT(*) は int だが、 容量系 tank は GB 等の小数を返す。 整数なら int の
-            # まま返して既存 tank の表示 (= 桁区切り無しの件数) を変えない。
-            v = _coerce_num(row[0]) if row and row[0] is not None else 0
+            if sql.startswith(_INCR_PREFIX):
+                v = _incr_count(conn, tid, sql[len(_INCR_PREFIX):])
+                if v is None:
+                    # 初回の全件集計が終わるまでは値なし (= 背景更新待ちと同じ扱い)
+                    results[tid] = (None, None)
+                    with _tank_cache_lock:
+                        _tank_cache[tid] = (now, None, None)
+                    cur.close()
+                    continue
+            else:
+                cur.execute(sql)
+                row = cur.fetchone()
+                # COUNT(*) は int だが、 容量系 tank は GB 等の小数を返す。 整数なら int の
+                # まま返して既存 tank の表示 (= 桁区切り無しの件数) を変えない。
+                v = _coerce_num(row[0]) if row and row[0] is not None else 0
             results[tid] = (v, None)
             with _tank_cache_lock:
                 _tank_cache[tid] = (now, v, None)
@@ -973,11 +1140,11 @@ def _trend_tank_sqls(nodes_raw: list[dict[str, Any]],
     sqls: dict[str, str] = {}
     ttls: dict[str, float] = {}
     for n in nodes_raw:
-        if n.get("kind") != "tank" or not n.get("metric_sql"):
+        if n.get("kind") != "tank" or not _tank_sql(n):
             continue
         if n.get("accumulator") or n.get("unit"):
             continue
-        sqls[n["id"]] = n["metric_sql"]
+        sqls[n["id"]] = _tank_sql(n)
         if n.get("metric_ttl_s"):
             ttls[n["id"]] = float(n["metric_ttl_s"])
     return sqls, ttls
@@ -1363,8 +1530,8 @@ def _snapshot_uncached(req: Request) -> FlowSnapshot:
     tank_sqls: dict[str, str] = {}
     tank_ttls: dict[str, float] = {}
     for n in nodes_raw:
-        if n.get("kind") == "tank" and n.get("metric_sql"):
-            tank_sqls[n["id"]] = n["metric_sql"]
+        if n.get("kind") == "tank" and _tank_sql(n):
+            tank_sqls[n["id"]] = _tank_sql(n)
             # 重い COUNT(*) は yaml で metric_ttl_s を長めに宣言する (背景更新に回る)
             if n.get("metric_ttl_s"):
                 tank_ttls[n["id"]] = float(n["metric_ttl_s"])

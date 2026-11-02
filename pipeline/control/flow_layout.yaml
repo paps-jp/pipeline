@@ -17,9 +17,9 @@ nodes:
   label: crawl (URL総数)
   icon: link
   # COUNT(*) は 5.5億行で 289s かかり bg の max_statement_time (120s) で毎回 1969 になる
-  # (2026-11-01 実測)。 統計値の概算 (実数より約 5% 少ない) を 0ms で読む。
-  # MAX(id) は INSERT IGNORE が id を飛ばすので 70億になり使えない。
-  metric_sql: SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'crawl'
+  # (2026-11-01 実測)。 TABLE_ROWS の概算は統計の取り直しで -17% まで飛ぶ。
+  # 差分カウント (flow_tank_counter に確定件数、 増えた id だけ数えて足す)。
+  count_table: crawl
   # 単調増加する総数タンク = バックログではない (停滞判定から除外)
   accumulator: true
   metric_ttl_s: 60
@@ -194,10 +194,11 @@ nodes:
   y: 408
   label: crawl_person (集約)
   icon: users-group
-  metric_sql: SELECT COUNT(*) FROM crawl_person
+  # 差分カウント (全件 COUNT(*) は億行級で max_statement_time を超える)
+  count_table: crawl_person
   # 単調増加する総数タンク = バックログではない (停滞判定から除外)
   accumulator: true
-  metric_ttl_s: 900
+  metric_ttl_s: 60
   capacity_warn: 500000000
 - id: crawl_video_hash
   kind: tank
@@ -216,10 +217,11 @@ nodes:
   y: -570
   label: crawl_image_hash (binary 集約)
   icon: fingerprint
-  metric_sql: SELECT COUNT(*) FROM crawl_image_hash
+  # 差分カウント (全件 COUNT(*) は億行級で max_statement_time を超える)
+  count_table: crawl_image_hash
   # 単調増加する総数タンク = バックログではない (停滞判定から除外)
   accumulator: true
-  metric_ttl_s: 900
+  metric_ttl_s: 60
   capacity_warn: 500000000
 - id: image_embed_queue
   kind: tank
