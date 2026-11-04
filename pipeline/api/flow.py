@@ -702,6 +702,193 @@ def _faiss_alerts() -> list[dict[str, Any]]:
         return list(_faiss_health["alerts"])
 
 
+# ── Paprika 常駐 GC (gc_runner) 死活 ─────────────────────────────────────────
+# 2026-11-04: 別デプロイで hub の _reaper.py が 08-30 版に巻き戻り、 gc_runner 3 シャードが
+# 「コンテナは Up、 毎パス AttributeError で 0 件」 のまま走り続けた。 restart: unless-stopped
+# はプロセスが死なない限り何もせず、 気付く手段は退役遅れタンクが 60 分を超えて赤く
+# なるのを待つことだけだった。 runner は paprika.gc_runner_heartbeat に 1 行/シャードを
+# upsert する (beat_at = 毎書込、 last_pass_at = 1 行でも消したパス、 state_since = 状態が
+# 変わった時刻、 state = starting/pass/idle/fail_closed)。 ここはそれを delian 経由で読み
+# 「生きているのに消していない」 を数分で赤ボックスに出す。 他の probe と同じく
+# background refresh + cache で snapshot リクエストは絶対にブロックしない。
+#
+# 時刻は全部 UTC (runner は UTC_TIMESTAMP() で書く)。 MariaDB の NOW() は JST なので
+# 経過秒は SQL 側で UTC_TIMESTAMP() との差を取る。
+_GC_RUNNER_TTL_S = 60.0
+_GC_RUNNER_STALE_BEAT_S = 180        # beat_at が止まって 3 分 → crit (プロセス死/ハング)
+_GC_RUNNER_STALE_PASS_S = 900        # beat は新しいが 15 分パスが進まない (+ lag > 60 分) → crit
+_GC_RUNNER_FAIL_CLOSED_S = 600       # watermark fail-closed が 10 分継続 → warn (意図的停止)
+_GC_RUNNER_LAG_TANK_ID = "paprika_jobs_retention_lag"
+_GC_RUNNER_LAG_MIN = 60.0            # タンクの capacity_warn と同じ
+_GC_RUNNER_SQL = (
+    "SELECT shard, shards_total, hub_id, state,"
+    " TIMESTAMPDIFF(SECOND, beat_at, UTC_TIMESTAMP()),"
+    " TIMESTAMPDIFF(SECOND, last_pass_at, UTC_TIMESTAMP()),"
+    " TIMESTAMPDIFF(SECOND, state_since, UTC_TIMESTAMP()),"
+    " beat_at, cutoff_at"
+    " FROM paprika.gc_runner_heartbeat ORDER BY shard"
+)
+_gc_runner_health: dict[str, Any] = {"ts": 0.0, "alerts": [], "refreshing": False}
+_gc_runner_health_lock = threading.Lock()
+
+
+def _gc_runner_rows(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """heartbeat 表を読む。 読めない (表が無い/権限無し/DB 不通) ときは None。"""
+    connect = _db_connector(5000)
+    if connect is None:
+        return None
+    conn = connect(cfg)
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SET SESSION max_statement_time=5")
+        except Exception:
+            pass
+        cur.execute(_GC_RUNNER_SQL)
+        rows = []
+        for r in cur.fetchall():
+            rows.append({
+                "shard": int(r[0]), "shards_total": int(r[1]), "hub_id": str(r[2]),
+                "state": str(r[3]),
+                "beat_age_s": None if r[4] is None else float(r[4]),
+                "pass_age_s": None if r[5] is None else float(r[5]),
+                "state_age_s": None if r[6] is None else float(r[6]),
+                "beat_at": r[7], "cutoff_at": r[8],
+            })
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def _fmt_utc_hm(v: Any) -> str:
+    """DATETIME → '12:09Z' (赤ボックスは 1 行なので短く)。"""
+    if isinstance(v, _dt.datetime):
+        return v.strftime("%H:%MZ")
+    return str(v)[11:16] + "Z" if v else "?"
+
+
+def _gc_runner_judge(rows: list[dict[str, Any]],
+                     lag_min: float | None) -> list[dict[str, Any]]:
+    """heartbeat 行 → alert dict 列。 純関数 (DB もキャッシュも触らない) なので単体テスト対象。
+
+    rows の各要素: shard / shards_total / hub_id / state / beat_age_s / pass_age_s (None =
+    まだ 1 回も消していない) / state_age_s / beat_at / cutoff_at。 lag_min は退役遅れタンクの
+    現在値 (None = 未取得)。 表が空 = runner 未配備とみなし何も出さない。
+    """
+    alerts: list[dict[str, Any]] = []
+    if not rows:
+        return alerts
+    kind = "gc_runner"
+
+    # シャード不整合: 行数と shards_total が食い違う (= 1 本だけ古い GC_SHARDS で動いている、
+    # あるいは 1 本が一度も起動していない)。 残基 (CRC32 % N) に穴が空くので crit。
+    totals = {r["shards_total"] for r in rows}
+    expected = max(totals)
+    if len(totals) > 1 or len(rows) != expected:
+        alerts.append({
+            "name": "gc_runner シャード不整合", "kind": kind, "severity": "crit",
+            "endpoint": None,
+            "error": f"{expected} 本中 {len(rows)} 本 (shards_total={sorted(totals)})",
+            "detail": "CRC32(job_id) % N の残基に穴が空いています。 全 gc-runner.env の GC_SHARDS を"
+                      " 揃えて起動し直してください",
+        })
+
+    dead: list[int] = []
+    fail_closed: list[int] = []
+    for r in rows:
+        s = r["shard"]
+        beat_age = r["beat_age_s"]
+        if beat_age is None or beat_age >= _GC_RUNNER_STALE_BEAT_S:
+            dead.append(s)
+            alerts.append({
+                "name": f"gc_runner s{s} 無応答", "kind": kind, "severity": "crit",
+                "endpoint": r.get("hub_id"),
+                "error": f"最終 {_fmt_utc_hm(r.get('beat_at'))} ({beat_age / 60:.0f} 分前)"
+                         if beat_age is not None else "beat なし",
+                "detail": "プロセスが固まっています (restart: unless-stopped は exit しないと"
+                          " 働かない)。 docker compose -p hub restart gc-runner",
+            })
+            continue
+        if r["state"] == "fail_closed":
+            if (r.get("state_age_s") or 0) >= _GC_RUNNER_FAIL_CLOSED_S:
+                fail_closed.append(s)
+            continue
+        # 生きているが削除が進まない。 lag が無い (drain 済) なら「消す物が無い」 だけなので
+        # 鳴らさない: 両方そろって初めて「詰まっている」 と言える。
+        pass_age = r["pass_age_s"]
+        if (lag_min is not None and lag_min > _GC_RUNNER_LAG_MIN
+                and (pass_age is None or pass_age >= _GC_RUNNER_STALE_PASS_S)):
+            alerts.append({
+                "name": f"gc_runner s{s} 停滞", "kind": kind, "severity": "crit",
+                "endpoint": r.get("hub_id"),
+                "error": "パスが進まない (最終パス "
+                         + (f"{pass_age / 60:.0f} 分前" if pass_age is not None else "無し")
+                         + f", 退役遅れ {lag_min:.0f} 分)",
+                "detail": f"state={r['state']} cutoff={_fmt_utc_hm(r.get('cutoff_at'))}。"
+                          " docker logs hub-gc-runner-1 で pass failed を確認",
+            })
+
+    if fail_closed:
+        alerts.append({
+            "name": "GC 停止中: watermark 待ち", "kind": kind, "severity": "warn",
+            "endpoint": None,
+            "error": f"shard {','.join(str(s) for s in fail_closed)} が fail_closed "
+                     f"{_GC_RUNNER_FAIL_CLOSED_S // 60} 分超",
+            "detail": "image/video/links-pull の watermark が読めないか欠けています (意図的な"
+                      " fail-closed)。 pull plugin が止まっていないか確認",
+        })
+    if dead and len(dead) == len(rows):
+        alerts.append({
+            "name": "gc_runner 全シャード無応答", "kind": kind, "severity": "crit",
+            "endpoint": None,
+            "error": f"{len(rows)} 本とも beat が {_GC_RUNNER_STALE_BEAT_S // 60} 分以上止まっている",
+            "detail": "hub 内フォールバック (20 分毎 20k 行) は Redis ロック失効まで再開しない:"
+                      " 最大 GC_LOCK_TTL_S (既定 600 s)",
+        })
+    return alerts
+
+
+def _gc_runner_lag_min() -> float | None:
+    """退役遅れタンクの最新値 (分) を tank cache から借りる。 無ければ None。"""
+    with _tank_cache_lock:
+        ent = _tank_cache.get(_GC_RUNNER_LAG_TANK_ID)
+    if ent is None or ent[1] is None:
+        return None
+    return float(ent[1])
+
+
+def _refresh_gc_runner_health() -> None:
+    alerts: list[dict[str, Any]] = []
+    try:
+        cfg = _read_db_cfg()
+        if cfg is None:
+            _warn_once("gc_runner_env", "flow: db env 無し — gc_runner 死活は見ません")
+        else:
+            rows = _gc_runner_rows(cfg)
+            if rows is None:
+                _warn_once("gc_runner_driver", "flow: mysql driver 無し — gc_runner 死活は見ません")
+            else:
+                alerts = _gc_runner_judge(rows, _gc_runner_lag_min())
+    except Exception as e:  # noqa: BLE001 — 表が無い/権限無しは alert にしない (片側 fail-open)
+        log.warning("flow: gc_runner heartbeat unreadable (no alert raised): %s", e)
+    with _gc_runner_health_lock:
+        _gc_runner_health["ts"] = time.monotonic()
+        _gc_runner_health["alerts"] = alerts
+        _gc_runner_health["refreshing"] = False
+
+
+def _gc_runner_alerts() -> list[dict[str, Any]]:
+    """cache を即返す。 stale ならバックグラウンド refresh を1本だけ起動 (request 非ブロック)。"""
+    now = time.monotonic()
+    with _gc_runner_health_lock:
+        stale = (now - _gc_runner_health["ts"]) >= _GC_RUNNER_TTL_S
+        if stale and not _gc_runner_health["refreshing"]:
+            _gc_runner_health["refreshing"] = True
+            threading.Thread(target=_refresh_gc_runner_health, daemon=True).start()
+        return list(_gc_runner_health["alerts"])
+
+
 # ── GPU 死活 (= センサーが黙った GPU を赤ボックスに出す) ────────────────────
 # 2026-08-15: ai-gpu8 が Xid 119 (GSP timeout) で `GPU requires reset` に落ち、
 # **19 時間気付かれなかった**。 このとき UI の GPU カードは VRAM と Mem 帯域を
@@ -1732,6 +1919,7 @@ def _snapshot_uncached(req: Request) -> FlowSnapshot:
     infra_alerts = [InfraAlert(**a) for a in
                     (*_storage_alerts(), *_pve_alerts(), *_ramdisk_alerts(),
                      *_tank_ramdisk_alerts(nodes), *_faiss_alerts(),
+                     *_gc_runner_alerts(),
                      *_submit_paused_alerts(req.app.state.db),
                      *_gpu_alerts(req.app.state.db))]
     return FlowSnapshot(canvas=canvas, nodes=nodes, edges=edges, infra_alerts=infra_alerts)

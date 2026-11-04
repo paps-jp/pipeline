@@ -1823,7 +1823,7 @@ function GpuAlertBox({
               : IconAlertTriangleFilled
             : a.kind === "faiss"
               ? IconSearchOff
-              : a.kind === "gpu"
+              : a.kind === "gpu" || a.kind === "gc_runner"
                 ? IconCpu
                 : IconServerOff;
           const head = full
@@ -1832,7 +1832,9 @@ function GpuAlertBox({
               ? `${t("flow.alert.faiss", "顔検索 (FAISS)")} · ${a.name}`
               : a.kind === "gpu"
                 ? `${t("flow.alert.gpu_sensor", "GPU センサー無応答")} · ${a.name}`
-                : `${t("flow.alert.storage_down", "ストレージ停止")} · ${a.name}`;
+                : a.kind === "gc_runner"
+                  ? `${t("flow.alert.gc_runner", "Paprika GC")} · ${a.name}`
+                  : `${t("flow.alert.storage_down", "ストレージ停止")} · ${a.name}`;
           return (
             <div key={`infra-${a.name}`} style={{ fontSize: 12, lineHeight: 1.35 }}>
               <div style={{ fontWeight: 700, display: "flex", alignItems: "center", gap: 5 }}>

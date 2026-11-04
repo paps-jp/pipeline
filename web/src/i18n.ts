@@ -93,6 +93,7 @@ const resources = {
         alert: {
           faiss: "顔検索 (FAISS)",
           gpu_sensor: "GPU センサー無応答",
+          gc_runner: "Paprika GC",
           hang: "ハング検知/復旧",
           storage_down: "ストレージ停止",
           storage_tight: "ストレージ逼迫",
@@ -963,6 +964,7 @@ const resources = {
         alert: {
           faiss: "Face search (FAISS)",
           gpu_sensor: "GPU sensor not responding",
+          gc_runner: "Paprika GC",
           hang: "Hang detected / recovered",
           storage_down: "Storage down",
           storage_tight: "Storage almost full",
