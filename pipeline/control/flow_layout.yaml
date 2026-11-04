@@ -31,6 +31,29 @@ nodes:
   label: paprika 投入
   icon: send
   workload_slug: paprika-job-submit
+- id: paprika_jobs_retention_lag
+  kind: tank
+  x: 190
+  y: -330
+  label: paprika 退役遅れ
+  icon: database
+  unit: min
+  # Paprika jobs 表の退役 (job_retention_days 経過後の削除) がどれだけ遅れているか。
+  # 行数ではなく「cutoff を過ぎてから消されるまでの時間」を見る (CoDel 流):
+  # 投入量が変わっても閾値の意味が変わらない。 0 = 追いついている。
+  # 2026-11-03 に 5,000 万行まで育った件は、 この値が 1 か月以上伸び続けていたのに
+  # どこにも出ていなかったのが発見を遅らせた。 60 分で warn (常駐 gc_runner 3 シャードなら
+  # 通常 0〜数分)。 paprika スキーマは delian ユーザに SELECT を GRANT 済 (jobs / settings)。
+  # MIN(completed_at) は (completed_at,status) index を全走査して 3s かかるので
+  # ORDER BY ... LIMIT 1 で先頭 1 行だけ読む (1〜4ms)。
+  metric_sql: >-
+    SELECT COALESCE(ROUND(GREATEST(0, TIMESTAMPDIFF(SECOND,
+    (SELECT completed_at FROM paprika.jobs WHERE completed_at IS NOT NULL
+    AND status IN ('completed','failed','cancelled','review') ORDER BY completed_at LIMIT 1),
+    UTC_TIMESTAMP() - INTERVAL COALESCE((SELECT CAST(v AS SIGNED) FROM paprika.settings
+    WHERE k='job_retention_days'), 10) DAY)) / 60), 0)
+  metric_ttl_s: 60
+  capacity_warn: 60
 - id: paprika-hub
   kind: external
   x: 331
@@ -322,6 +345,9 @@ edges:
   to: paprika-hub
   label: job/min
   metric_field: submitted
+- from: paprika-hub
+  to: paprika_jobs_retention_lag
+  dashed: true
 - from: paprika-hub
   to: paprika-image-pull
   dashed: true
