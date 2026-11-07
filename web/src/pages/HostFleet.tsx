@@ -1,4 +1,5 @@
 import {
+  ActionIcon,
   Alert,
   Badge,
   Box,
@@ -16,10 +17,12 @@ import {
   Stack,
   Text,
   TextInput,
+  Tooltip,
   UnstyledButton,
 } from "@mantine/core";
+import { modals } from "@mantine/modals";
 import { notifications } from "@mantine/notifications";
-import { IconAlertTriangle, IconChevronDown, IconChevronRight, IconRefresh } from "@tabler/icons-react";
+import { IconAlertTriangle, IconChevronDown, IconChevronRight, IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -138,9 +141,11 @@ function StatusBadge({ s }: { s: Status }) {
 function HostDetail({
   sum,
   workloads,
+  allHosts,
 }: {
   sum: Summary;
   workloads: Workload[];
+  allHosts: string[];
 }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -228,6 +233,68 @@ function HostDetail({
     onSuccess: () => qc.invalidateQueries({ queryKey: ["workloads-hostcfg"] }),
     onError: (e: unknown) => notifications.show({ color: "red", message: String(e) }),
   });
+
+  // このホストからワークロードを外す: 許可リストから外し、 設定 (template) の枠を消す。
+  // 許可リストを先に外す (枠だけ消すと、 自動制御が許可ホストとして枠を作り直すことがあるため)。
+  const removeFromHost = useMutation({
+    mutationFn: async ({ slug, w }: { slug: string; w: Workload | undefined }) => {
+      const affinity = (w?.host_affinity ?? []) as string[];
+      if (w) {
+        let next: string[] | null = null;
+        if (affinity.length === 0) next = allHosts.filter((h) => h !== policy.host);
+        else if (affinity.includes(policy.host)) next = affinity.filter((h) => h !== policy.host);
+        if (next !== null) {
+          if (next.length === 0) throw new Error(t("hostfleet.remove_last", "最後の 1 ホストは外せません (空にすると全ホスト許可になります)"));
+          await api.setWorkloadHostAffinity(slug, next);
+        }
+      }
+      if (slug in template) {
+        const rest = { ...template };
+        delete rest[slug];
+        await hostApi.setAgentDesired(policy.host, rest);
+      }
+    },
+    onSuccess: (_d, v) => {
+      qc.invalidateQueries({ queryKey: ["agents"] });
+      qc.invalidateQueries({ queryKey: ["workloads-hostcfg"] });
+      notifications.show({
+        color: "teal",
+        message: t("hostfleet.removed", { defaultValue: "{{slug}} をこのホストから外しました", slug: v.slug }),
+      });
+    },
+    onError: (e: unknown) => {
+      qc.invalidateQueries({ queryKey: ["agents"] });
+      qc.invalidateQueries({ queryKey: ["workloads-hostcfg"] });
+      notifications.show({ color: "red", message: e instanceof Error ? e.message : String(e) });
+    },
+  });
+
+  const confirmRemove = (slug: string, w: Workload | undefined, alive: number) => {
+    const affinity = (w?.host_affinity ?? []) as string[];
+    modals.openConfirmModal({
+      title: t("hostfleet.remove_title", { defaultValue: "{{slug}} をこのホストから外しますか?", slug }),
+      children: (
+        <Stack gap={6}>
+          <Text size="sm">
+            {alive > 0
+              ? t("hostfleet.remove_alive", { defaultValue: "稼働中の {{n}} 台が停止します (処理中のジョブは中断され、再実行されます)。", n: alive })
+              : t("hostfleet.remove_idle", "稼働中の子プロセスはありません。")}
+          </Text>
+          {affinity.length === 0 && (
+            <Alert color="yellow" icon={<IconAlertTriangle size={16} />}>
+              {t("hostfleet.remove_all_hosts", {
+                defaultValue: "このワークロードは「全ホスト許可」です。外すと、許可リストが他の {{n}} ホストの明示指定に変わります。今後追加するホストは、自動では許可されません。",
+                n: allHosts.filter((h) => h !== policy.host).length,
+              })}
+            </Alert>
+          )}
+        </Stack>
+      ),
+      labels: { confirm: t("hostfleet.remove", "外す"), cancel: t("common.cancel", "キャンセル") },
+      confirmProps: { color: "red" },
+      onConfirm: () => removeFromHost.mutate({ slug, w }),
+    });
+  };
 
   const gapText = (gap: EffGap, target: number, eff: number): string | null => {
     if (gap === "vram")
@@ -362,6 +429,14 @@ function HostDetail({
                     />
                   </Group>
                 )}
+                <Tooltip label={t("hostfleet.remove_tip", "このホストから外す (許可リストと設定の枠を削除)")}>
+                  <ActionIcon variant="subtle" color="red" size="sm"
+                              loading={removeFromHost.isPending && removeFromHost.variables?.slug === slug}
+                              onClick={() => confirmRemove(slug, w, alive)}
+                              aria-label={t("hostfleet.remove", "外す")}>
+                    <IconTrash size={15} />
+                  </ActionIcon>
+                </Tooltip>
                 <Box w={86} ta="right">
                   <Text size="sm" fw={500}>{t("hostfleet.alive", "稼働")} {alive}</Text>
                   {gap && (
@@ -673,7 +748,8 @@ export function HostFleet() {
           <Text size="sm" c="dimmed">{t("hostfleet.pick", "左の一覧からホストを選択してください。複数選択すると一括操作になります。")}</Text>
         )}
         {selectedSums.length === 1 && (
-          <HostDetail key={selectedSums[0].policy.host} sum={selectedSums[0]} workloads={workloads} />
+          <HostDetail key={selectedSums[0].policy.host} sum={selectedSums[0]} workloads={workloads}
+                      allHosts={sums.map((x) => x.policy.host)} />
         )}
         {selectedSums.length > 1 && (
           <BulkPanel hosts={selectedSums} workloads={workloads} onDone={() => setSelected([])} />
