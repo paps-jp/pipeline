@@ -473,7 +473,10 @@ const resources = {
         reload: "再読み込み",
       },
       hosts: {
-        subtitle: "ホストごとの能力・ワーカー割り当てと登録の管理",
+        subtitle: "ホストごとの台数・許可の設定と、ホストの登録",
+        tab_config: "ホスト設定",
+        tab_registry: "ホスト登録",
+        tab_workers: "稼働ワーカー",
         title: "ホスト",
       },
       plugin_panel: {
@@ -1344,7 +1347,10 @@ const resources = {
         reload: "Reload",
       },
       hosts: {
-        subtitle: "Per-host capability, worker allocation and registration",
+        subtitle: "Per-host allocation and permissions, and host registration",
+        tab_config: "Host settings",
+        tab_registry: "Host registry",
+        tab_workers: "Running workers",
         title: "Hosts",
       },
       plugin_panel: {
