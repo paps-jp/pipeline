@@ -2,7 +2,7 @@ import { Stack } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 
 import { PageHeader } from "@/components/PageHeader";
-import { HostConfigSection } from "./HostConfig";
+import { HostFleet } from "./HostFleet";
 import { RuntimeSection, WorkerRegistrySection } from "./Workers";
 import { TabbedPage } from "@/components/TabbedPage";
 
@@ -24,7 +24,7 @@ export default function Hosts() {
             label: "設定・登録",
             content: (
               <Stack gap="lg">
-                <HostConfigSection />
+                <HostFleet />
                 <WorkerRegistrySection />
               </Stack>
             ),
