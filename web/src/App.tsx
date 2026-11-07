@@ -11,46 +11,30 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
-  IconChartBar,
-  IconChartLine,
   IconBook2,
-  IconDashboard,
-  IconDatabase,
   IconLanguage,
   IconLink,
   IconList,
   IconMoon,
   IconPuzzle,
-  IconRocket,
   IconScript,
   IconServer,
-  IconSettings,
-  IconSettingsAutomation,
   IconSitemap,
   IconSun,
-  IconUsersGroup,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { Link as RouterLink, NavLink as RouterNavLink, Route, Routes } from "react-router-dom";
+import { Link as RouterLink, NavLink as RouterNavLink, Navigate, Route, Routes } from "react-router-dom";
 
 import { api } from "@/api/client";
 import { FleetStopButton } from "@/components/FleetStopButton";
 import { PageTransition } from "@/components/PageTransition";
-import Dashboard from "./pages/Dashboard";
-import Deploy from "./pages/Deploy";
-import Flow from "./pages/Flow";
+import CrawlHub from "./pages/CrawlHub";
 import Hosts from "./pages/Hosts";
-import MariadbTables from "./pages/MariadbTables";
-import Supervisor from "./pages/Supervisor";
-import Throughput from "./pages/Throughput";
+import OpsHub from "./pages/OpsHub";
 import PluginPanel from "./pages/PluginPanel";
-import Settings from "./pages/Settings";
-import ServiceLog from "./pages/ServiceLog";
-import SiteYield from "./pages/SiteYield";
-import UrlManagement from "./pages/UrlManagement";
-import Workers from "./pages/Workers";
-import Workloads from "./pages/Workloads";
+import StatusHub from "./pages/StatusHub";
+import WorkloadsHub from "./pages/WorkloadsHub";
 
 function HeaderStatus() {
   const { t } = useTranslation();
@@ -137,7 +121,7 @@ export default function App() {
             />
             <RouterLink
               to="/"
-              aria-label="Home"
+ aria-label="Home"
               style={{ display: "inline-flex", lineHeight: 0 }}
             >
               <img
@@ -205,35 +189,16 @@ export default function App() {
 
       <AppShell.Navbar p="xs" style={{ overflowY: "auto" }}>
         <NavLink
-          label={t("nav.dashboard")}
-          leftSection={<IconDashboard size={18} />}
-          component={RouterNavLink}
-          to="/"
-          end
-        />
-        <NavLink
-          label={t("nav.flow", "フロー図")}
+          label={t("nav.status", "状況")}
           leftSection={<IconSitemap size={18} />}
           component={RouterNavLink}
-          to="/flow"
+          to="/status"
         />
         <NavLink
-          label={t("nav.throughput", "スループット")}
-          leftSection={<IconChartLine size={18} />}
-          component={RouterNavLink}
-          to="/throughput"
-        />
-        <NavLink
-          label={t("nav.workloads")}
+          label={t("nav.workloads", "ワークロード")}
           leftSection={<IconList size={18} />}
           component={RouterNavLink}
           to="/workloads"
-        />
-        <NavLink
-          label={t("nav.workers", "ワーカー")}
-          leftSection={<IconUsersGroup size={18} />}
-          component={RouterNavLink}
-          to="/workers"
         />
         <NavLink
           label={t("nav.hosts", "ホスト")}
@@ -242,46 +207,16 @@ export default function App() {
           to="/hosts"
         />
         <NavLink
-          label={t("nav.supervisor", "Supervisor")}
-          leftSection={<IconSettingsAutomation size={18} />}
-          component={RouterNavLink}
-          to="/supervisor"
-        />
-        <NavLink
-          label={t("nav.urlManagement", "URL管理")}
+          label={t("nav.crawl", "クロール")}
           leftSection={<IconLink size={18} />}
           component={RouterNavLink}
-          to="/url-management"
+          to="/crawl"
         />
         <NavLink
-          label={t("nav.siteYield", "サイト収率")}
-          leftSection={<IconChartBar size={18} />}
-          component={RouterNavLink}
-          to="/site-yield"
-        />
-        <NavLink
-          label={t("nav.crawlTables", "クロール設定")}
-          leftSection={<IconDatabase size={18} />}
-          component={RouterNavLink}
-          to="/crawl-tables"
-        />
-        <NavLink
-          label={t("nav.logs")}
+          label={t("nav.ops", "運用")}
           leftSection={<IconScript size={18} />}
           component={RouterNavLink}
-          to="/logs"
-        />
-        <NavLink
-          label={t("nav.deploy")}
-          leftSection={<IconRocket size={18} />}
-          component={RouterNavLink}
-          to="/deploy"
-        />
-        <NavLink
-          label={t("nav.settings", "設定")}
-          leftSection={<IconSettings size={18} />}
-          component={RouterNavLink}
-          to="/settings"
+          to="/ops"
         />
         {uiPlugins.length > 0 && (
           <Text size="xs" c="dimmed" px="sm" mt="md" mb={4}>
@@ -308,21 +243,24 @@ export default function App() {
       <AppShell.Main>
         <Routes>
           <Route element={<PageTransition />}>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/flow" element={<Flow />} />
-            <Route path="/throughput" element={<Throughput />} />
-            <Route path="/workloads" element={<Workloads />} />
-            <Route path="/workloads/:slug" element={<Workloads />} />
-            <Route path="/workloads/:slug/runs" element={<Workloads />} />
-            <Route path="/workers" element={<Workers />} />
+            <Route path="/" element={<Navigate to="/status" replace />} />
+            <Route path="/status" element={<StatusHub />} />
+            <Route path="/flow" element={<StatusHub />} />
+            <Route path="/throughput" element={<StatusHub />} />
+            <Route path="/workloads" element={<WorkloadsHub />} />
+            <Route path="/workloads/:slug" element={<WorkloadsHub />} />
+            <Route path="/workloads/:slug/runs" element={<WorkloadsHub />} />
+            <Route path="/supervisor" element={<WorkloadsHub />} />
             <Route path="/hosts" element={<Hosts />} />
-            <Route path="/url-management" element={<UrlManagement />} />
-            <Route path="/site-yield" element={<SiteYield />} />
-            <Route path="/crawl-tables" element={<MariadbTables />} />
-            <Route path="/supervisor" element={<Supervisor />} />
-            <Route path="/logs" element={<ServiceLog />} />
-            <Route path="/deploy" element={<Deploy />} />
-            <Route path="/settings" element={<Settings />} />
+            <Route path="/workers" element={<Navigate to="/hosts?tab=workers" replace />} />
+            <Route path="/crawl" element={<CrawlHub />} />
+            <Route path="/url-management" element={<CrawlHub />} />
+            <Route path="/site-yield" element={<CrawlHub />} />
+            <Route path="/crawl-tables" element={<CrawlHub />} />
+            <Route path="/ops" element={<OpsHub />} />
+            <Route path="/logs" element={<OpsHub />} />
+            <Route path="/deploy" element={<OpsHub />} />
+            <Route path="/settings" element={<OpsHub />} />
             <Route path="/plugins/:slug" element={<PluginPanel />} />
           </Route>
         </Routes>

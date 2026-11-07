@@ -569,7 +569,7 @@ function WorkerTable({ workers, workloadNameMap }: {
   );
 }
 
-function RuntimeSection() {
+export function RuntimeSection() {
   const { t } = useTranslation();
   const q = useQuery({
     queryKey: ["workers"],
