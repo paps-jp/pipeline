@@ -51,6 +51,7 @@ class AgentSupervisor:
         health_source: Callable[[str], Any] | None = None,
         health_forget: Callable[[str], None] | None = None,
         cache_root: str = "/tmp/pipeline-agent-cache",
+        plugin_fetcher: Callable[[str], bool] | None = None,
     ) -> None:
         self.host = host
         self.pipeline_exe = pipeline_exe
@@ -65,6 +66,9 @@ class AgentSupervisor:
         self.health_source = health_source
         self.health_forget = health_forget
         self.cache_root = cache_root
+        # spawn 直前にワークロードのコードを用意する (None = 何もしない = 従来どおり)。
+        # False を返した slug はその tick は spawn しない。
+        self.plugin_fetcher = plugin_fetcher
         self.children: dict[str, Child] = {}
         # wedged で殺した slug は暫く spawn しない (= kill→spawn→build失敗 の churn 防止)
         self._wedged_cooldown_until: dict[str, float] = {}
@@ -328,6 +332,8 @@ class AgentSupervisor:
             cool_until = self._wedged_cooldown_until.get(wd.slug)
             cooling = cool_until is not None and time.monotonic() < cool_until
             if cur < wd.count and not cooling:
+                if self.plugin_fetcher is not None and not self.plugin_fetcher(wd.slug):
+                    continue  # コード取得に失敗 → 次 tick に再試行 (稼働中の子は触らない)
                 need = wd.count - cur
                 for _ in range(need):
                     if wd.gpu:

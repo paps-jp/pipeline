@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from pipeline import __version__
-from pipeline.api import admin_cmds, admin_deploy, agents as agents_api, dashboard, declarative as declarative_api, fleet, flow, host_policy as host_policy_api, mariadb_tables, plugin_runtime, plugins_local, service_logs, settings as settings_api, site_yield, system, url_management, workers, workloads
+from pipeline.api import admin_cmds, admin_deploy, agents as agents_api, dashboard, declarative as declarative_api, fleet, flow, host_policy as host_policy_api, mariadb_tables, plugin_dist as plugin_dist_api, plugin_runtime, plugins_local, service_logs, settings as settings_api, site_yield, system, url_management, workers, workloads
 from pipeline.config import Settings
 from pipeline.db import get_db
 from pipeline.worker.drain import Worker
@@ -407,6 +407,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(settings_api.router)
     app.include_router(host_policy_api.router)
     app.include_router(declarative_api.router)
+    app.include_router(plugin_dist_api.router)
     app.include_router(mariadb_tables.router)
     app.include_router(url_management.router)
     app.include_router(site_yield.router)

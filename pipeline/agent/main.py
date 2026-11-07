@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import socket
 import time
@@ -43,6 +44,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="proxy で heartbeat を refresh 周期に合体 (control plane の lost 閾値確認後に)")
     p.add_argument("--no-sync", action="store_true",
                    help="P2 sync を使わずローカル desired.json のみ (bootstrap/検証用)")
+    p.add_argument("--auto-fetch-plugins", action="store_true",
+                   default=os.environ.get("PIPELINE_AGENT_AUTO_FETCH_PLUGINS") == "1",
+                   help="spawn 直前に、 無い/古い (配布で入れた) ワークロードのコードを control plane から取得する"
+                        " (既定オフ。 手動で置いたプラグインは上書きしない)")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
 
@@ -98,6 +103,12 @@ def main(argv: list[str] | None = None) -> int:
     if n_orphan:
         log.info("[agent] 起動時に孤児 %d を回収", n_orphan)
     sync_control_url = d0.control_url  # sync は本物の control plane へ (proxy 経由でない)
+    if args.auto_fetch_plugins:
+        from pipeline.agent.plugin_fetch import PluginFetcher
+
+        # コード取得も proxy を経由せず本物の control plane へ
+        sup.plugin_fetcher = PluginFetcher(lambda: sync_control_url).ensure
+        log.info("[agent] プラグイン自動取得: 有効 (root=%s)", os.environ.get("PIPELINE_PLUGIN_ROOT", "/opt/pipeline/plugins"))
     tick = 0
     # 直近で sync に成功した desired。 sync が落ちたときはこれを据え置く。
     # ローカル desired.json は **bootstrap 専用** (control plane と一度も話せていない間だけ)
