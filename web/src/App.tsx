@@ -260,6 +260,7 @@ export default function App() {
             <Route path="/ops" element={<OpsHub />} />
             <Route path="/logs" element={<OpsHub />} />
             <Route path="/deploy" element={<OpsHub />} />
+            <Route path="/config" element={<OpsHub />} />
             <Route path="/settings" element={<OpsHub />} />
             <Route path="/plugins/:slug" element={<PluginPanel />} />
           </Route>

@@ -999,3 +999,37 @@ export interface DeployPathCreate {
   service_command?: string | null;
   notes?: string | null;
 }
+
+// ============================================================
+// 宣言的構成管理 (/api/v1/config): YAML で構成を管理し、 差分を確認してから反映する
+// ============================================================
+
+export interface ConfigChange {
+  section: string;
+  key: string;
+  op: "create" | "update" | "delete" | "unchanged" | "extra" | "skipped";
+  diff: Record<string, { before: unknown; after: unknown }>;
+  note: string | null;
+  applied: boolean;
+  error: string | null;
+}
+
+export interface ConfigPlan {
+  summary: Record<string, number>;
+  has_changes: boolean;
+  ok: boolean;
+  changes: ConfigChange[];
+}
+
+export const configApi = {
+  /** 今の構成を YAML テキストで取得 (JSON ではなく text なので fetch を直接使う)。 */
+  exportYaml: async (): Promise<string> => {
+    const res = await fetch(BASE + "/api/v1/config/export");
+    if (!res.ok) throw new ApiError(res.status, await res.text());
+    return res.text();
+  },
+  plan: (yaml: string, prune: boolean) =>
+    request<ConfigPlan>("/api/v1/config/plan", { method: "POST", json: { yaml, prune } }),
+  apply: (yaml: string, prune: boolean) =>
+    request<ConfigPlan>("/api/v1/config/apply", { method: "POST", json: { yaml, prune } }),
+};

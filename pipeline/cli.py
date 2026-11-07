@@ -56,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--pip-index-url", default=None, help=argparse.SUPPRESS)
     p_worker.add_argument("--skip-pip-install", action="store_true", help=argparse.SUPPRESS)
 
+    from pipeline.declarative.cli import add_subparser as _add_config
+
+    _add_config(sub)
+
     return p
 
 
@@ -123,6 +127,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(args)
     if args.cmd == "worker":
         return cmd_worker(args)
+    if args.cmd == "config":
+        from pipeline.declarative.cli import run as _run_config
+
+        return _run_config(args)
     parser.error(f"unknown command: {args.cmd}")
     return 2
 

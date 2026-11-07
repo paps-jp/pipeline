@@ -27,6 +27,8 @@ dependencies = [
     "pydantic>=2.7",
     "passlib[scrypt]>=1.7",
     "httpx>=0.27",
+    # 宣言的構成管理 (pipeline config)
+    "pyyaml>=6.0",
     # /api/v1/create の multipart アップロード (FastAPI の UploadFile が要求)
     "python-multipart>=0.0.9",
 ]
