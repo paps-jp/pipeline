@@ -208,5 +208,11 @@ def test_dead_process_is_detected_and_backed_off(m, monkeypatch):
 
 
 def test_bypass_mps_option(m):
-    assert m.parse_config({"model": "x"})["bypass_mps"] is True          # 既定は迂回
-    assert m.parse_config({"model": "x", "bypass_mps": 0})["bypass_mps"] is False
+    assert m.parse_config({"model": "x"})["bypass_mps"] is False         # 既定は worker と同じ MPS に相乗り
+    assert m.parse_config({"model": "x", "bypass_mps": 1})["bypass_mps"] is True
+
+
+def test_enforce_eager_default_and_command(m, cfg):
+    assert "--enforce-eager" in m.build_command(dict(cfg, enforce_eager=True), 16311)
+    assert "--enforce-eager" not in m.build_command(dict(cfg, enforce_eager=False), 16311)
+    assert m.parse_config({"model": "x"})["enforce_eager"] is True
