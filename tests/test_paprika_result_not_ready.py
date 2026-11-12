@@ -12,8 +12,12 @@ Paprika hub はワーカーから完了を受け取ると、 先に status=compl
 - video-pull は no_video として読み飛ばし watermark を進めるので、 その動画は
   失敗としても記録されずに失われていた
 
+もう 1 つの経路: hub は yt-dlp の進捗行 100% を受けると、 assets_saved=0 のまま
+completed を保存する。 結果はワーカーがアップロードを終えたときに書かれる (実測 2〜125 秒)。
+完了直後に空だった動画 job はほぼ全部こちらで、 一覧の ``progress.download_pct`` が付いている。
+
 ここで固定するのは:
-  1. 判定: assets_saved>0 なのに assets が空で、 completed から間もない
+  1. 判定: assets_saved>0 または download_pct 付きなのに assets が空で、 completed から間もない
   2. 古い空応答 (max_age 超) と assets_saved=0 は本当に空として扱う (固着しない)
   3. video-pull: 未保存の job は INSERT せず、 watermark をその手前で止め、
      次 tick で結果が書かれていれば取り込む
@@ -78,9 +82,10 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
-def _job(job_id: str, completed_at: datetime, assets_saved: int = 3) -> dict:
+def _job(job_id: str, completed_at: datetime, assets_saved: int = 3,
+         download_pct: "float | None" = None) -> dict:
     return {"job_id": job_id, "status": "completed", "completed_at": _iso(completed_at),
-            "progress": {"assets_saved": assets_saved}}
+            "progress": {"assets_saved": assets_saved, "download_pct": download_pct}}
 
 
 # ---------------------------------------------------------------- 判定 (両 plugin 共通)
@@ -105,6 +110,19 @@ def test_job_that_saved_nothing_is_really_empty(judge):
     now = datetime.now(timezone.utc)
     assert not judge(_job("a", now - timedelta(seconds=2), assets_saved=0),
                      {"assets": []}, 300, now)
+
+
+def test_ytdlp_completion_with_zero_assets_saved_is_not_ready(judge):
+    # yt-dlp 100% で completed になった job: assets_saved=0 だが download_pct が付く
+    now = datetime.now(timezone.utc)
+    assert judge(_job("a", now - timedelta(seconds=2), assets_saved=0, download_pct=100.0),
+                 {"assets": []}, 300, now)
+
+
+def test_old_ytdlp_completion_that_stayed_empty_is_trusted(judge):
+    now = datetime.now(timezone.utc)
+    assert not judge(_job("a", now - timedelta(seconds=301), assets_saved=0,
+                          download_pct=100.0), {"assets": []}, 300, now)
 
 
 def test_old_empty_result_is_trusted_so_watermark_cannot_pin(judge):
@@ -206,6 +224,25 @@ def test_video_pull_holds_watermark_before_unsaved_result(vp, env):
     assert "j2" in env["inserted"]
     assert out2["result_not_ready"] == 0
     assert st["watermark"] == base + timedelta(seconds=4)
+
+
+def test_video_pull_holds_watermark_before_ytdlp_completion(vp, env):
+    base = datetime.now(timezone.utc) - timedelta(seconds=20)
+    env["jobs"] = [_job(f"j{i}", base + timedelta(seconds=i)) for i in range(3)]
+    env["jobs"][1] = _job("j1", base + timedelta(seconds=1), assets_saved=0,
+                          download_pct=100.0)
+    env["not_ready"] = {"j1"}
+    st = _state(vp, base - timedelta(seconds=1))
+    out = vp.process(None, None, st)
+    assert env["inserted"] == ["j0", "j2"]
+    assert out["result_not_ready"] == 1
+    assert st["watermark"] < base + timedelta(seconds=1)
+
+    env["not_ready"] = set()
+    env["inserted"].clear()
+    vp.process(None, None, st)
+    assert "j1" in env["inserted"]
+    assert st["watermark"] == base + timedelta(seconds=2)
 
 
 def test_video_pull_old_empty_result_does_not_pin_watermark(vp, env):
