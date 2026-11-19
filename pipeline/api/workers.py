@@ -957,7 +957,19 @@ def workloads_for_worker(worker_id: str, request: Request) -> WorkloadsForWorker
     # VRAM 予算チェック用 lookup
     # cost = peak ベース (= 常時 peak 近く使う plugin で avg 採用すると race で OOM 再発、
     # 2026-06-28 Phase 1D で検証して逆戻り)。 avg/p95 は UI 表示用にとどめる。
-    cost_by_slug = {w.slug: int(w.observed_vram_mb_peak or 0) for w in all_wls}
+    #
+    # requires_gpu=False の workload は 0 と数える (= used にも新規 cost にも入れない)。
+    # CPU プロセスは nvidia-smi に出ないので新しい観測が来ず、 peak は減衰もせずに
+    # 凍結する (減衰は観測時のみ)。 2026-06〜07 に複数 workload を回す worker が
+    # GPU モデルを抱えたまま CPU workload の分として報告した値 (face-person-link 3284MB 等)
+    # が残り、 実使用 0MB の worker が GPU ホストの予算を架空に埋めていた。 その結果
+    # ai-gpu8 (16GB) で face-person-link が 8% の確率で候補から外れ、 ホスト上の
+    # worker が一斉に evict → setup し直す churn を数十秒毎に起こし、 巻き添えで
+    # vfe / image-hash も押し出されていた (2026-11-20)。
+    cost_by_slug = {
+        w.slug: (int(w.observed_vram_mb_peak or 0) if w.requires_gpu else 0)
+        for w in all_wls
+    }
     new_cost_by_slug = cost_by_slug
     # 同 family の active workers の VRAM 使用見積 + host capacity。
     # capacity_mb=0 (= CPU instance 群 or 申告なし) は fail-open。
