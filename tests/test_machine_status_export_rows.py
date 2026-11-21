@@ -5,6 +5,8 @@
   - 消費電力は書かない (GPU だけの値で実態より小さく見えるため)
   - 45 秒より古い GPU の値は書かない
   - CPU の行は gpu_index=-1 で、GPU 系の列は空
+  - Proxmox ノードの行は gpu_index=-2 で、cpu_pct = PVE の cpu × 100、mem_used_mb / mem_total_mb = RAM。
+    online でないノードは書かない
   - 行の並びが UPSERT の placeholder の数と一致する (列を足したときのずれ防止)
 
 plugin は非公開リポジトリの入れ子 clone なので、未配置なら skip する。
@@ -80,3 +82,24 @@ def test_row_width_matches_upsert_placeholders(m):
     for r in rows:
         assert len(r) == m.UPSERT.count("?")
     assert "mem_util_pct" in m.DDL and "mem_util_pct" in m.ADD_COLUMNS
+
+
+def test_proxmox_node_rows_have_cpu_and_ram(m):
+    nodes = [
+        {"node": "hall", "status": "online", "cpu": 0.362, "maxcpu": 128, "mem": 123 * 2**30, "maxmem": 188 * 2**30},
+        {"node": "base", "status": "online", "cpu": 0.6421, "maxcpu": 128, "mem": 445_000 * 2**20, "maxmem": 515_000 * 2**20},
+        {"node": "loft", "status": "offline"},                                     # 落ちている → 書かない
+        {"node": "odd", "status": "online", "cpu": None, "maxmem": 1},            # 値が無い → 書かない
+    ]
+    rows = m.build_node_rows(nodes, now=NOW)
+    assert rows == [
+        ("base", -2, None, None, 445_000, 515_000, None, 64.2, None, m._utc(NOW)),
+        ("hall", -2, None, None, 123 * 1024, 188 * 1024, None, 36.2, None, m._utc(NOW)),
+    ]
+    for r in rows:
+        assert len(r) == m.UPSERT.count("?")
+
+
+def test_proxmox_nodes_skipped_without_config(m):
+    assert m._pve_nodes({"pve_urls": [], "pve_token": None}) == []
+    assert m.build_node_rows([]) == []
