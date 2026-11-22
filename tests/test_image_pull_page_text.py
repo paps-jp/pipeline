@@ -178,7 +178,7 @@ def _res(title="", desc="", hit=False, body="", imgs=()):
 
 def test_collect_mode1_only_counts(im):
     st = _state(im, 1)
-    st["pt_pending"] = [(_done(_res("T", "D", hit=True, body="本文")), 10, "s", "https://ex.test/1", "j1")]
+    st["pt_pending"] = [(_done(_res("T", "D", hit=True, body="本文")), 10, "s", "https://ex.test/1", "j1", [])]
     db, out = _Db(), {}
     im._page_text_collect(st, db, out)
     assert db.log == []
@@ -190,10 +190,10 @@ def test_collect_mode2_fills_titles_and_writes_candidates_and_carries_pending(im
     waiting = Future()                                      # まだ終わっていない解析
     imgs = [{"u": "https://cdn/a.jpg", "alt": "ハナコ", "main": 1}]
     st["pt_pending"] = [
-        (_done(_res("ハナコ 写真集", "説明", hit=True, body="本文 ハナコ", imgs=imgs)), 10, "s", "https://ex.test/1", "j1"),
-        (_done(_res("別のページ", "")), 11, "s", "https://ex.test/2", "j2"),
-        (_done({"error": "TimeoutError"}), 12, "s", "https://ex.test/3", "j3"),
-        (waiting, 13, "s", "https://ex.test/4", "j4"),
+        (_done(_res("ハナコ 写真集", "説明", hit=True, body="本文 ハナコ", imgs=imgs)), 10, "s", "https://ex.test/1", "j1", []),
+        (_done(_res("別のページ", "")), 11, "s", "https://ex.test/2", "j2", []),
+        (_done({"error": "TimeoutError"}), 12, "s", "https://ex.test/3", "j3", []),
+        (waiting, 13, "s", "https://ex.test/4", "j4", []),
     ]
     db, out = _Db(), {}
     im._page_text_collect(st, db, out)
@@ -213,7 +213,7 @@ def test_collect_mode2_fills_titles_and_writes_candidates_and_carries_pending(im
 def test_collect_stops_writing_candidates_when_the_table_is_full(im):
     """identity-expand が止まっていても page_text_candidate が際限なく膨らまない。"""
     st = _state(im, 2, page_text_candidate_max=5)
-    st["pt_pending"] = [(_done(_res("T", hit=True, body="b")), 10, "s", "u", "j")]
+    st["pt_pending"] = [(_done(_res("T", hit=True, body="b")), 10, "s", "u", "j", [])]
     db, out = _Db(cand_n=5), {}
     im._page_text_collect(st, db, out)
     assert not [x for x in db.log if x[0].startswith("INSERT INTO page_text_candidate")]
@@ -258,7 +258,8 @@ def test_submit_reads_page_html_of_the_job_before_the_prefix_is_deleted(im):
     im._page_text_submit(st, db, "j3", 0, "s", "https://ex.test/3", [])         # crawl の行が無い
     assert store.keys == [("paprika", "jobs/j1/page.html"), ("paprika", "jobs/j2/page.html")]
     assert len(sent) == 1
-    html, base, assets, aliases = sent[0]
+    html, base, assets, aliases, want_kw = sent[0]
+    assert want_kw is False                       # page_kw_mode=0 なら語は頼まない
     assert html == b"<title>ab</title>0123456789"[:10] and base == "https://ex.test/1" and assets == ["https://cdn/a.jpg"]
     assert aliases == im._ptext.norm_aliases(["ハナコ"])
     s = st["pt_stats"]
