@@ -125,11 +125,73 @@ def _measure_gpu_capacity_mb() -> int | None:
     return total if total > 0 else None
 
 
-def _host_cpu_pct() -> float | None:
-    """ホスト全体の CPU 利用率を /proc/loadavg + nproc から概算。
-    psutil 不要 (= 標準 lib のみ)。 load1 / cores * 100 で 0-100% にクリップ。
-    Linux 以外 / ファイル無しの場合は None。
+_CGROUP_CPU_STAT = "/sys/fs/cgroup/cpu.stat"
+_CGROUP_CPU_MAX = "/sys/fs/cgroup/cpu.max"
+CPU_WINDOW_S = 60.0         # CPU 利用率はこの秒数の平均 (load1 と同じくらいの時定数)
+_cpu_samples: list[tuple[float, int]] = []   # (monotonic 秒, usage_usec)
+
+
+def _cgroup_cpu_usage_usec(path: str = _CGROUP_CPU_STAT) -> int | None:
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("usage_usec "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _cpu_cores(max_path: str = _CGROUP_CPU_MAX) -> float:
+    """使ってよいコア数。 cpuset (sched_getaffinity) と cgroup の cpu.max (quota) の小さい方。"""
+    try:
+        cores = float(len(os.sched_getaffinity(0)))  # type: ignore[attr-defined]
+    except Exception:
+        cores = float(os.cpu_count() or 1)
+    try:
+        with open(max_path) as f:
+            quota, period = f.read().split()[:2]
+        if quota != "max" and float(period) > 0:
+            cores = min(cores, float(quota) / float(period))
+    except (OSError, ValueError):
+        pass
+    return cores
+
+
+def _cgroup_cpu_pct(now: float, usage_usec: int, cores: float,
+                    samples: list[tuple[float, int]], window_s: float = CPU_WINDOW_S) -> float | None:
+    """cgroup の CPU 使用時間の増え方から、 直近 window_s 秒の利用率 (%) を出す。
+
+    samples は呼び出し側が持ち回す。 1 回目 (比べる相手が無い) と、 カウンタが戻った
+    (= 別の cgroup に見えた等) ときは None。
     """
+    if samples and usage_usec < samples[-1][1]:
+        samples.clear()
+    samples.append((now, usage_usec))
+    while len(samples) > 2 and now - samples[1][0] >= window_s:
+        samples.pop(0)
+    t0, u0 = samples[0]
+    if now - t0 < 1.0 or cores <= 0:
+        return None
+    return max(0.0, min(100.0, round((usage_usec - u0) / 1e6 / (now - t0) / cores * 100.0, 1)))
+
+
+def _host_cpu_pct() -> float | None:
+    """ホスト全体の CPU 利用率 (%)。 lane scaler / supervisor の elastic が読む。
+
+    cgroup v2 の `/sys/fs/cgroup/cpu.stat` (usage_usec) の増え方を、 使ってよいコア数で割る。
+    worker から見える cgroup の根は、 VM ではマシン全体、 LXC では CT 全体なので、 どちらでも
+    「その機械の」使用率になる (Proxmox が出すゲストの CPU と同じ元)。
+
+    以前は load1 / コア数だった。 LXC の中の /proc/loadavg は親ノード全体の値が漏れ、
+    lxcfs の /proc/stat も実際より高く出るので、 CT の ai-gpu4/5・nas が実際は 1〜3 割でも
+    100% に張り付き、 elastic が「CPU 飽和」と見てそこへ増やさなかった (2026-11-22)。
+
+    cgroup v2 が無い環境だけ load1 / コア数に戻す。 Linux 以外 / ファイル無しは None。
+    """
+    usage = _cgroup_cpu_usage_usec()
+    if usage is not None:
+        return _cgroup_cpu_pct(time.monotonic(), usage, _cpu_cores(), _cpu_samples)
     try:
         with open("/proc/loadavg") as f:
             load1 = float(f.read().split()[0])

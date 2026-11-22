@@ -140,7 +140,7 @@ class HeartbeatRequest(BaseModel):
     rows_processed_delta: int = 0
     errors_total_delta: int = 0
     gpu_metrics: list[GpuMetric] | None = None
-    host_cpu_pct: float | None = None    # /proc/loadavg ベース、 lane scaler が読む
+    host_cpu_pct: float | None = None    # cgroup cpu.stat の直近 60 秒 (無ければ load1)、 lane scaler / elastic が読む
     gpu_throttle: bool | None = None     # サーマルスロットル発動中
     gpu_temp_c: float | None = None      # GPU 温度 (報告用)
 
