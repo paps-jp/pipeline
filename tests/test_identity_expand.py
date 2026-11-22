@@ -419,3 +419,63 @@ def test_sync_persons_release_all(m, monkeypatch):
     idents = {"k": {"paused": True, "self": [1], "G": _person(np.random.default_rng(10), 1)}}
     st = m.sync_persons(_person_state(person_write=True, person_release_all=True), None, idents)
     assert st["removed"] == 2 and moved == [(1, None, "release"), (2, None, "release")]
+
+
+# ----------------------------------------------------------------------
+# 登録語 (段階 4)
+# ----------------------------------------------------------------------
+def test_norm_text_folds_width_case_kana_and_separators(m):
+    assert m.norm_text("ＡＢＣ－１２３") == m.norm_text("abc123") == "abc123"
+    assert m.norm_text("テスト 花子") == m.norm_text("てすと花子")
+    assert m.norm_text("ﾃｽﾄ") == m.norm_text("テスト")
+
+
+def test_prepare_and_match_aliases(m):
+    al = m.prepare_aliases(["テスト 花子", "ABC-123", "A B"])
+    assert [a for a, _ in al] == ["テスト 花子", "ABC-123"]          # 正規化して 3 文字未満の語は使わない
+    assert m.match_aliases("【新作】abc123 てすと花子 出演", al) == ["テスト 花子", "ABC-123"]
+    assert m.match_aliases("無関係なページ", al) == []
+    assert m.match_aliases(None, al) == []
+
+
+def test_like_patterns_escape_and_variants(m):
+    pats = m.like_patterns("50%_off テスト")
+    assert "%50!%!_off テスト%" in pats            # LIKE の記号は ! でエスケープ
+    assert "%50!%off%" not in pats and any("テスト%" in p for p in pats)
+    assert m.like_patterns("ABC-123") == ["%ABC-123%", "%ABC123%"]
+
+
+def test_decide_with_text(m):
+    # 顔だけで auto のものはそのまま
+    assert m.decide_with_text(0.7, -1, 0.6, 0.6, 0.5, False) == "auto"
+    # 0.5〜0.6 は登録語が一致したときだけ review
+    assert m.decide_with_text(0.55, -1, 0.6, 0.6, 0.5, True) == "review"
+    assert m.decide_with_text(0.55, -1, 0.6, 0.6, 0.5, False) is None
+    # text_floor 未満・別人の正解の方が近いものは、登録語が一致しても捨てる
+    assert m.decide_with_text(0.45, -1, 0.6, 0.6, 0.5, True) is None
+    assert m.decide_with_text(0.55, 0.58, 0.6, 0.6, 0.5, True) is None
+
+
+def test_write_candidates_reviews_gray_faces_with_text(m, monkeypatch):
+    rng = np.random.default_rng(11)
+    G = _person(rng, 4)
+    base = G.mean(axis=0)
+    base /= np.linalg.norm(base)
+    noise = rng.standard_normal(DIM)
+    noise -= noise.dot(base) * base
+    noise /= np.linalg.norm(noise)
+    gray = 0.57 * base + np.sqrt(1 - 0.57 ** 2) * noise   # 本人の正解との最大がおよそ 0.5〜0.6
+    emb = {200: gray.astype(np.float32), 201: gray.astype(np.float32)}
+    monkeypatch.setattr(m, "load_embeddings", lambda state, db, ids: {f: emb[f] for f in ids if f in emb})
+    monkeypatch.setattr(m, "face_page_text", lambda db, ids: {200: "テスト花子 出演作品", 201: "別の人のページ"})
+    ident = {"G": G, "N": np.zeros((0, DIM), np.float32), "excluded": set(),
+             "aliases": m.prepare_aliases(["テスト 花子"])}
+    mx = float((G @ gray).max())
+    assert 0.5 <= mx < 0.6, mx
+    state = {"auto_threshold": 0.6, "review_floor": 0.6, "text_floor": 0.5, "dry_run": False}
+    db = _Db()
+    st = m.write_candidates(state, db, "k" * 32, ident, {200: 1, 201: 1}, "newface", None)
+    assert st == {"candidates": 2, "auto": 0, "review": 1}
+    rows = [e for e in db.log if e[0] == "many"][0][2]
+    assert len(rows) == 1 and rows[0][1] == 200 and rows[0][2] == "review"
+    assert rows[0][3] == "newface+text" and rows[0][10] == 1
