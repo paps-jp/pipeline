@@ -445,100 +445,208 @@ def test_like_patterns_escape_and_variants(m):
     assert m.like_patterns("ABC-123") == ["%ABC-123%", "%ABC123%"]
 
 
-def test_url_text_matches_terms_in_encoded_and_slug_urls(m):
-    """URL の中の登録語も当てる (2026-11-22)。%エンコードを戻し、区切りの中の - _ . は無視する。"""
-    import urllib.parse
-    al = m.prepare_aliases(["テスト 花子", "Hanako Yamada"])
-    enc = "https://ex.test/tag/" + urllib.parse.quote("テスト花子") + "/page/2"
-    assert m.match_aliases(m.page_text(None, None, enc), al) == ["テスト 花子"]
-    assert m.match_aliases(m.page_text(None, None, "https://ex.test/v/hanako-yamada.html?x=1"), al) == ["Hanako Yamada"]
-    assert m.match_aliases(m.page_text(None, None, "https://ex.test/search?q=hanako+yamada"), al) == ["Hanako Yamada"]
+def test_term_occurrences_tell_whole_words_from_parts_of_longer_names(m):
+    """語がそのまま出ているか、長い名前の一部として出ているか (2026-11-22、設計 §7.10)。
+
+    本番の一致 14,218 ページのうち、語がそのまま出ていたのは 12%。残りは別の人のフルネームの一部などだった。
+    """
+    n = m.norm_text("ハナコ")
+    S, W = m.STRONG, m.WEAK
+    assert m.term_occurrences("【新作】ハナコ 写真集", n) == [(S, "")]
+    assert m.term_occurrences("ハナコちゃんの日記", n) == [(S, "")]          # 敬称
+    assert m.term_occurrences("人気のはなこ出演作", n) == [(S, "")]          # 前が助詞・後ろが漢字
+    assert m.term_occurrences("佐藤はなこ 写真集", n) == [(W, "佐藤はなこ")]  # 前に別の苗字
+    assert m.term_occurrences("はなこみみ", n) == [(W, "はなこみみ")]        # 後ろに名前が続く
+    code = m.norm_text("ABC-123")
+    assert m.term_occurrences("ABC-1234 発売", code) == [(W, "abc-1234")]     # 別の品番
+    assert m.term_occurrences("abc123 発売", code) == [(S, "")]
+    # 照合は norm_text と同じ (区切りの違いは無視)、前後は元の文字で見る
+    assert m.term_occurrences("テスト・花子", m.norm_text("テスト 花子")) == [(S, "")]
+    assert m.term_occurrences("ハナコ と 佐藤ハナコ", n) == [(S, ""), (W, "佐藤はなこ")]
+    assert m.term_occurrences(None, n) == [] and m.term_occurrences("別の話", n) == []
 
 
-def test_url_text_does_not_join_across_separators(m):
-    """URL の区切りどうしや、タイトルと説明文の継ぎ目で語が偶然つながらない。"""
-    al = m.prepare_aliases(["hanako"])
-    assert m.match_aliases(m.page_text(None, None, "https://ex.test/han/ako"), al) == []
-    assert m.match_aliases(m.page_text(None, None, "https://ex.test/?q=han&ako=1"), al) == []
-    assert m.match_aliases(m.page_text("... han", "ako ...", None), al) == []
-    assert m.match_aliases(m.page_text(None, None, "https://hanako.ex.test/"), al) == ["hanako"]
+def test_is_search_url(m):
+    assert m.is_search_url("https://ex.test/?word=x&page=2")
+    assert m.is_search_url("https://ex.test/search?search_type=photos&search_query=x")
+    assert m.is_search_url("https://ex.test/search/?genre=1")
+    assert not m.is_search_url("https://ex.test/video/123/title")
+    assert not m.is_search_url("https://ex.test/researcher/1") and not m.is_search_url(None)
 
 
-def test_url_like_patterns_cover_percent_encoded_and_kana_forms(m):
-    import urllib.parse
-    pats = m.url_like_patterns("テスト 花子")
-    q = lambda s: "%" + urllib.parse.quote(s, safe="").replace("%", "!%") + "%"  # noqa: E731
-    assert q("テスト花子") in pats and q("てすと花子") in pats and q("テスト 花子") in pats
-    assert "%" + urllib.parse.quote_plus("テスト 花子", safe="").replace("%", "!%") + "%" in pats
-    assert m.url_like_patterns("Hanako Yamada") == ["%Hanako Yamada%", "%HanakoYamada%"]
-    assert m.url_like_patterns("a_b%c") == ["%a!_b!%c%", "%ab!%c%"]
+def test_classify_page_takes_the_strongest_field_and_ignores_search_pages(m):
+    al = m.prepare_aliases(["ハナコ", "ABC-123"])
+    res = m.classify_page({"title": "佐藤ハナコ", "body": "出演: ハナコ / 関連 ABC-1234"}, "https://ex.test/v/1", al)
+    assert res == [("ハナコ", m.STRONG, "body", ""), ("ABC-123", m.WEAK, "body", "abc-1234")]
+    # 検索結果のページは一致を記録するが、手がかりにしない
+    assert m.classify_page({"title": "ハナコ"}, "https://ex.test/?q=ハナコ", al) == [("ハナコ", m.NONE, "title", "")]
+    # URL にだけ語があっても当てない
+    assert m.classify_page({"title": "関係ないページ"}, "https://ex.test/hanako/abc-123", al) == []
 
 
-def test_scan_text_hits_also_looks_at_urls_and_rescans_once(m, monkeypatch):
-    """走査の SQL は url も LIKE で見て、URL にだけ語があるページも identity_text_hit に入る。
-    見る欄が増えたので、登録語が同じでも既存のページを 1 回走査し直す (TEXT_SCAN_VERSION)。"""
+def test_scan_text_hits_reads_titles_only_records_strength_and_rescans_once(m, monkeypatch):
+    """走査はタイトル・説明文だけを LIKE で見て、語の出方の強さを identity_text_page に書く。
+    URL は見ない。判定を変えたので、登録語が同じでも既存のページを 1 回走査し直す (TEXT_SCAN_VERSION)。"""
     import json
-    import urllib.parse
-    aliases = {"k" * 32: m.prepare_aliases(["テスト 花子"])}
-    cursor = {"textscan": json.dumps({"sig": "old-sig-before-url", "next": 999, "max": 999, "win": 1000})}
+    aliases = {"k" * 32: m.prepare_aliases(["ハナコ"])}
+    cursor = {"textscan": json.dumps({"sig": "sig-from-version-2", "next": 999, "max": 999, "win": 1000})}
     sqls, written = [], []
 
     def q(db, sql, params=()):
         sqls.append((sql, list(params)))
         if "DISTINCT identity_key" in sql:
-            return []
+            return [("k" * 32, "消した語")]
         if sql.startswith("SELECT MAX(id) FROM crawl"):
             return [(10,)]
-        return [(7, None, None, "https://ex.test/" + urllib.parse.quote("テスト花子")),
-                (8, "関係ないページ", None, "https://ex.test/other")]
+        return [(7, "ハナコ 写真集", None, "https://ex.test/7"),
+                (8, "佐藤ハナコ", None, "https://ex.test/8"),
+                (9, "ハナコ", None, "https://ex.test/?word=ハナコ")]
+    deleted = []
     monkeypatch.setattr(m, "_q", q)
-    monkeypatch.setattr(m, "_exec", lambda db, sql, params=(): 0)
+    monkeypatch.setattr(m, "_exec", lambda db, sql, params=(): deleted.append(params) or 1)
     monkeypatch.setattr(m, "_exec_many", lambda db, sql, rows: written.extend(rows))
     monkeypatch.setattr(m, "_cursor_get", lambda db, name: cursor.get(name))
     monkeypatch.setattr(m, "_cursor_set", lambda db, name, v: cursor.__setitem__(name, v))
     state = {"text_scan_window": 1000, "text_scan_budget_s": 5, "text_scan_target_s": 2}
     st = m.scan_text_hits(state, None, aliases, deadline=__import__("time").time() + 5)
     scan = [x for x in sqls if x[0].startswith("SELECT id, title, description, url FROM crawl")]
-    assert scan and scan[0][1][:2] == [0, 1000]   # 走査し直し: 0 から
-    assert "url LIKE ? ESCAPE '!'" in scan[0][0]
-    assert written == [("k" * 32, 7, "テスト 花子")] and st["hits"] == 1
+    assert scan and scan[0][1][:2] == [0, 1000]       # 走査し直し: 0 から
+    assert "url LIKE" not in scan[0][0]
+    K = "k" * 32
+    assert written == [(K, 7, "ハナコ", 2, "title", "", "scan"), (K, 8, "ハナコ", 1, "title", "佐藤はなこ", "scan"),
+                       (K, 9, "ハナコ", 0, "title", "", "scan")]
+    assert st["hits"] == 3 and st["removed"] == 1 and deleted[0] == (K, "消した語")
     assert json.loads(cursor["textscan"])["sig"] == m._alias_sig(aliases)
 
 
+def test_upsert_text_page_keeps_the_stronger_row(m):
+    """同じページ・同じ語は強いほうを残す。field 等は strength を上げる前に書く (MariaDB は左から評価する)。"""
+    sql = m.UPSERT_TEXT_PAGE
+    assert sql.index("field    = IF(VALUES(strength) > strength") < sql.index("strength = GREATEST(")
+    assert sql.index("src      = IF(") < sql.index("strength = GREATEST(")
+
+
 def test_decide_with_text(m):
+    S, W = m.STRONG, m.WEAK
     # 顔だけで auto のものはそのまま
-    assert m.decide_with_text(0.7, -1, 0.6, 0.6, 0.5, False) == "auto"
-    # 0.5〜0.6 は登録語が一致したときだけ review
-    assert m.decide_with_text(0.55, -1, 0.6, 0.6, 0.5, True) == "review"
-    assert m.decide_with_text(0.55, -1, 0.6, 0.6, 0.5, False) is None
-    # text_floor 未満・別人の正解の方が近いものは、登録語が一致しても捨てる
-    assert m.decide_with_text(0.45, -1, 0.6, 0.6, 0.5, True) is None
-    assert m.decide_with_text(0.55, 0.58, 0.6, 0.6, 0.5, True) is None
+    assert m.decide_with_text(0.7, -1, 0.6, 0.6, 0.2, 0) == "auto"
+    # 語がそのまま出ていれば text_floor から、長い名前の一部なら weak_floor から review
+    assert m.decide_with_text(0.25, -1, 0.6, 0.6, 0.2, S, 0.5) == "review"
+    assert m.decide_with_text(0.25, -1, 0.6, 0.6, 0.2, W, 0.5) is None
+    assert m.decide_with_text(0.55, -1, 0.6, 0.6, 0.2, W, 0.5) == "review"
+    assert m.decide_with_text(0.55, -1, 0.6, 0.6, 0.2, 0) is None
+    # True は STRONG (旧い呼び方)。text_floor 未満・別人の正解の方が近いものは捨てる
+    assert m.decide_with_text(0.25, -1, 0.6, 0.6, 0.2, True) == "review"
+    assert m.decide_with_text(0.15, -1, 0.6, 0.6, 0.2, S) is None
+    assert m.decide_with_text(0.55, 0.58, 0.6, 0.6, 0.2, S) is None
 
 
-def test_write_candidates_reviews_gray_faces_with_text(m, monkeypatch):
-    rng = np.random.default_rng(11)
+def _gray_face(m, rng, target):
     G = _person(rng, 4)
     base = G.mean(axis=0)
     base /= np.linalg.norm(base)
     noise = rng.standard_normal(DIM)
     noise -= noise.dot(base) * base
     noise /= np.linalg.norm(noise)
-    gray = 0.57 * base + np.sqrt(1 - 0.57 ** 2) * noise   # 本人の正解との最大がおよそ 0.5〜0.6
-    emb = {200: gray.astype(np.float32), 201: gray.astype(np.float32)}
-    monkeypatch.setattr(m, "load_embeddings", lambda state, db, ids: {f: emb[f] for f in ids if f in emb})
-    monkeypatch.setattr(m, "face_page_text", lambda db, ids: {200: "テスト花子 出演作品", 201: "別の人のページ"})
-    ident = {"G": G, "N": np.zeros((0, DIM), np.float32), "excluded": set(),
-             "aliases": m.prepare_aliases(["テスト 花子"])}
+    return G, (target * base + np.sqrt(1 - target ** 2) * noise).astype(np.float32)
+
+
+def test_write_candidates_uses_the_strength_of_the_text(m, monkeypatch):
+    rng = np.random.default_rng(11)
+    G, gray = _gray_face(m, rng, 0.45)
     mx = float((G @ gray).max())
-    assert 0.5 <= mx < 0.6, mx
-    state = {"auto_threshold": 0.6, "review_floor": 0.6, "text_floor": 0.5, "dry_run": False}
+    assert 0.3 <= mx < 0.5, mx
+    emb = {200: gray, 201: gray, 202: gray}
+    monkeypatch.setattr(m, "load_embeddings", lambda state, db, ids: {f: emb[f] for f in ids if f in emb})
+    monkeypatch.setattr(m, "face_page_text", lambda db, ids: {
+        200: [("ハナコ 出演作品", None, "https://ex.test/1")],
+        201: [("佐藤ハナコ 出演作品", None, "https://ex.test/2")],      # 長い名前の一部 → 0.5 未満は出さない
+        202: [("ハナコ", None, "https://ex.test/?q=ハナコ")]})          # 検索ページ → 出さない
+    ident = {"G": G, "N": np.zeros((0, DIM), np.float32), "excluded": set(), "aliases": m.prepare_aliases(["ハナコ"])}
+    state = {"auto_threshold": 0.6, "review_floor": 0.6, "text_floor": 0.2, "text_floor_weak": 0.5, "dry_run": False}
     db = _Db()
-    st = m.write_candidates(state, db, "k" * 32, ident, {200: 1, 201: 1}, "newface", None)
-    assert st == {"candidates": 2, "auto": 0, "review": 1}
+    st = m.write_candidates(state, db, "k" * 32, ident, {200: 1, 201: 1, 202: 1}, "newface", None)
+    assert st == {"candidates": 3, "auto": 0, "review": 1}
     rows = [e for e in db.log if e[0] == "many"][0][2]
     assert len(rows) == 1 and rows[0][1] == 200 and rows[0][2] == "review"
-    assert rows[0][3] == "newface+text" and rows[0][10] == 1
+    assert rows[0][3] == "newface+text" and rows[0][10] == 1 and rows[0][11] == m.STRONG
+
+
+def test_text_hits_for_combines_first_page_text_faces_and_ingested_images(m, monkeypatch):
+    """最初のページの文字・一致ページに載っていた顔 (identity_text_face)・取り込みで一致した画像 (identity_text_image)
+    のうち、一番強い手がかりを顔ごとに返す。強さ 0 (検索ページ) は手がかりにしない。"""
+    monkeypatch.setattr(m, "face_page_text", lambda db, ids: {
+        1: [("佐藤ハナコ", None, "https://ex.test/1")], 2: [("ハナコ", None, "https://ex.test/?q=x")]})
+
+    def q(db, sql, params=()):
+        if "FROM identity_text_face" in sql:
+            return [(3, 1)]
+        if "identity_text_image" in sql:
+            return [(1, 2), (4, 0)]
+        return []
+    monkeypatch.setattr(m, "_q", q)
+    looked, s = m.text_hits_for(None, "k" * 32, m.prepare_aliases(["ハナコ"]), [1, 2, 3, 4, 5])
+    assert looked == {1, 2, 3, 4} and s == {1: m.STRONG, 3: m.WEAK}
+
+
+def test_consume_page_candidates_records_pages_and_images_then_deletes(m, monkeypatch):
+    """取り込みで残った本文を判定し、ページ (identity_text_page) と画像 (identity_text_image) を書いて行を消す。
+    alt に語がそのまま出ている画像は、ページが「長い名前の一部」でも STRONG。もう顔がある画像はここで判定する。"""
+    import hashlib
+    import json
+    K = "k" * 32
+    imgs = [{"u": "https://cdn/a.jpg", "alt": "ハナコ", "main": 1}, {"u": "https://cdn/b.jpg", "alt": "", "main": 0}]
+    rows = [(1, 500, "https://ex.test/v/1", "佐藤ハナコ と共演", None, None, None, "本文", json.dumps(imgs))]
+    calls = {"q": 0}
+    written, deleted = {}, []
+
+    def q(db, sql, params=()):
+        if sql.startswith("SELECT id, crawl_id"):
+            calls["q"] += 1
+            return rows if calls["q"] == 1 else []
+        if "FROM crawl_image ci JOIN crawl_face" in sql:
+            assert params[0] in (hashlib.sha256(b"https://cdn/a.jpg").digest(), hashlib.sha256(b"https://cdn/b.jpg").digest())
+            return [(900,)]
+        return []
+    monkeypatch.setattr(m, "_q", q)
+    monkeypatch.setattr(m, "_exec", lambda db, sql, params=(): deleted.append((sql, list(params))) or 0)
+    monkeypatch.setattr(m, "_exec_many", lambda db, sql, r: written.setdefault(sql.split()[2], []).extend(r))
+    judged = {}
+    monkeypatch.setattr(m, "write_candidates", lambda state, db, key, ident, cand, rule, ver:
+                        judged.update({key: (sorted(cand), rule)}) or {"auto": 0, "review": 1})
+    idents = {K: {"paused": False, "G": np.zeros((3, DIM), np.float32)}}
+    state = {"page_cand_budget_s": 5, "page_cand_batch": 10}
+    st = m.consume_page_candidates(state, None, {K: m.prepare_aliases(["ハナコ"])}, idents,
+                                   deadline=__import__("time").time() + 5)
+    assert written["identity_text_page"] == [(K, 500, "ハナコ", m.WEAK, "title", "佐藤はなこ", "ingest")]
+    img = sorted(written["identity_text_image"], key=lambda r: r[3])
+    assert [(r[1], r[3], r[4]) for r in img] == [(hashlib.sha256(b"https://cdn/b.jpg").digest(), m.WEAK, 0),
+                                                 (hashlib.sha256(b"https://cdn/a.jpg").digest(), m.STRONG, 1)]
+    assert judged == {K: ([900], "page")}
+    assert any("DELETE FROM page_text_candidate WHERE id IN" in s and p == [1] for s, p in deleted)
+    assert st["pages"] == 1 and st["weak"] == 1 and st["images"] == 2 and st["review"] == 1
+
+
+def test_consume_page_candidates_skips_search_pages(m, monkeypatch):
+    import json
+    K = "k" * 32
+    rows = [(1, 500, "https://ex.test/?word=ハナコ", "ハナコ", None, None, None, None,
+             json.dumps([{"u": "https://cdn/a.jpg", "alt": "ハナコ"}]))]
+    calls = {"q": 0}
+    written = {}
+
+    def q(db, sql, params=()):
+        if sql.startswith("SELECT id, crawl_id"):
+            calls["q"] += 1
+            return rows if calls["q"] == 1 else []
+        return []
+    monkeypatch.setattr(m, "_q", q)
+    monkeypatch.setattr(m, "_exec", lambda db, sql, params=(): 0)
+    monkeypatch.setattr(m, "_exec_many", lambda db, sql, r: written.setdefault(sql.split()[2], []).extend(r))
+    st = m.consume_page_candidates({"page_cand_budget_s": 5, "page_cand_batch": 10}, None,
+                                   {K: m.prepare_aliases(["ハナコ"])}, {}, deadline=__import__("time").time() + 5)
+    assert written["identity_text_page"][0][3] == m.NONE and written.get("identity_text_image", []) == []
+    assert st["search"] == 1
 
 
 def test_run_pass_scans_pages_for_clients_without_face_labels(m, monkeypatch):
@@ -566,11 +674,12 @@ def test_record_text_faces_routes_faces_to_the_identities_of_their_pages(m, monk
                         or {"candidates": len(cand), "auto": 0, "review": len(cand)})
     db = _Db()
     st = {"faces": 0, "auto": 0, "review": 0}
-    pages = {10: {A}, 20: {A, B}}
+    pages = {10: {A: 2}, 20: {A: 1, B: 1}, 11: {A: 1}}
     m._record_text_faces({}, db, {A: {}, B: {}}, {100: [11, 10], 101: [20], 102: [99]}, pages, st)
     assert called == {A: ([100, 101], "page"), B: ([101], "page")}     # 102 はどの一致ページにも無い
     rows = sorted(r for e in db.log if e[0] == "many" for r in e[2])
-    assert rows == [(A, 100, 10), (A, 101, 20), (B, 101, 20)]
+    # 顔が何ページにも載っていれば、一番強いページを残す (100 は 11 で 1、10 で 2)
+    assert rows == [(A, 100, 10, 2), (A, 101, 20, 1), (B, 101, 20, 1)]
     assert st == {"faces": 3, "auto": 0, "review": 3}
 
 
@@ -588,6 +697,30 @@ def test_run_pass_stays_busy_while_text_face_scan_has_sites_left(m, monkeypatch)
     state = {"auto_threshold": 0.6, "review_floor": 0.6, "text_floor": 0.2, "newface_batch": 100}
     out, busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
     assert busy and out["textface_faces"] == 7 and out["textface_review"] == 2
+    left["n"] = 0
+    _out, busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
+    assert not busy
+
+
+def test_run_pass_consumes_page_candidates_and_stays_busy_while_rows_are_left(m, monkeypatch):
+    """取り込みで残った本文 (page_text_candidate) を毎巡読む。読み残しがあれば待たずに次の巡へ。"""
+    monkeypatch.setattr(m, "sync_labels", lambda state, db: {})
+    monkeypatch.setattr(m, "load_aliases", lambda state, db: {"k" * 32: m.prepare_aliases(["ハナコ"])})
+    monkeypatch.setattr(m, "_faiss", lambda state: ([], None))
+    monkeypatch.setattr(m, "match_new_faces", lambda state, db, idents, deadline: {"new_faces": 0, "auto": 0, "review": 0})
+    monkeypatch.setattr(m, "sync_persons", lambda state, db, idents: {})
+    monkeypatch.setattr(m, "daily_eval", lambda state, db, idents: 0)
+    monkeypatch.setattr(m, "scan_text_hits", lambda state, db, aliases, deadline: {"scanned_to": 0})
+    monkeypatch.setattr(m, "scan_text_faces", lambda state, db, idents, deadline: {"sites_left": 0})
+    stats = []
+    monkeypatch.setattr(m, "refresh_alias_stats", lambda state, db, aliases: stats.append(sorted(aliases)) or 0)
+    left = {"n": 1}
+    monkeypatch.setattr(m, "consume_page_candidates", lambda state, db, aliases, idents, deadline:
+                        {"pages": 40, "strong": 3, "weak": 9, "left": left["n"]})
+    state = {"auto_threshold": 0.6, "review_floor": 0.6, "text_floor": 0.2, "newface_batch": 100}
+    out, busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
+    assert busy and out["ingest_pages"] == 40 and out["ingest_weak"] == 9 and "ingest_left" not in out
+    assert stats == [["k" * 32]]
     left["n"] = 0
     _out, busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
     assert not busy
