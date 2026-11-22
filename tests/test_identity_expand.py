@@ -445,6 +445,66 @@ def test_like_patterns_escape_and_variants(m):
     assert m.like_patterns("ABC-123") == ["%ABC-123%", "%ABC123%"]
 
 
+def test_url_text_matches_terms_in_encoded_and_slug_urls(m):
+    """URL の中の登録語も当てる (2026-11-22)。%エンコードを戻し、区切りの中の - _ . は無視する。"""
+    import urllib.parse
+    al = m.prepare_aliases(["テスト 花子", "Hanako Yamada"])
+    enc = "https://ex.test/tag/" + urllib.parse.quote("テスト花子") + "/page/2"
+    assert m.match_aliases(m.page_text(None, None, enc), al) == ["テスト 花子"]
+    assert m.match_aliases(m.page_text(None, None, "https://ex.test/v/hanako-yamada.html?x=1"), al) == ["Hanako Yamada"]
+    assert m.match_aliases(m.page_text(None, None, "https://ex.test/search?q=hanako+yamada"), al) == ["Hanako Yamada"]
+
+
+def test_url_text_does_not_join_across_separators(m):
+    """URL の区切りどうしや、タイトルと説明文の継ぎ目で語が偶然つながらない。"""
+    al = m.prepare_aliases(["hanako"])
+    assert m.match_aliases(m.page_text(None, None, "https://ex.test/han/ako"), al) == []
+    assert m.match_aliases(m.page_text(None, None, "https://ex.test/?q=han&ako=1"), al) == []
+    assert m.match_aliases(m.page_text("... han", "ako ...", None), al) == []
+    assert m.match_aliases(m.page_text(None, None, "https://hanako.ex.test/"), al) == ["hanako"]
+
+
+def test_url_like_patterns_cover_percent_encoded_and_kana_forms(m):
+    import urllib.parse
+    pats = m.url_like_patterns("テスト 花子")
+    q = lambda s: "%" + urllib.parse.quote(s, safe="").replace("%", "!%") + "%"  # noqa: E731
+    assert q("テスト花子") in pats and q("てすと花子") in pats and q("テスト 花子") in pats
+    assert "%" + urllib.parse.quote_plus("テスト 花子", safe="").replace("%", "!%") + "%" in pats
+    assert m.url_like_patterns("Hanako Yamada") == ["%Hanako Yamada%", "%HanakoYamada%"]
+    assert m.url_like_patterns("a_b%c") == ["%a!_b!%c%", "%ab!%c%"]
+
+
+def test_scan_text_hits_also_looks_at_urls_and_rescans_once(m, monkeypatch):
+    """走査の SQL は url も LIKE で見て、URL にだけ語があるページも identity_text_hit に入る。
+    見る欄が増えたので、登録語が同じでも既存のページを 1 回走査し直す (TEXT_SCAN_VERSION)。"""
+    import json
+    import urllib.parse
+    aliases = {"k" * 32: m.prepare_aliases(["テスト 花子"])}
+    cursor = {"textscan": json.dumps({"sig": "old-sig-before-url", "next": 999, "max": 999, "win": 1000})}
+    sqls, written = [], []
+
+    def q(db, sql, params=()):
+        sqls.append((sql, list(params)))
+        if "DISTINCT identity_key" in sql:
+            return []
+        if sql.startswith("SELECT MAX(id) FROM crawl"):
+            return [(10,)]
+        return [(7, None, None, "https://ex.test/" + urllib.parse.quote("テスト花子")),
+                (8, "関係ないページ", None, "https://ex.test/other")]
+    monkeypatch.setattr(m, "_q", q)
+    monkeypatch.setattr(m, "_exec", lambda db, sql, params=(): 0)
+    monkeypatch.setattr(m, "_exec_many", lambda db, sql, rows: written.extend(rows))
+    monkeypatch.setattr(m, "_cursor_get", lambda db, name: cursor.get(name))
+    monkeypatch.setattr(m, "_cursor_set", lambda db, name, v: cursor.__setitem__(name, v))
+    state = {"text_scan_window": 1000, "text_scan_budget_s": 5, "text_scan_target_s": 2}
+    st = m.scan_text_hits(state, None, aliases, deadline=__import__("time").time() + 5)
+    scan = [x for x in sqls if x[0].startswith("SELECT id, title, description, url FROM crawl")]
+    assert scan and scan[0][1][:2] == [0, 1000]   # 走査し直し: 0 から
+    assert "url LIKE ? ESCAPE '!'" in scan[0][0]
+    assert written == [("k" * 32, 7, "テスト 花子")] and st["hits"] == 1
+    assert json.loads(cursor["textscan"])["sig"] == m._alias_sig(aliases)
+
+
 def test_decide_with_text(m):
     # 顔だけで auto のものはそのまま
     assert m.decide_with_text(0.7, -1, 0.6, 0.6, 0.5, False) == "auto"
@@ -495,3 +555,39 @@ def test_run_pass_scans_pages_for_clients_without_face_labels(m, monkeypatch):
     state = {"auto_threshold": 0.6, "review_floor": 0.6, "text_floor": 0.5, "newface_batch": 100}
     out, _busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
     assert list(got) == ["k" * 32] and out["text_scanned_to"] == 5 and out["text_hits"] == 1
+
+
+def test_record_text_faces_routes_faces_to_the_identities_of_their_pages(m, monkeypatch):
+    """一致したページに載っていた顔は、そのページに語が一致した対象者だけの候補にする。"""
+    A, B = "a" * 32, "b" * 32
+    called = {}
+    monkeypatch.setattr(m, "write_candidates",
+                        lambda state, db, key, ident, cand, rule, ver: called.update({key: (sorted(cand), rule)})
+                        or {"candidates": len(cand), "auto": 0, "review": len(cand)})
+    db = _Db()
+    st = {"faces": 0, "auto": 0, "review": 0}
+    pages = {10: {A}, 20: {A, B}}
+    m._record_text_faces({}, db, {A: {}, B: {}}, {100: [11, 10], 101: [20], 102: [99]}, pages, st)
+    assert called == {A: ([100, 101], "page"), B: ([101], "page")}     # 102 はどの一致ページにも無い
+    rows = sorted(r for e in db.log if e[0] == "many" for r in e[2])
+    assert rows == [(A, 100, 10), (A, 101, 20), (B, 101, 20)]
+    assert st == {"faces": 3, "auto": 0, "review": 3}
+
+
+def test_run_pass_stays_busy_while_text_face_scan_has_sites_left(m, monkeypatch):
+    monkeypatch.setattr(m, "sync_labels", lambda state, db: {})
+    monkeypatch.setattr(m, "load_aliases", lambda state, db: {})
+    monkeypatch.setattr(m, "_faiss", lambda state: ([], None))
+    monkeypatch.setattr(m, "match_new_faces", lambda state, db, idents, deadline: {"new_faces": 0, "auto": 0, "review": 0})
+    monkeypatch.setattr(m, "sync_persons", lambda state, db, idents: {})
+    monkeypatch.setattr(m, "daily_eval", lambda state, db, idents: 0)
+    monkeypatch.setattr(m, "scan_text_hits", lambda state, db, aliases, deadline: {"scanned_to": 0})
+    left = {"n": 3}
+    monkeypatch.setattr(m, "scan_text_faces", lambda state, db, idents, deadline:
+                        {"sites": 1, "sites_left": left["n"], "faces": 7, "review": 2})
+    state = {"auto_threshold": 0.6, "review_floor": 0.6, "text_floor": 0.2, "newface_batch": 100}
+    out, busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
+    assert busy and out["textface_faces"] == 7 and out["textface_review"] == 2
+    left["n"] = 0
+    _out, busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
+    assert not busy
