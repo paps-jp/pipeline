@@ -166,7 +166,7 @@ def env(vp, monkeypatch):
     monkeypatch.setattr(vp, "_self_enqueue_next_tick", lambda *a, **k: None)
     monkeypatch.setattr(vp.time, "sleep", lambda s: None)
 
-    def fake_insert(db, job, asset, min_bytes):
+    def fake_insert(db, job, asset, min_bytes, crawl_id=0):
         rec["inserted"].append(job["job_id"])
         return "inserted"
     monkeypatch.setattr(vp, "_insert_video", fake_insert)

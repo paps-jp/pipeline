@@ -70,8 +70,9 @@ def env(vp, monkeypatch):
     monkeypatch.setattr(vp, "_self_enqueue_next_tick", lambda *a, **k: None)
     monkeypatch.setattr(vp.time, "sleep", lambda s: None)
 
-    def fake_insert(db, job, asset, min_bytes):
+    def fake_insert(db, job, asset, min_bytes, crawl_id=0):
         rec["inserted"].append(job["job_id"])
+        rec.setdefault("crawl_ids", []).append(crawl_id)
         return "inserted"
     monkeypatch.setattr(vp, "_insert_video", fake_insert)
 
@@ -164,3 +165,58 @@ def test_jobs_without_assets_are_not_fetched(vp, env, monkeypatch):
     st = _state(vp, base - timedelta(seconds=1))
     vp.process(None, None, st)
     assert len(fetched) == 1 and "/jobs/full/result" in fetched[0]
+
+
+class _RecCur:
+    def __init__(self, db):
+        self.db = db
+        self.rowcount = 1
+
+    def execute(self, sql, params=()):
+        self.db.sqls.append((" ".join(sql.split()), tuple(params)))
+        self._row = self.db.page_row if sql.lstrip().startswith("SELECT id FROM crawl") else None
+
+    def fetchone(self):
+        return self._row
+
+    def close(self):
+        pass
+
+
+class _RecDb(_Db):
+    def __init__(self, page_row):
+        self.sqls = []
+        self.page_row = page_row
+
+    def cursor(self):
+        return _RecCur(self)
+
+
+def test_insert_video_records_the_page_it_was_on(vp):
+    """動画にも載っていたページ (crawl.id) を入れる。2026-11-22 まで常に 0 で、
+    動画の顔からページのタイトル・登録語の一致をたどれなかった。"""
+    db = _RecDb((4242,))
+    job = {"job_id": "j1", "url": "https://ex.test/watch/1"}
+    cid = vp._find_crawl_id(db, job["url"])
+    assert cid == 4242
+    assert db.sqls[0] == ("SELECT id FROM crawl WHERE url_sha256 = UNHEX(SHA2(%s, 256)) LIMIT 1",
+                          ("https://ex.test/watch/1",))
+    r = vp._insert_video(db, job, {"name": "a.mp4", "size": 5 << 20, "url": "https://cdn/a.mp4"}, 1 << 20, cid)
+    assert r == "inserted"
+    sql, params = db.sqls[-1]
+    assert sql.startswith("INSERT IGNORE INTO crawl_video") and params[0] == 4242
+
+
+def test_find_crawl_id_is_zero_when_the_page_is_unknown(vp):
+    assert vp._find_crawl_id(_RecDb(None), "https://ex.test/none") == 0
+    assert vp._find_crawl_id(_RecDb((1,)), "") == 0
+
+
+def test_process_passes_the_page_id_and_counts_it(vp, env):
+    base = datetime.now(timezone.utc) - timedelta(minutes=30)
+    env["jobs"] = [{"job_id": "j1", "url": "https://ex.test/p", "completed_at": _iso(base),
+                    "progress": {"assets_saved": 1}}]
+    st = _state(vp, base - timedelta(seconds=1))
+    out = vp.process(None, None, st)
+    # _Db のカーソルは常に (1,) を返す = ページが見つかった
+    assert env["crawl_ids"] == [1] and out["with_page"] == 1
