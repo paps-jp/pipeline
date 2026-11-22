@@ -180,6 +180,72 @@ def test_write_candidates_skips_labeled_faces_and_writes_dry_run(m, monkeypatch)
     assert all(r[2] == "auto" and r[3] == "seed" and r[8] == "v1" and r[9] == 1 for r in rows)
 
 
+def test_search_seeds_judges_each_face_once(m, monkeypatch):
+    """別の起点の検索にも出た顔を、1 回の中で重ねて判定・数えない。"""
+    rng = np.random.default_rng(6)
+    me = _person(rng, 3)
+    state = {"label_emb": {1: me[0], 2: me[1], 3: me[2]}, "max_seeds": 100, "seed_batch": 2,
+             "topk": 10, "nprobe": 8}
+    ident = {"self": [1, 2, 3], "paused": False}
+    monkeypatch.setattr(m, "_knn", lambda url, vec, topk, nprobe: [100, 101, 102])
+    got: list[list[int]] = []
+    monkeypatch.setattr(m, "write_candidates",
+                        lambda st, db, key, idn, cand, rule, ver: (got.append(sorted(cand)),
+                                                                   {"candidates": len(cand), "auto": len(cand),
+                                                                    "review": 0})[1])
+    st = m.search_seeds(state, _Db(), "k" * 32, ident, ["http://a:9000"], "v1", deadline=float("inf"))
+    assert st["seeds_searched"] == 3 and st["seeds_left"] == 0
+    assert got == [[100, 101, 102], []]          # 2 つ目の束では、もう判定した顔を渡さない
+    assert st["auto"] == 3
+
+
+# ----------------------------------------------------------------------
+# 1 回のタスクの刻み方 (空回りしない)
+# ----------------------------------------------------------------------
+def _pace_state():
+    return {"counter": 0, "loop_s": 1, "idle_s": 0.3, "control_url": "http://x", "workload_slug": "identity-expand"}
+
+
+def test_process_stays_for_loop_s_when_idle(m, monkeypatch):
+    """やることが無くても loop_s 秒は留まり、次のタスクは最後に 1 回だけ積む (初回デプロイで空回りした)。"""
+    calls = {"pass": 0, "enqueue": 0}
+
+    def fake_pass(state, db, deadline):
+        calls["pass"] += 1
+        return {"identities": 1, "seed_auto": 0}, False
+
+    monkeypatch.setattr(m, "run_pass", fake_pass)
+    monkeypatch.setattr(m, "_get_db", lambda state: None)
+    monkeypatch.setattr(m, "_self_enqueue_next_tick",
+                        lambda *a: calls.__setitem__("enqueue", calls["enqueue"] + 1))
+    t0 = __import__("time").time()
+    out = m.process(None, None, _pace_state())
+    took = __import__("time").time() - t0
+    assert took >= 0.95
+    assert 2 <= calls["pass"] <= 5               # idle_s ごとに 1 巡。空回りしない
+    assert calls["enqueue"] == 1
+    assert out["passes"] == calls["pass"]
+
+
+def test_process_waits_after_errors_too(m, monkeypatch):
+    """VIEW が読めない等で毎回失敗しても、すぐに次を積まずに待つ。"""
+    calls = {"pass": 0, "enqueue": 0}
+
+    def failing_pass(state, db, deadline):
+        calls["pass"] += 1
+        raise RuntimeError("SELECT command denied")
+
+    monkeypatch.setattr(m, "run_pass", failing_pass)
+    monkeypatch.setattr(m, "_get_db", lambda state: None)
+    monkeypatch.setattr(m, "_self_enqueue_next_tick",
+                        lambda *a: calls.__setitem__("enqueue", calls["enqueue"] + 1))
+    t0 = __import__("time").time()
+    out = m.process(None, None, _pace_state())
+    assert __import__("time").time() - t0 >= 0.95
+    assert calls["pass"] <= 5 and calls["enqueue"] == 1
+    assert out["errors"] == calls["pass"] and "denied" in out["last_error"]
+
+
 def test_upsert_auto_does_not_override_human_labels(m):
     sql = " ".join(m.UPSERT_AUTO.split())
     assert "decision = IF(decision IN ('auto','review'), VALUES(decision), decision)" in sql
