@@ -253,3 +253,169 @@ def test_upsert_auto_does_not_override_human_labels(m):
     assert sql.rstrip().endswith("VALUES(decision), decision)")
     for col in ("rule", "max_cos", "top3_cos", "neg_cos", "index_version", "dry_run"):
         assert f"{col} = IF(decision IN ('auto','review')" in sql
+
+
+# ----------------------------------------------------------------------
+# person (段階 3): anchor への出し入れ
+# ----------------------------------------------------------------------
+def test_plan_person_moves_adds_and_removes(m):
+    want = {"a": {1, 2, 3}, "b": {10}}
+    members = {"a": {2, 3, 4}, "b": set()}
+    plan = m.plan_person_moves(want, members, frozen=set(), limit=100)
+    assert plan["a"] == {"add": [1], "remove": [4]}
+    assert plan["b"] == {"add": [10], "remove": []}
+
+
+def test_plan_person_moves_skips_ambiguous_and_frozen(m):
+    # 5 は a と b の両方に入れたい → どちらにも入れない。a に入っていれば外す
+    want = {"a": {1, 5}, "b": {5, 6}, "c": {7}}
+    members = {"a": {5}, "c": {8}}
+    plan = m.plan_person_moves(want, members, frozen={"c"}, limit=100)
+    assert plan["a"] == {"add": [1], "remove": [5]}
+    assert plan["b"] == {"add": [6], "remove": []}
+    assert "c" not in plan                      # 止めている対象者は動かさない
+
+
+def test_plan_person_moves_moves_directly_between_anchors(m):
+    # a の anchor にいる 3 が b に入れたい顔になった → a からは「外す」にせず、b へ直接移す
+    plan = m.plan_person_moves({"a": set(), "b": {3}}, {"a": {3}, "b": set()}, frozen=set(), limit=100)
+    assert plan == {"b": {"add": [3], "remove": []}}
+
+
+def test_plan_person_moves_limit_removes_first(m):
+    plan = m.plan_person_moves({"a": {1, 2, 3}}, {"a": {7, 8}}, frozen=set(), limit=3)
+    assert plan["a"]["remove"] == [7, 8] and plan["a"]["add"] == [1]
+
+
+def test_anchor_centroid_picks_closest_self_face(m):
+    rng = np.random.default_rng(7)
+    G = _person(rng, 5)
+    c, rep = m.anchor_centroid({"G": G, "self": [11, 12, 13, 14, 15]})
+    assert abs(np.linalg.norm(c) - 1) < 1e-5
+    assert rep == [11, 12, 13, 14, 15][int(np.argmax(G @ c))]
+    assert m.anchor_centroid({"G": np.zeros((0, DIM), np.float32), "self": []}) is None
+
+
+class _TxCur:
+    def __init__(self, db):
+        self.db = db
+        self.rowcount = 0
+        self.lastrowid = None
+
+    def execute(self, sql, params=()):
+        s = " ".join(sql.split())
+        self.db.log.append((s, tuple(params)))
+        self.rowcount = self.db.rowcounts.pop(0) if s.startswith("UPDATE crawl_face") and self.db.rowcounts else 1
+
+    def fetchall(self):
+        return []
+
+    def close(self):
+        pass
+
+
+class _TxDb:
+    def __init__(self, rowcounts=()):
+        self.log, self.rowcounts = [], list(rowcounts)
+        self.autocommit = True
+        self.commits = self.rollbacks = 0
+
+    def cursor(self):
+        return _TxCur(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+def _meta(pid, video=False, site="s", fid=42):
+    return {"id": fid, "person_id": pid, "site": site, "has_image": not video, "is_video": video}
+
+
+def test_move_face_into_anchor_updates_both_persons_and_logs(m):
+    db = _TxDb()
+    meta = _meta(7)
+    assert m.move_face(db, "k" * 32, meta, 900, "auto", 0.8)
+    sqls = [s for s, _ in db.log]
+    assert sqls[0].startswith("UPDATE crawl_face SET person_id=?")
+    assert db.log[0][1] == (900, 0.8, 42, 7)                 # 読んだときと同じ person のときだけ書く
+    assert any("GREATEST(face_count, 1) - 1" in s for s in sqls)        # 元の person を減らす
+    assert any(s.startswith("UPDATE crawl_person SET face_count = face_count + 1") for s in sqls)
+    assert any("INSERT INTO crawl_person_appearance" in s for s in sqls)
+    assert any("INSERT INTO identity_person_move" in s for s in sqls)
+    assert db.commits == 1 and db.rollbacks == 0 and db.autocommit is True
+    assert meta["person_id"] == 900
+
+
+def test_move_face_release_requeues_for_face_person_link(m):
+    db = _TxDb()
+    assert m.move_face(db, "k" * 32, _meta(900), None, "release", None)
+    sqls = [s for s, _ in db.log]
+    assert any(s.startswith("INSERT INTO face_person_link_queue") for s in sqls)
+    assert not any(s.startswith("UPDATE crawl_person SET face_count = face_count + 1") for s in sqls)
+
+
+def test_move_face_raced_does_nothing(m):
+    db = _TxDb(rowcounts=[0])     # face-person-link が先に書いていた
+    assert not m.move_face(db, "k" * 32, _meta(7), 900, "auto", 0.8)
+    assert len(db.log) == 1 and db.rollbacks == 1 and db.commits == 0 and db.autocommit is True
+
+
+def _person_state(**kw):
+    st = {"dry_run": False, "person_write": False, "person_release_all": False, "person_move_batch": 100}
+    st.update(kw)
+    return st
+
+
+def _fake_q(rows_by_prefix):
+    def q(db, sql, params=()):
+        s = " ".join(sql.split())
+        for prefix, rows in rows_by_prefix.items():
+            if s.startswith(prefix):
+                return rows
+        return []
+    return q
+
+
+WANT = "SELECT identity_key, face_id, decision, max_cos FROM identity_match"
+ANCHORS = "SELECT identity_key, anchor_person_id FROM identity_state"
+
+
+def test_sync_persons_counts_only_unless_person_write(m, monkeypatch):
+    monkeypatch.setattr(m, "_q", _fake_q({WANT: [("k", 1, "label_self", None), ("k", 2, "auto", 0.7)],
+                                          ANCHORS: []}))
+    moved = []
+    monkeypatch.setattr(m, "move_face", lambda *a, **k: moved.append(a) or True)
+    idents = {"k": {"paused": False, "self": [1], "G": _person(np.random.default_rng(8), 1)}}
+    st = m.sync_persons(_person_state(), None, idents)
+    assert st["would_add"] == 2 and st["added"] == 0 and moved == []
+    st = m.sync_persons(_person_state(dry_run=True), None, idents)
+    assert st["would_add"] == 0                          # 試運転中は person に触らない
+
+
+def test_sync_persons_writes_into_new_anchor(m, monkeypatch):
+    monkeypatch.setattr(m, "_q", _fake_q({WANT: [("k", 1, "label_self", None), ("k", 2, "auto", 0.7)],
+                                          ANCHORS: []}))
+    monkeypatch.setattr(m, "_face_meta", lambda db, ids: {f: _meta(None, fid=f) for f in ids})
+    monkeypatch.setattr(m, "ensure_anchor", lambda db, key, ident: 900)
+    moved = []
+    monkeypatch.setattr(m, "move_face",
+                        lambda db, key, meta, to, reason, score: moved.append((meta["id"], to, reason, score)) or True)
+    idents = {"k": {"paused": False, "self": [1], "G": _person(np.random.default_rng(9), 1)}}
+    st = m.sync_persons(_person_state(person_write=True), None, idents)
+    assert st["anchors_created"] == 1 and st["added"] == 2
+    assert moved == [(1, 900, "label_self", 1.0), (2, 900, "auto", 0.7)]
+
+
+def test_sync_persons_release_all(m, monkeypatch):
+    monkeypatch.setattr(m, "_q", _fake_q({WANT: [("k", 1, "label_self", None)], ANCHORS: [("k", 900)],
+                                          "SELECT id FROM crawl_face WHERE person_id=?": [(1,), (2,)]}))
+    monkeypatch.setattr(m, "_face_meta", lambda db, ids: {f: _meta(900, fid=f) for f in ids})
+    moved = []
+    monkeypatch.setattr(m, "move_face",
+                        lambda db, key, meta, to, reason, score: moved.append((meta["id"], to, reason)) or True)
+    idents = {"k": {"paused": True, "self": [1], "G": _person(np.random.default_rng(10), 1)}}
+    st = m.sync_persons(_person_state(person_write=True, person_release_all=True), None, idents)
+    assert st["removed"] == 2 and moved == [(1, None, "release"), (2, None, "release")]
