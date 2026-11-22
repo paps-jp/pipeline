@@ -479,3 +479,19 @@ def test_write_candidates_reviews_gray_faces_with_text(m, monkeypatch):
     rows = [e for e in db.log if e[0] == "many"][0][2]
     assert len(rows) == 1 and rows[0][1] == 200 and rows[0][2] == "review"
     assert rows[0][3] == "newface+text" and rows[0][10] == 1
+
+
+def test_run_pass_scans_pages_for_clients_without_face_labels(m, monkeypatch):
+    """顔の確認が 1 件も無い相談者でも、登録語があればページを照合する (2026-11-22 本番で走査が始まらなかった)。"""
+    monkeypatch.setattr(m, "sync_labels", lambda state, db: {})
+    monkeypatch.setattr(m, "load_aliases", lambda state, db: {"k" * 32: m.prepare_aliases(["テスト 花子"])})
+    monkeypatch.setattr(m, "_faiss", lambda state: ([], None))
+    monkeypatch.setattr(m, "match_new_faces", lambda state, db, idents, deadline: {"new_faces": 0, "auto": 0, "review": 0})
+    monkeypatch.setattr(m, "sync_persons", lambda state, db, idents: {})
+    monkeypatch.setattr(m, "daily_eval", lambda state, db, idents: 0)
+    got = {}
+    monkeypatch.setattr(m, "scan_text_hits",
+                        lambda state, db, aliases, deadline: got.update(aliases) or {"scanned_to": 5, "hits": 1})
+    state = {"auto_threshold": 0.6, "review_floor": 0.6, "text_floor": 0.5, "newface_batch": 100}
+    out, _busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
+    assert list(got) == ["k" * 32] and out["text_scanned_to"] == 5 and out["text_hits"] == 1
