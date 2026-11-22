@@ -8,6 +8,10 @@
   - Proxmox ノードの行は gpu_index=-2 で、cpu_pct = PVE の cpu × 100、mem_used_mb / mem_total_mb = RAM。
     online でないノードは書かない
   - 行の並びが UPSERT の placeholder の数と一致する (列を足したときのずれ防止)
+  - ワーカーの機械の cpu_pct は、Proxmox のゲストとして見つかれば PVE の実際の使用率を使う
+    (LXC の中の load は親ノード全体の値が漏れ、ai-gpu4/5・nas が 100% に張り付いていた。2026-11-22)。
+    nas-c2 はゲスト名 nas で引く。見つからなければ load の値のまま
+  - 「<機械>-<役割>」の host (nas-c2-pipeline-supervisor 等) は、その機械の行にまとめる
 
 plugin は非公開リポジトリの入れ子 clone なので、未配置なら skip する。
 """
@@ -103,3 +107,41 @@ def test_proxmox_node_rows_have_cpu_and_ram(m):
 def test_proxmox_nodes_skipped_without_config(m):
     assert m._pve_nodes({"pve_urls": [], "pve_token": None}) == []
     assert m.build_node_rows([]) == []
+
+
+def test_cpu_row_uses_proxmox_guest_cpu_when_known(m):
+    cpu = {"per_worker": {}, "per_host": {
+        "ai-gpu4": {"cpu_pct": 100.0, "n_workers": 5, "ts": _iso(NOW - 5)},   # CT: load は親ノードの値
+        "nas-c2": {"cpu_pct": 100.0, "n_workers": 12, "ts": _iso(NOW - 5)},   # ゲスト名は nas
+        "elsewhere": {"cpu_pct": 33.0, "n_workers": 2, "ts": _iso(NOW - 5)},  # ゲストでない → load のまま
+    }}
+    guests = m.build_guest_cpu([
+        {"name": "ai-gpu4", "type": "lxc", "status": "running", "cpu": 0.083},
+        {"name": "nas", "type": "lxc", "status": "running", "cpu": 0.237},
+        {"name": "elsewhere", "type": "qemu", "status": "stopped", "cpu": 0.9},  # 止まっている → 使わない
+        {"name": "no-cpu", "type": "qemu", "status": "running"},
+    ])
+    assert guests == {"ai-gpu4": 8.3, "nas": 23.7}
+    rows = m.build_rows({"workers": {}}, cpu, now=NOW, guest_cpu=guests)
+    assert {r[0]: r[7] for r in rows} == {"ai-gpu4": 8.3, "elsewhere": 33.0, "nas-c2": 23.7}
+
+
+def test_role_suffixed_hosts_fold_into_their_machine(m):
+    cpu = {"per_worker": {}, "per_host": {
+        "nas-c2": {"cpu_pct": 40.0, "n_workers": 12, "ts": _iso(NOW - 9)},
+        "nas-c2-pipeline-supervisor": {"cpu_pct": 55.0, "n_workers": 1, "ts": _iso(NOW - 3)},
+        "nas-c2-proxmox-manager": {"cpu_pct": 50.0, "n_workers": 1, "ts": _iso(NOW - 4)},
+        "ai-gpu1": {"cpu_pct": 10.0, "n_workers": 3, "ts": _iso(NOW - 1)},
+        "ai-gpu10": {"cpu_pct": 20.0, "n_workers": 1, "ts": _iso(NOW - 1)},     # ai-gpu1 の役割ではない
+    }}
+    rows = m.build_rows({"workers": {}}, cpu, now=NOW)
+    assert rows == [
+        ("ai-gpu1", -1, None, None, None, None, None, 10.0, 3, m._utc(NOW - 1)),
+        ("ai-gpu10", -1, None, None, None, None, None, 20.0, 1, m._utc(NOW - 1)),
+        ("nas-c2", -1, None, None, None, None, None, 55.0, 14, m._utc(NOW - 3)),
+    ]
+
+
+def test_proxmox_guests_skipped_without_config(m):
+    assert m._pve_guests({"pve_urls": [], "pve_token": None}) == []
+    assert m.build_guest_cpu([]) == {}
