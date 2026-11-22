@@ -10,7 +10,7 @@
   - 行の並びが UPSERT の placeholder の数と一致する (列を足したときのずれ防止)
   - ワーカーの機械の cpu_pct は、Proxmox のゲストとして見つかれば PVE の実際の使用率を使う
     (LXC の中の load は親ノード全体の値が漏れ、ai-gpu4/5・nas が 100% に張り付いていた。2026-11-22)。
-    nas-c2 はゲスト名 nas で引く。見つからなければ load の値のまま
+    nas-c2 はゲスト名 nas で引く。見つからなければ load の値のまま。PVE の 1 回の値は跳ねるので直近 60 秒の平均
   - 「<機械>-<役割>」の host (nas-c2-pipeline-supervisor 等) は、その機械の行にまとめる
 
 plugin は非公開リポジトリの入れ子 clone なので、未配置なら skip する。
@@ -145,3 +145,12 @@ def test_role_suffixed_hosts_fold_into_their_machine(m):
 def test_proxmox_guests_skipped_without_config(m):
     assert m._pve_guests({"pve_urls": [], "pve_token": None}) == []
     assert m.build_guest_cpu([]) == {}
+
+
+def test_guest_cpu_is_averaged_over_the_window(m):
+    hist: dict = {}
+    assert m.smooth_guest_cpu(hist, {"ai-gpu1": 26.0, "nas": 20.0}, NOW, window_s=60) == {"ai-gpu1": 26.0, "nas": 20.0}
+    assert m.smooth_guest_cpu(hist, {"ai-gpu1": 0.6, "nas": 30.0}, NOW + 10, window_s=60) == {"ai-gpu1": 13.3, "nas": 25.0}
+    # 窓を出た古い値は使わない。今回出てこなかったゲスト (nas) は返さず、持ち回しからも消す
+    assert m.smooth_guest_cpu(hist, {"ai-gpu1": 40.0}, NOW + 75, window_s=60) == {"ai-gpu1": 40.0}
+    assert "nas" not in hist
