@@ -403,45 +403,83 @@ def test_process_loop_does_not_spin_when_hours_are_left(pkc, monkeypatch):
 
 
 # ---- 6. 文字の N グラムの試し -----------------------------------------------------
+# 英数字以外は 2・3 文字ずつ (番号から文字に戻せる)、英数字は単語 + となり合う 2 語 (ハッシュ、負の番号)
+NL = chr(10)
+
+
 def _txt(pt, ids):
-    return {pt.ngram_text(i) for i in ids}
+    return {pt.ngram_text(i) for i in ids if i >= 0}
 
 
-def test_ngrams_cut_ascii_in_threes_and_the_rest_in_twos(pt):
-    assert _txt(pt, pt.query_ngrams("Yui Hatano")) == {"yui", "uih", "iha", "hat", "ata", "tan", "ano"}
-    assert _txt(pt, pt.query_ngrams("山田花子")) == {"山田", "田花", "花子"}
-    assert _txt(pt, pt.query_ngrams("PPPD-173")) == {"ppp", "ppd", "pd1", "d17", "173"}
-    assert _txt(pt, pt.query_ngrams("ab漢")) == {"ab", "b漢"}          # 英数字との境目は 2 文字
-    assert pt.query_ngrams("a") == set() and pt.query_ngrams("漢") == set()   # 1 文字では探さない
-    assert _txt(pt, pt.query_ngrams("山田【花子】")) == {"山田", "花子"}    # 記号で切る (「田花」は作らない)
+def _words(pt, ids):
+    return {i for i in ids if i < 0}
+
+
+def _w(pt, *ws):
+    return {pt.word_id(w) for w in ws}
+
+
+def test_ngrams_cut_non_ascii_in_twos_and_threes_and_ascii_into_words(pt):
+    q = pt.query_ngrams
+    assert _txt(pt, q("山田花子")) == {"山田", "田花", "花子", "山田花", "田花子"} and not _words(pt, q("山田花子"))
+    for name in ("Yui Hatano", "YuiHatano", "yui・HATANO", "Ｙｕｉ　Ｈａｔａｎｏ"):    # どれも yuihatano の 1 つ
+        assert q(name) == _w(pt, "yuihatano")
+    assert q("PPPD-173") == q("pppd173") == _w(pt, "pppd173")
+    assert q("Mary Jane Watson") == _w(pt, "maryjane", "janewatson")      # 3 語はとなり合う 2 語ずつ
+    assert _txt(pt, q("ab漢")) == {"b漢", "ab漢"} and _words(pt, q("ab漢")) == _w(pt, "ab")   # 境目の窓も持つ
+    assert q("漢") == set()                                              # 1 文字では探さない
+    assert _txt(pt, q("山田【花子】")) == {"山田", "花子"}                 # 記号で切る (「田花」は作らない)
 
 
 def test_ngram_ids_turn_back_into_text_and_kinds_do_not_collide(pt):
-    for g in ("ab", "z9", "山田", "a漢", "가나", "abc", "173"):
+    top = chr(0x10FFFF)
+    for g in ("山田", "a漢", "가나", "山田花", "ab漢", top * 3):
         assert pt.ngram_text(pt.ngram_id(g)) == g
-    assert pt.ngram_id("abc") >= pt.NG_TRI_BASE > pt.ngram_id("ab")
-    assert pt.ngram_id("\U0010ffff\U0010ffff") < pt.NG_TRI_BASE        # 2 文字の番号は 3 文字の番号と重ならない
+    assert 0 < pt.ngram_id(top * 2) < pt.NG_TRI_BASE <= pt.ngram_id("ab漢")   # 2 文字と 3 文字は重ならない
+    assert pt.ngram_id(top * 3) < 1 << 63                               # int64 に入る
+    w = pt.word_id("yuihatano")
+    assert -(1 << 63) <= w < 0 and w == pt.word_id("yuihatano") != pt.word_id("yuihatan")
+    assert pt.ngram_text(w) is None                                     # 単語は戻せない
 
 
 def test_extract_ngrams_keeps_the_heaviest_field_counts_and_stops_at_lines(pt):
-    ng = {pt.ngram_text(i): (f, n) for i, f, n in pt.extract_ngrams(
-        {"title": "山田花子", "alt": "山田\n花子", "body": "山田花子と山田"})}
+    out = pt.extract_ngrams({"title": "山田花子", "alt": "山田" + NL + "花子", "body": "山田花子と山田 Yui Hatano"})
+    ng = {pt.ngram_text(i): (f, n) for i, f, n in out if i >= 0}
+    wd = {i: (f, n) for i, f, n in out if i < 0}
     assert ng["山田"] == (0, 4)               # タイトル (0) が一番重い。タイトル 1・alt 1・本文 2
     assert ng["田花"] == (0, 2)               # alt の「山田」「花子」は行が別なので「田花」にならない
-    assert ng["花子"][0] == 0 and "子と" in ng
+    assert ng["花子と"] == (5, 1)             # 本文にだけある 3 文字
+    assert set(wd) == _w(pt, "yui", "hatano", "yuihatano") and wd[pt.word_id("yuihatano")] == (5, 1)
+
+
+def test_extract_ngrams_skips_long_ascii_runs_and_pairs_across_lines(pt):
+    long = "a" * (pt.NG_WORD_MAX + 1)
+    ids = {i for i, _f, _n in pt.extract_ngrams({"body": f"yui {long} x{NL}hatano"})}
+    assert pt.word_id(long) not in ids and pt.word_id("yui" + long) not in ids
+    assert pt.word_id("yuihatano") not in ids                           # 行が違えばつながない
+    assert _w(pt, "yui", "x", "hatano") <= ids
 
 
 def test_a_page_holds_every_ngram_of_a_term_it_contains(pt):
-    page = {pt.ngram_text(i) for i, _f, _n in pt.extract_ngrams({"body": "出演: Yui  HATANO / ＰＰＰＤ－１７３ 山田 花子"})}
-    for term in ("yui hatano", "PPPD173", "山田花子"):
-        assert _txt(pt, pt.query_ngrams(term)) <= page
+    page = {i for i, _f, _n in pt.extract_ngrams({"body": "出演: Yui  HATANO / ＰＰＰＤ－１７３ 山田 花子"})}
+    for term in ("yui hatano", "YuiHatano", "PPPD173", "pppd-173", "山田花子"):
+        assert pt.query_ngrams(term) <= page
+
+
+def test_scattered_pieces_do_not_make_a_hit(pt):
+    """2 文字ずつだけ・3 文字ずつだけでは偶然そろったもの (本物の本文で外れが多かった形) が当たりにならない。"""
+    page = {i for i, _f, _n in pt.extract_ngrams({"body": "やまのぼり。まだまだ" + NL + "Yui Kawa and Mio Hatano"})}
+    assert {pt.ngram_id("やま"), pt.ngram_id("まだ")} <= page and not pt.query_ngrams("やまだ") <= page
+    assert _w(pt, "yui", "hatano") <= page and not pt.query_ngrams("Yui Hatano") <= page
 
 
 def test_parse_page_returns_ngrams_only_when_asked(pt):
     html = "<title>山田花子</title><p>x</p>".encode()
     assert pt.parse_page(html, "https://ex.test/", [], [])["ng"] is None
     r = pt.parse_page(html, "https://ex.test/", [], [], False, True)
-    assert _txt(pt, [i for i, _f, _n in r["ng"]]) == {"山田", "田花", "花子"} and r["kw"] is None
+    ids = [i for i, _f, _n in r["ng"]]
+    assert _txt(pt, ids) == {"山田", "田花", "花子", "山田花", "田花子"} and _words(pt, ids) == _w(pt, "x")
+    assert r["kw"] is None
 
 
 def _ng_state(im, tmp_path, **kw):
@@ -453,7 +491,7 @@ def _ng_state(im, tmp_path, **kw):
 
 def test_page_ng_root_defaults_under_the_keyword_root(im, tmp_path):
     st = _ng_state(im, tmp_path)
-    assert st["page_ng_root"] == str(tmp_path / "ng-trial")
+    assert st["page_ng_root"] == str(tmp_path / "ng-v2")
 
 
 @pytest.mark.skipif(not _has("pyarrow"), reason="pyarrow が無い")
@@ -462,13 +500,14 @@ def test_page_ng_write_writes_rows_in_gram_order(im, pt, tmp_path):
     import pyarrow.parquet as pq
     st = _ng_state(im, tmp_path)
     s = Counter()
-    a, b = pt.ngram_id("山田"), pt.ngram_id("abc")
-    im._page_ng_write(st, [(11, [(b, 5, 2), (a, 0, 1)]), (10, [(a, 4, 70000)])], s)
-    f = list((tmp_path / "ng-trial").rglob("grams-*.parquet"))
-    assert len(f) == 1 and not list((tmp_path / "ng-trial").rglob("*.tmp"))
+    a, b, w = pt.ngram_id("山田"), pt.ngram_id("山田花"), pt.word_id("yuihatano")
+    im._page_ng_write(st, [(11, [(b, 5, 2), (a, 0, 1), (w, 1, 3)]), (12, []), (10, [(a, 4, 70000), (w, 0, 1)])], s)
+    f = list((tmp_path / "ng-v2").rglob("grams-*.parquet"))
+    assert len(f) == 1 and not list((tmp_path / "ng-v2").rglob("*.tmp"))
     rows = [(r["gram"], r["crawl_id"], r["field"], r["tf"]) for r in pq.read_table(f[0]).to_pylist()]
-    assert rows == sorted(rows) and (a, 10, 4, 65535) in rows and (b, 11, 5, 2) in rows
-    assert s["ng_pages"] == 2 and s["ng_rows"] == 3 and s["ng_bytes"] == st["ng_written_bytes"] > 0
+    assert rows == sorted(rows) and rows[0] == (w, 10, 0, 1)            # 単語 (負の番号) が先頭、同じ番号は crawl_id 順
+    assert (a, 10, 4, 65535) in rows and (b, 11, 5, 2) in rows
+    assert s["ng_pages"] == 3 and s["ng_rows"] == 5 and s["ng_bytes"] == st["ng_written_bytes"] > 0
 
 
 def test_page_ng_write_stops_at_the_size_limit(im, tmp_path):
@@ -477,7 +516,7 @@ def test_page_ng_write_stops_at_the_size_limit(im, tmp_path):
     st["ng_written_bytes"] = int(1e9)
     s = Counter()
     im._page_ng_write(st, [(1, [(1, 0, 1)])], s)
-    assert s["ng_capped"] == 1 and not (tmp_path / "ng-trial").exists()
+    assert s["ng_capped"] == 1 and not (tmp_path / "ng-v2").exists()
 
 
 def test_collect_passes_ngrams_to_the_writer(im, tmp_path, monkeypatch):
