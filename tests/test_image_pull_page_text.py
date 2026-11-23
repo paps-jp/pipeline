@@ -258,8 +258,8 @@ def test_submit_reads_page_html_of_the_job_before_the_prefix_is_deleted(im):
     im._page_text_submit(st, db, "j3", 0, "s", "https://ex.test/3", [])         # crawl の行が無い
     assert store.keys == [("paprika", "jobs/j1/page.html"), ("paprika", "jobs/j2/page.html")]
     assert len(sent) == 1
-    html, base, assets, aliases, want_kw = sent[0]
-    assert want_kw is False                       # page_kw_mode=0 なら語は頼まない
+    html, base, assets, aliases, want_kw, want_ng = sent[0]
+    assert want_kw is False and want_ng is False  # page_kw_mode=0・page_ng_mode=0 なら語も N グラムも頼まない
     assert html == b"<title>ab</title>0123456789"[:10] and base == "https://ex.test/1" and assets == ["https://cdn/a.jpg"]
     assert aliases == im._ptext.norm_aliases(["ハナコ"])
     s = st["pt_stats"]

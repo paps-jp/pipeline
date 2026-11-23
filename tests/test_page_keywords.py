@@ -8,6 +8,8 @@
   3. ID: 手元 → kw_term の SELECT → 無い語だけ INSERT IGNORE (既にある語で AUTO_INCREMENT を進めない)。手元は上限まで
   4. tick の Parquet: 語の ID 順、画像は crawl_image の id、.tmp から置き換え、置き場所がいっぱいなら書かない
   5. 1 時間ごとのまとめ: 終わった時間だけ、本文のサイト共通語を落とし、語の ID 順、元を消す
+  6. 文字の N グラムの試し (辞書なし): 英数字は 3 文字ずつ・ほかは 2 文字ずつ、記号と行で切る、番号は文字に戻せる、
+     ページ側と探す語の切り方が同じ、tick の Parquet は番号順、上限を超えたら書かない
 Sudachi・pyarrow・DuckDB が無い手元では、その部分のテストは飛ばす (使い捨ての容器で通す)。
 """
 
@@ -398,3 +400,119 @@ def test_process_loop_does_not_spin_when_hours_are_left(pkc, monkeypatch):
     st = {"counter": 0, "loop_s": 600, "interval_s": 300, "control_url": "x", "workload_slug": "w"}
     out = pkc.process(None, None, st)
     assert len(calls) < 10 and out["hours_left"] == 3
+
+
+# ---- 6. 文字の N グラムの試し -----------------------------------------------------
+def _txt(pt, ids):
+    return {pt.ngram_text(i) for i in ids}
+
+
+def test_ngrams_cut_ascii_in_threes_and_the_rest_in_twos(pt):
+    assert _txt(pt, pt.query_ngrams("Yui Hatano")) == {"yui", "uih", "iha", "hat", "ata", "tan", "ano"}
+    assert _txt(pt, pt.query_ngrams("山田花子")) == {"山田", "田花", "花子"}
+    assert _txt(pt, pt.query_ngrams("PPPD-173")) == {"ppp", "ppd", "pd1", "d17", "173"}
+    assert _txt(pt, pt.query_ngrams("ab漢")) == {"ab", "b漢"}          # 英数字との境目は 2 文字
+    assert pt.query_ngrams("a") == set() and pt.query_ngrams("漢") == set()   # 1 文字では探さない
+    assert _txt(pt, pt.query_ngrams("山田【花子】")) == {"山田", "花子"}    # 記号で切る (「田花」は作らない)
+
+
+def test_ngram_ids_turn_back_into_text_and_kinds_do_not_collide(pt):
+    for g in ("ab", "z9", "山田", "a漢", "가나", "abc", "173"):
+        assert pt.ngram_text(pt.ngram_id(g)) == g
+    assert pt.ngram_id("abc") >= pt.NG_TRI_BASE > pt.ngram_id("ab")
+    assert pt.ngram_id("\U0010ffff\U0010ffff") < pt.NG_TRI_BASE        # 2 文字の番号は 3 文字の番号と重ならない
+
+
+def test_extract_ngrams_keeps_the_heaviest_field_counts_and_stops_at_lines(pt):
+    ng = {pt.ngram_text(i): (f, n) for i, f, n in pt.extract_ngrams(
+        {"title": "山田花子", "alt": "山田\n花子", "body": "山田花子と山田"})}
+    assert ng["山田"] == (0, 4)               # タイトル (0) が一番重い。タイトル 1・alt 1・本文 2
+    assert ng["田花"] == (0, 2)               # alt の「山田」「花子」は行が別なので「田花」にならない
+    assert ng["花子"][0] == 0 and "子と" in ng
+
+
+def test_a_page_holds_every_ngram_of_a_term_it_contains(pt):
+    page = {pt.ngram_text(i) for i, _f, _n in pt.extract_ngrams({"body": "出演: Yui  HATANO / ＰＰＰＤ－１７３ 山田 花子"})}
+    for term in ("yui hatano", "PPPD173", "山田花子"):
+        assert _txt(pt, pt.query_ngrams(term)) <= page
+
+
+def test_parse_page_returns_ngrams_only_when_asked(pt):
+    html = "<title>山田花子</title><p>x</p>".encode()
+    assert pt.parse_page(html, "https://ex.test/", [], [])["ng"] is None
+    r = pt.parse_page(html, "https://ex.test/", [], [], False, True)
+    assert _txt(pt, [i for i, _f, _n in r["ng"]]) == {"山田", "田花", "花子"} and r["kw"] is None
+
+
+def _ng_state(im, tmp_path, **kw):
+    st = _kw_state(im, tmp_path)
+    im._page_ng_init(st, {"page_ng_mode": 0, **kw})
+    st["page_ng_mode"] = 1
+    return st
+
+
+def test_page_ng_root_defaults_under_the_keyword_root(im, tmp_path):
+    st = _ng_state(im, tmp_path)
+    assert st["page_ng_root"] == str(tmp_path / "ng-trial")
+
+
+@pytest.mark.skipif(not _has("pyarrow"), reason="pyarrow が無い")
+def test_page_ng_write_writes_rows_in_gram_order(im, pt, tmp_path):
+    from collections import Counter
+    import pyarrow.parquet as pq
+    st = _ng_state(im, tmp_path)
+    s = Counter()
+    a, b = pt.ngram_id("山田"), pt.ngram_id("abc")
+    im._page_ng_write(st, [(11, [(b, 5, 2), (a, 0, 1)]), (10, [(a, 4, 70000)])], s)
+    f = list((tmp_path / "ng-trial").rglob("grams-*.parquet"))
+    assert len(f) == 1 and not list((tmp_path / "ng-trial").rglob("*.tmp"))
+    rows = [(r["gram"], r["crawl_id"], r["field"], r["tf"]) for r in pq.read_table(f[0]).to_pylist()]
+    assert rows == sorted(rows) and (a, 10, 4, 65535) in rows and (b, 11, 5, 2) in rows
+    assert s["ng_pages"] == 2 and s["ng_rows"] == 3 and s["ng_bytes"] == st["ng_written_bytes"] > 0
+
+
+def test_page_ng_write_stops_at_the_size_limit(im, tmp_path):
+    from collections import Counter
+    st = _ng_state(im, tmp_path, page_ng_max_gb=1)
+    st["ng_written_bytes"] = int(1e9)
+    s = Counter()
+    im._page_ng_write(st, [(1, [(1, 0, 1)])], s)
+    assert s["ng_capped"] == 1 and not (tmp_path / "ng-trial").exists()
+
+
+def test_collect_passes_ngrams_to_the_writer(im, tmp_path, monkeypatch):
+    st = {}
+    im._page_text_init(st, {"page_text_mode": 1, "page_text_wait_s": 0.01}, _KwDb())
+    st.update({"page_kw_mode": 0, "page_ng_mode": 1, "page_kw_root": str(tmp_path)})
+    got = []
+    monkeypatch.setattr(im, "_page_ng_write", lambda state, pages, s: got.extend(pages))
+
+    def done(r):
+        f = Future()
+        f.set_result(r)
+        return f
+    base = {"title": "T", "description": "", "h1": "", "ld": "", "body": "", "body_len": 0, "imgs": [],
+            "imgs_dom": 0, "imgs_matched": 0, "hit": False, "cpu_ms": 1.0, "kw": None}
+    st["pt_pending"] = [(done({**base, "ng": [(5, 0, 1)], "ng_cpu_ms": 3.0}), 10, "s", "u", "j1", []),
+                        (done({**base, "ng": None}), 11, "s", "u", "j2", [])]
+    out = {}
+    im._page_text_collect(st, _KwDb(), out)
+    assert got == [(10, [(5, 0, 1)])] and out["page_text"]["ng_cpu_ms"] == 3
+
+
+def test_submit_asks_the_child_for_ngrams_only_in_ng_mode(im):
+    for mode in (0, 1):
+        st = {}
+        im._page_text_init(st, {"page_text_mode": 1}, _KwDb())
+        st.update({"page_kw_mode": 0, "page_ng_mode": mode, "hub_ram_client": _Store(b"<title>t</title>"),
+                   "hub_bucket": "paprika", "pt_alias_at": 1e18})
+        sent = []
+        st["pt_pool"] = types.SimpleNamespace(submit=lambda req: sent.append(req) or Future(), restarts=0)
+        im._page_text_submit(st, _KwDb(), "j", 10, "s", "https://ex.test/", [])
+        assert sent[0][4] is False and sent[0][5] is bool(mode)
+
+
+def test_page_ng_mode_is_off_by_default(im, tmp_path):
+    st = _kw_state(im, tmp_path)
+    im._page_ng_init(st, {})
+    assert st["page_ng_mode"] == 0
