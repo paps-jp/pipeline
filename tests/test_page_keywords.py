@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import time
 import types
 from concurrent.futures import Future
 from datetime import datetime, timezone
@@ -344,10 +345,10 @@ def test_closed_hours_waits_for_the_hour_and_grace(pkc, tmp_path):
         (tmp_path / "work" / d / h).mkdir(parents=True)
     (tmp_path / "work" / "junk").mkdir()
     now = datetime(2026, 11, 23, 5, 3, tzinfo=timezone.utc)
-    got = [(d, h) for d, h, _p in pkc.closed_hours(tmp_path, now, grace_s=300)]
+    got = [(d, h) for d, h, _p in pkc.closed_hours(tmp_path / "work", now, grace_s=300)]
     assert got == [("2026-11-23", "03")]                  # 04 時は 05:05 から、05 時はまだ書いている途中
     now = datetime(2026, 11, 23, 5, 6, tzinfo=timezone.utc)
-    assert [(d, h) for d, h, _p in pkc.closed_hours(tmp_path, now, grace_s=300)][-1] == ("2026-11-23", "04")
+    assert [(d, h) for d, h, _p in pkc.closed_hours(tmp_path / "work", now, grace_s=300)][-1] == ("2026-11-23", "04")
 
 
 @pytest.mark.skipif(not (_has("duckdb") and _has("pyarrow")), reason="DuckDB / pyarrow が無い")
@@ -400,6 +401,75 @@ def test_process_loop_does_not_spin_when_hours_are_left(pkc, monkeypatch):
     st = {"counter": 0, "loop_s": 600, "interval_s": 300, "control_url": "x", "workload_slug": "w"}
     out = pkc.process(None, None, st)
     assert len(calls) < 10 and out["hours_left"] == 3
+
+
+@pytest.mark.skipif(not (_has("duckdb") and _has("pyarrow")), reason="DuckDB / pyarrow が無い")
+def test_compact_ng_hour_keeps_every_row_sorted_by_gram(pkc, tmp_path):
+    import duckdb
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    ng = tmp_path / "ng-v2"
+    wd = ng / "2026-11-23" / "03"
+    wd.mkdir(parents=True)
+    cols = (("crawl_id", pa.int64()), ("gram", pa.int64()), ("field", pa.uint8()), ("tf", pa.uint16()))
+
+    def write(name, rows):
+        pq.write_table(pa.table({c: pa.array([r[k] for r in rows], t) for k, (c, t) in enumerate(cols)}), str(wd / name))
+    # tick 2 回分。どちらも番号順だが、合わせると混ざる。単語 (負の番号) と、同じページが 2 回出るのも残す
+    write("grams-1-1.parquet", [(5, -9, 5, 1), (1, 7, 0, 2), (2, 1 << 42, 5, 3)])
+    write("grams-2-1.parquet", [(3, -9, 4, 1), (4, 7, 5, 1), (1, 7, 0, 2)])
+    (wd / ".grams-3-1.parquet.tmp").write_bytes(b"half written")       # 書きかけは読まない
+    st = pkc.compact_ng_hour(duckdb.connect(), ng, "2026-11-23", "03", wd, row_group_size=10_000)
+    f = ng / "day=2026-11-23" / "hour=03" / "grams.parquet"
+    t = pq.read_table(str(f))
+    assert [(r["gram"], r["crawl_id"]) for r in t.to_pylist()] == [(-9, 3), (-9, 5), (7, 1), (7, 1), (7, 4), (1 << 42, 2)]
+    assert [x.type for x in t.schema] == [pa.int64(), pa.int64(), pa.uint8(), pa.uint16()]
+    assert st == {"ng_files": 2, "ng_rows": 6, "ng_bytes_in": st["ng_bytes_in"], "ng_bytes_out": f.stat().st_size}
+    assert not (ng / "2026-11-23").exists()
+
+
+def test_closed_hours_skips_merged_ng_hours(pkc, tmp_path):
+    (tmp_path / "2026-11-23" / "03").mkdir(parents=True)
+    (tmp_path / "day=2026-11-23" / "hour=02").mkdir(parents=True)
+    now = datetime(2026, 11, 23, 5, 0, tzinfo=timezone.utc)
+    assert [(d, h) for d, h, _p in pkc.closed_hours(tmp_path, now, grace_s=300)] == [("2026-11-23", "03")]
+
+
+@pytest.mark.skipif(not (_has("duckdb") and _has("pyarrow")), reason="DuckDB / pyarrow が無い")
+def test_ng_pass_only_when_ng_mode_and_keeps_files_on_failure(pkc, tmp_path, monkeypatch):
+    import duckdb
+    wd = tmp_path / "ng-v2" / "2026-11-23" / "03"
+    wd.mkdir(parents=True)
+    (wd / "grams-1-1.parquet").write_bytes(b"not parquet")
+    st = {"root": str(tmp_path), "ng_root": str(tmp_path / "ng-v2"), "grace_s": 300, "ng_row_group_size": 1000,
+          "min_site_pages": 8, "common_ratio": 0.5, "duck": duckdb.connect(), "ng_mode": 0}
+    assert "ng_hours" not in pkc.run_pass(st, time.time() + 60)
+    st["ng_mode"] = 1
+    out = pkc.run_pass(st, time.time() + 60)
+    assert out["ng_errors"] == 1 and out["ng_hours"] == 0 and (wd / "grams-1-1.parquet").exists()
+    assert not (tmp_path / "ng-v2" / "day=2026-11-23" / "hour=03" / "grams.parquet").exists()
+    out = pkc.run_pass(st, time.time() - 1)            # 時間切れ: 手を付けずに残りを数える
+    assert out["ng_hours_left"] == 1
+
+
+def test_process_reports_ng_hours_left(pkc, monkeypatch):
+    monkeypatch.setattr(pkc, "run_pass", lambda state, deadline: {"hours": 0, "hours_left": 0, "ng_hours": 1,
+                                                                   "ng_hours_left": 2})
+    monkeypatch.setattr(pkc, "_self_enqueue_next_tick", lambda *a: None)
+    clock = [0.0]
+    monkeypatch.setattr(pkc.time, "monotonic", lambda: clock.__setitem__(0, clock[0] + 100) or clock[0])
+    monkeypatch.setattr(pkc.time, "sleep", lambda s: None)
+    out = pkc.process(None, None, {"counter": 0, "loop_s": 600, "interval_s": 300, "control_url": "x",
+                                   "workload_slug": "w"})
+    assert out["ng_hours_left"] == 2 and out["ng_hours"] >= 1
+
+
+def test_setup_ng_defaults(pkc, tmp_path, monkeypatch):
+    monkeypatch.setattr(pkc, "_self_enqueue_next_tick", lambda *a: None)
+    if not _has("duckdb"):
+        monkeypatch.setitem(sys.modules, "duckdb", types.ModuleType("duckdb"))
+    st = pkc.setup(root=str(tmp_path))
+    assert st["ng_mode"] == 0 and st["ng_root"] == str(tmp_path / "ng-v2") and st["ng_row_group_size"] == 1_000_000
 
 
 # ---- 6. 文字の N グラムの試し -----------------------------------------------------
