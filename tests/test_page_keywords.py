@@ -577,16 +577,31 @@ def test_page_ng_write_writes_rows_in_gram_order(im, pt, tmp_path):
     rows = [(r["gram"], r["crawl_id"], r["field"], r["tf"]) for r in pq.read_table(f[0]).to_pylist()]
     assert rows == sorted(rows) and rows[0] == (w, 10, 0, 1)            # 単語 (負の番号) が先頭、同じ番号は crawl_id 順
     assert (a, 10, 4, 65535) in rows and (b, 11, 5, 2) in rows
-    assert s["ng_pages"] == 3 and s["ng_rows"] == 5 and s["ng_bytes"] == st["ng_written_bytes"] > 0
+    assert s["ng_pages"] == 3 and s["ng_rows"] == 5 and s["ng_bytes"] == st["ng_used_bytes"] > 0
 
 
-def test_page_ng_write_stops_at_the_size_limit(im, tmp_path):
+def test_page_ng_limit_defaults_to_100_gb(im, tmp_path):
+    assert _ng_state(im, tmp_path)["page_ng_max_gb"] == 100.0
+
+
+def test_page_ng_write_stops_when_the_directory_is_full_and_resumes_after_it_shrinks(im, tmp_path):
     from collections import Counter
-    st = _ng_state(im, tmp_path, page_ng_max_gb=1)
-    st["ng_written_bytes"] = int(1e9)
+    st = _ng_state(im, tmp_path, page_ng_max_gb=1e-6)            # 1,000 バイト
+    old = tmp_path / "ng-v2" / "day=2026-11-23" / "hour=03" / "grams.parquet"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"x" * 2000)                                  # まとめた後のファイルも、実際の量として数える
     s = Counter()
     im._page_ng_write(st, [(1, [(1, 0, 1)])], s)
-    assert s["ng_capped"] == 1 and not (tmp_path / "ng-v2").exists()
+    assert s["ng_capped"] == 1 and st["ng_used_bytes"] == 2000
+    assert not list((tmp_path / "ng-v2").rglob("grams-*.parquet"))
+    old.write_bytes(b"x" * 10)                                    # まとめて小さくなった
+    im._page_ng_write(st, [(1, [(1, 0, 1)])], s)
+    assert s["ng_capped"] == 2                                    # 数え直すまでは前の量のまま
+    st["ng_used_at"] = -1e9                                       # 10 分たった
+    if _has("pyarrow"):
+        im._page_ng_write(st, [(1, [(1, 0, 1)])], s)
+        assert s["ng_capped"] == 2 and len(list((tmp_path / "ng-v2").rglob("grams-*.parquet"))) == 1
+        assert st["ng_used_bytes"] == 10 + s["ng_bytes"]
 
 
 def test_collect_passes_ngrams_to_the_writer(im, tmp_path, monkeypatch):
