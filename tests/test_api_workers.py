@@ -297,3 +297,23 @@ def test_claim_cap_allows_same_worker_to_keep_claiming(client: TestClient):
     assert len(r1.json()["tasks"]) == 2
     r2 = client.post(f"/api/v1/workers/{a}/claim", json={"workload_slug": "pull", "limit": 2})
     assert len(r2.json()["tasks"]) == 2
+
+
+# ---------------- /workers/cpu ----------------
+
+
+def test_workers_cpu_ignores_worker_that_sends_only_gpu_state(client: TestClient):
+    """GPU の温度・スロットルだけを送る worker (cpu_pct が None) が混じっても 500 にせず、host の集計から外す。"""
+    a = client.post("/api/v1/workers", json={"host": "ha"}).json()["id"]
+    b = client.post("/api/v1/workers", json={"host": "hb"}).json()["id"]
+    assert client.put(f"/api/v1/workers/{a}/heartbeat", json={"host_cpu_pct": 42.5}).status_code == 200
+    assert client.put(f"/api/v1/workers/{b}/heartbeat",
+                      json={"gpu_throttle": False, "gpu_temp_c": 61.0}).status_code == 200
+    r = client.get("/api/v1/workers/cpu")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["per_host"] == {"ha": {"cpu_pct": 42.5, "n_workers": 1, "ts": d["per_host"]["ha"]["ts"]}}
+    assert d["cluster_max"] == 42.5
+    # GPU の状態は per_worker に残る
+    assert d["per_worker"][b]["gpu_temp_c"] == 61.0
+    assert d["per_worker"][b]["cpu_pct"] is None

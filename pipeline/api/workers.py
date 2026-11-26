@@ -817,6 +817,10 @@ def list_workers_cpu(request: Request) -> dict[str, Any]:
         if ts_dt < cutoff:
             continue
         per_worker[wid] = v
+        # GPU の温度・スロットルだけを送ってくる worker は cpu_pct が None のまま。
+        # 1 台でも混じると float(None) で一覧ごと 500 になっていたので、host の集計からは外す
+        if v.get("cpu_pct") is None:
+            continue
         host = v.get("host") or wid
         per_host_vals.setdefault(host, []).append(float(v["cpu_pct"]))
         # 最新 ts を host 代表に
