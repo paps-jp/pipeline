@@ -212,7 +212,10 @@ def create_app(settings: Settings) -> FastAPI:
             repo = _MR(db)
             while not _maintenance_stop.is_set():
                 try:
-                    deleted = repo.purge_all()
+                    # 2026-11-27: event loop 上で直に呼ぶと、plugin-thumb の 1 件ずつの
+                    # remove_object (5 分毎に約 6,000 件) の間 :8001 全体が 7〜11 秒止まり、
+                    # 5 秒 timeout の呼び出し (machine-status-export 等) が落ちていた。別スレッドで回す
+                    deleted = await _asyncio.to_thread(repo.purge_all)
                     nonempty = {k: v for k, v in deleted.items() if v}
                     if nonempty:
                         log.info("maintenance purge: %s", nonempty)
