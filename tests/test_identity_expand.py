@@ -724,3 +724,134 @@ def test_run_pass_consumes_page_candidates_and_stays_busy_while_rows_are_left(m,
     left["n"] = 0
     _out, busy = m.run_pass(state, None, deadline=__import__("time").time() + 5)
     assert not busy
+
+
+# ----------------------------------------------------------------------
+# 参照画像 (protection_ai.v_identity_ref、設計 §9.9)
+# ----------------------------------------------------------------------
+def _ref_state(**kw):
+    st = {"label_view": "protection_ai.v_identity_label", "ref_view": "protection_ai.v_identity_ref",
+          "ref_retry_s": 600, "ref_retry_at": 0.0, "label_emb": {}, "dup_cos": 0.97, "dry_run": False,
+          "mix_link": 0.6, "mix_min_group": 3, "mix_min_frac": 0.05, "mix_max_cross": 0.3,
+          "min_gallery": 3, "min_gallery_ref": 2}
+    st.update(kw)
+    return st
+
+
+def test_load_refs_parses_vectors_skips_bad_rows_and_backs_off(m, monkeypatch):
+    rng = np.random.default_rng(11)
+    v = _person(rng, 2)
+    rows = [("a" * 32, 7, DIM, (3 * v[0]).astype("<f4").tobytes()),   # 正規化されていなくても揃える
+            ("a" * 32, 8, 8, np.ones(8, "<f4").tobytes()),              # 次元が違う (テスト用の偽の顔の処理) → 使わない
+            ("b" * 32, 9, DIM, v[1].astype("<f4").tobytes())]
+    monkeypatch.setattr(m, "_q", lambda db, sql, params=(): rows)
+    st = _ref_state()
+    got = m.load_refs(st, None)
+    assert set(got) == {"a" * 32, "b" * 32}
+    assert list(got["a" * 32]) == [m.REF_BASE + 7]
+    assert abs(float(got["a" * 32][m.REF_BASE + 7] @ v[0]) - 1) < 1e-5
+
+    def boom(db, sql, params=()):
+        raise RuntimeError("SELECT command denied")
+    monkeypatch.setattr(m, "_q", boom)
+    assert m.load_refs(st, None) == {}           # GRANT の前は空で、ほかの処理を止めない
+    assert st["ref_retry_at"] > 0
+    monkeypatch.setattr(m, "_q", lambda db, sql, params=(): rows)
+    assert m.load_refs(st, None) == {}           # しばらくは読みに行かない
+    assert m.load_refs(_ref_state(ref_view=""), None) == {}
+
+
+def _fake_sync_db(m, monkeypatch, label_rows, refs, state_keys=()):
+    writes: list[tuple[str, tuple]] = []
+
+    def q(db, sql, params=()):
+        s = " ".join(sql.split())
+        if s.startswith("SELECT identity_key, face_id, label FROM"):
+            return label_rows
+        if s.startswith("SELECT face_id FROM identity_match"):
+            return []
+        if s.startswith("SELECT identity_key FROM identity_state"):
+            return [(k,) for k in state_keys]
+        writes.append((s, tuple(params)))
+        return []
+    monkeypatch.setattr(m, "_q", q)
+    monkeypatch.setattr(m, "_exec_many", lambda db, sql, rows: writes.append((" ".join(sql.split()), tuple(rows))))
+    monkeypatch.setattr(m, "load_refs", lambda state, db: refs)
+    monkeypatch.setattr(m, "release_identity", lambda db, k: 0)
+    return writes
+
+
+def _state_row(writes, key):
+    rows = [p for s, p in writes if s.startswith("INSERT INTO identity_state") and p[0] == key]
+    assert len(rows) == 1
+    # (identity_key, label_self, label_not, refs, conflicts, paused, pause_reason)
+    return rows[-1]
+
+
+def test_sync_labels_runs_clients_with_only_reference_images(m, monkeypatch):
+    """検索結果を「自分」と確認した顔が無くても、参照画像 2 枚で動き出す。G には参照画像が入り、Gs には入らない"""
+    rng = np.random.default_rng(12)
+    me = _person(rng, 2)
+    key = "c" * 32
+    refs = {key: {m.REF_BASE + 1: me[0], m.REF_BASE + 2: me[1]}}
+    writes = _fake_sync_db(m, monkeypatch, [], refs)
+    monkeypatch.setattr(m, "load_embeddings", lambda state, db, ids: {})
+    idents = m.sync_labels(_ref_state(), None)
+    ident = idents[key]
+    assert not ident["paused"]
+    assert ident["G"].shape == (2, DIM) and ident["Gs"].shape == (0, DIM)
+    assert ident["refs"] == [m.REF_BASE + 1, m.REF_BASE + 2]
+    assert _state_row(writes, key)[1:6] == (0, 0, 2, 0, 0)
+    # 1 枚だけでは動かない
+    writes = _fake_sync_db(m, monkeypatch, [], {key: {m.REF_BASE + 1: me[0]}})
+    ident = m.sync_labels(_ref_state(), None)[key]
+    assert ident["paused"] and "参照画像が 1 枚" in _state_row(writes, key)[6]
+
+
+def test_sync_labels_adds_reference_images_to_the_gallery_and_pauses_on_mismatch(m, monkeypatch):
+    rng = np.random.default_rng(13)
+    me = _person(rng, 6)
+    other = _person(rng, 2)
+    key = "d" * 32
+    emb = {10 + i: me[i] for i in range(4)}
+    monkeypatch.setattr(m, "load_embeddings", lambda state, db, ids: {f: emb[f] for f in ids if f in emb})
+    labels = [(key, f, "self") for f in emb]
+    writes = _fake_sync_db(m, monkeypatch, labels, {key: {m.REF_BASE + 5: me[4], m.REF_BASE + 6: me[5]}})
+    ident = m.sync_labels(_ref_state(), None)[key]
+    assert not ident["paused"] and ident["G"].shape[0] == 6 and ident["Gs"].shape[0] == 4
+    assert _state_row(writes, key)[1:4] == (4, 0, 2)
+    # 参照画像が本人の正解とまるで似ていない (別の人の写真を本人と確認した・別の人の参照画像) → 止める
+    writes = _fake_sync_db(m, monkeypatch, labels, {key: {m.REF_BASE + 5: other[0], m.REF_BASE + 6: other[1]}})
+    ident = m.sync_labels(_ref_state(), None)[key]
+    assert ident["paused"] and "参照画像と本人の正解が別の人の疑い" in _state_row(writes, key)[6]
+
+
+def test_search_seeds_searches_reference_images_first_with_their_own_vectors(m, monkeypatch):
+    rng = np.random.default_rng(14)
+    me = _person(rng, 3)
+    r1 = m.REF_BASE + 41
+    state = {"label_emb": {1: me[0]}, "max_seeds": 100, "seed_batch": 10, "topk": 10, "nprobe": 64}
+    ident = {"self": [1], "refs": [r1], "ref_vecs": {r1: me[2]}, "paused": False}
+    asked: list[np.ndarray] = []
+    monkeypatch.setattr(m, "_knn", lambda url, vec, topk, nprobe: (asked.append(vec), [100])[1])
+    monkeypatch.setattr(m, "load_embeddings", lambda st, db, ids: pytest.fail(f"参照画像を shard から読もうとした {ids}"))
+    seen_cand: list[dict] = []
+    monkeypatch.setattr(m, "write_candidates",
+                        lambda st, db, key, idn, cand, rule, ver: (seen_cand.append(dict(cand)),
+                                                                   {"candidates": 1, "auto": 1, "review": 0})[1])
+    db = _Db()
+    st = m.search_seeds(state, db, "e" * 32, ident, ["http://a:9000"], "v1", deadline=float("inf"))
+    assert st["seeds_searched"] == 2
+    assert any(np.allclose(v, me[2]) for v in asked)
+    assert seen_cand == [{100: r1}]                     # 起点は参照画像 (先に検索する) として残る
+    done = [e for e in db.log if e[0] == "many" and "identity_seed_done" in e[1]]
+    assert done and {r[1] for r in done[0][2]} == {r1, 1}
+
+
+def test_anchor_centroid_ignores_reference_images(m):
+    rng = np.random.default_rng(15)
+    me = _person(rng, 4)
+    ident = {"G": np.vstack([me[:2], me[2:]]), "Gs": me[:2], "self": [21, 22]}
+    c, rep = m.anchor_centroid(ident)
+    assert rep in (21, 22)
+    assert m.anchor_centroid({"G": me[:2], "Gs": np.zeros((0, DIM), np.float32), "self": []}) is None
